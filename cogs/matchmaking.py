@@ -204,18 +204,24 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
     async def mmr_self(self, interaction: discord.Interaction):
-        mmr_val,_ = await self.fetch_player(interaction.user.id)
-        name=interaction.user.display_name
-        role='Bronze' if mmr_val<1000 else 'Gold' if mmr_val<2000 else 'Diamond'
-        await interaction.response.send_message(f"{name} tiene {mmr_val} MMR y rango {role}.")
+        mmr_val, role = await self.fetch_player(interaction.user.id)
+        name = interaction.user.display_name
+        if role == 'Placement':
+            await interaction.response.send_message(f"{name} está en estado Placement y aún no tiene MMR asignado.")
+        else:
+            await interaction.response.send_message(f"{name} tiene {mmr_val} MMR y rango {role}.")
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr_user", description="Muestra el MMR de otro jugador")
     async def mmr_user(self, interaction: discord.Interaction, user: discord.Member):
-        mmr_val,_ = await self.fetch_player(user.id)
-        name=user.display_name
-        role='Bronze' if mmr_val<1000 else 'Gold' if mmr_val<2000 else 'Diamond'
-        await interaction.response.send_message(f"{name} tiene {mmr_val} MMR y rango {role}.")
+        mmr_val, role = await self.fetch_player(user.id)
+        name = user.display_name
+        if role == 'Placement':
+            await interaction.response.send_message(f"{name} está en estado Placement y aún no tiene MMR asignado.")
+        else:
+            await interaction.response.send_message(f"{name} tiene {mmr_val} MMR y rango {role}.")
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top10", description="Top 10 jugadores por MMR")
