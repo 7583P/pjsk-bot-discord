@@ -5,19 +5,18 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 
-# Cargar variables de entorno
+# Cargar variables de entorno\load_dotenv()
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 APP_ID = int(os.getenv("APPLICATION_ID", "0"))
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = os.getenv("GUILD_ID", "")
 
-# Intents
+# Configurar intents
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
 intents.members = True  # Necesario para on_member_join
 
-# Bot
 class MyBot(commands.Bot):
     def __init__(self):
         super().__init__(
@@ -28,34 +27,46 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        # Cargar Matchmaking
+        # Cargar Matchmaking Cog
         try:
             await self.load_extension("cogs.matchmaking")
             print("✅ Cog cargado: cogs.matchmaking")
         except Exception as e:
             print(f"❌ Error cargando cogs.matchmaking: {e}")
 
-        # Cargar AutoRoles
+        # Cargar AutoRoles Cog
         try:
             await self.load_extension("cogs.autoroles")
             print("✅ Cog cargado: cogs.autoroles")
         except Exception as e:
             print(f"❌ Error cargando cogs.autoroles: {e}")
 
-        # Sincronizar comandos slash al guild
+        # Cargar Players Cog (on_member_join + /register)
         try:
-            guild = discord.Object(id=GUILD_ID)
-            synced = await self.tree.sync(guild=guild)
-            print(f"📋 Comandos registrados: {[cmd.name for cmd in synced]}")
+            await self.load_extension("cogs.players")
+            print("✅ Cog cargado: cogs.players")
+        except Exception as e:
+            print(f"❌ Error cargando cogs.players: {e}")
+
+        # Sincronizar comandos slash
+        try:
+            if GUILD_ID:
+                guild = discord.Object(id=int(GUILD_ID))
+                synced = await self.tree.sync(guild=guild)
+                print(f"📋 Slash commands sincronizados en guild {GUILD_ID}: {[c.name for c in synced]}")
+            else:
+                synced = await self.tree.sync()
+                print(f"📋 Slash commands globales: {[c.name for c in synced]}")
         except Exception as e:
             print(f"❗ Error al sincronizar comandos: {e}")
 
     async def on_ready(self):
         print(f"🤖 Conectado como {self.user} (ID: {self.user.id})")
 
+# Instanciar bot
 bot = MyBot()
 
-# Manejo de errores globales
+# Manejo de errores globales para comandos slash
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     try:
@@ -72,3 +83,4 @@ if __name__ == "__main__":
         print("❌ DISCORD_TOKEN no definido.")
         sys.exit(1)
     bot.run(TOKEN)
+

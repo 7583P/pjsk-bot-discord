@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <title>PJSK LOUNGE</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+      background-color: #383838;
+      color: #ffffff;
+    }
+    #app {
+      max-width: 1000px;
+      margin: 0 auto;
+      padding: 20px;
+      background-color: #2a2a2a;
+      border-radius: 8px;
+      box-shadow: 0 0 10px rgba(0,0,0,0.5);
+    }
+    h1 {
+      font-size: 2em;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .controls {
+      margin-bottom: 15px;
+      text-align: center;
+    }
+    input {
+      padding: 5px;
+      width: 80%;
+      max-width: 400px;
+      border: none;
+      border-radius: 4px;
+      text-align: center;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+    }
+    th, td {
+      padding: 10px;
+      border: 1px solid #000;
+      text-align: center;
+    }
+    th {
+      background-color: #030050 !important;
+    }
+    tbody tr:nth-child(odd)  { background-color: #333; }
+    tbody tr:nth-child(even) { background-color: #2a2a2a; }
+
+    /* Solo la bandera, sin texto */
+    .flag {
+      width: 24px;
+      vertical-align: middle;
+    }
+
+    /* Colores según roles de Discord */
+    /* Reemplaza los hex por los reales de tu servidor */
+    .rank-Placement { color: #ff7000 !important; }  /* ej. gris “Placement” */
+    .rank-Bronze    { color: #66311e; }  /* bronce */
+    .rank-Gold      { color: #ffaf00; }  /* dorado */
+    .rank-Diamond   { color: #0080ff; }  /* aqua/diamond */
+  </style>
+</head>
+<body>
+  <div id="app">
+    <h1>PJSK LOUNGE – Temporada {{ seasonLabel }}</h1>
+    <div class="controls">
+      <input type="text" v-model="filter" placeholder="Buscar por nombre…">
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Jugador</th>
+          <th>MMR</th>
+          <th>País</th>
+          <th>Rango</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="p in filteredPlayers" :key="p.id">
+          <td :class="`rank-${p.rank}`">{{ p.name }}</td>
+          <td :class="`rank-${p.rank}`">{{ p.mmr }}</td>
+          <td>
+            <img 
+              :src="flagUrl(p.country)" 
+              :alt="p.country" 
+              class="flag"
+            />
+          </td>
+          <td :class="`rank-${p.rank}`">{{ p.rank }}</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <script src="https://unpkg.com/vue@3"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <script>
+    const { createApp } = Vue;
+    createApp({
+      data() {
+        return {
+          players: [],
+          filter: ''
+        };
+      },
+      computed: {
+        filteredPlayers() {
+          const q = this.filter.toLowerCase();
+          return this.players.filter(p =>
+            p.name.toLowerCase().includes(q)
+          );
+        },
+        seasonLabel() {
+          const start = new Date(2025, 4, 16);
+          const now   = new Date();
+          const monthsDiff = (now.getFullYear() - start.getFullYear()) * 12
+                           + (now.getMonth() - start.getMonth());
+          const period = Math.floor(monthsDiff / 3);
+          return period === 0 ? 'Beta' : period;
+        }
+      },
+      methods: {
+        async fetchPlayers() {
+          try {
+            const resp = await axios.get('/api/players');
+            this.players = resp.data;
+          } catch (err) {
+            console.error(err);
+            alert('Error al cargar los datos de jugadores');
+          }
+        },
+        flagUrl(cc) {
+          return `https://flagcdn.com/24x18/${cc.toLowerCase()}.png`;
+        }
+      },
+      mounted() {
+        this.fetchPlayers();
+      }
+    }).mount('#app');
+  </script>
+</body>
+</html>
