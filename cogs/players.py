@@ -23,7 +23,7 @@ def get_current_season_label() -> str:
 
 # Inserta o actualiza un jugador en la tabla
 async def upsert_player(user_id: int, name: str, country: str):
-    print('Register:' & country)
+    print('Register:' + country)
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
