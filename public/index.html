@@ -40,29 +40,29 @@
       border-collapse: collapse;
       margin-top: 10px;
     }
-    th, td {
+    th {
       padding: 10px;
-      border: 1px solid #000;
+      background-color: #030050 !important;
       text-align: center;
     }
-    th {
-      background-color: #030050 !important;
+    td {
+      padding: 10px;
+      text-align: center;
+      border-bottom: 1px solid #555;
     }
     tbody tr:nth-child(odd)  { background-color: #333; }
     tbody tr:nth-child(even) { background-color: #2a2a2a; }
 
-    /* Solo la bandera, sin texto */
     .flag {
       width: 24px;
       vertical-align: middle;
+      margin-left: 8px;
     }
 
-    /* Colores según roles de Discord */
-    /* Reemplaza los hex por los reales de tu servidor */
-    .rank-Placement { color: #ff7000 !important; }  /* ej. gris “Placement” */
-    .rank-Bronze    { color: #66311e; }  /* bronce */
-    .rank-Gold      { color: #ffaf00; }  /* dorado */
-    .rank-Diamond   { color: #0080ff; }  /* aqua/diamond */
+    .rank-Placement { color: #ff7000 !important; }
+    .rank-Bronze    { color: #66311e; }
+    .rank-Gold      { color: #ffaf00; }
+    .rank-Diamond   { color: #0080ff; }
   </style>
 </head>
 <body>
@@ -74,24 +74,21 @@
     <table>
       <thead>
         <tr>
-          <th>Jugador</th>
+          <th>#</th>
+          <th>Player</th>
           <th>MMR</th>
-          <th>País</th>
           <th>Rango</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="p in filteredPlayers" :key="p.id">
-          <td :class="`rank-${p.rank}`">{{ p.name }}</td>
-          <td :class="`rank-${p.rank}`">{{ p.mmr }}</td>
-          <td>
-            <img 
-              :src="flagUrl(p.country)" 
-              :alt="p.country" 
-              class="flag"
-            />
+          <td :class="rankClass(p.rank)">
+            {{ playerRankMap[p.id] }}
+            <img v-if="p.country" :src="flagUrl(p.country)" :alt="p.country" class="flag" />
           </td>
-          <td :class="`rank-${p.rank}`">{{ p.rank }}</td>
+          <td :class="rankClass(p.rank)">{{ p.name }}</td>
+          <td :class="rankClass(p.rank)">{{ p.mmr }}</td>
+          <td :class="rankClass(p.rank)">{{ p.rank }}</td>
         </tr>
       </tbody>
     </table>
@@ -105,7 +102,8 @@
       data() {
         return {
           players: [],
-          filter: ''
+          filter: '',
+          playerRankMap: {}
         };
       },
       computed: {
@@ -128,7 +126,15 @@
         async fetchPlayers() {
           try {
             const resp = await axios.get('/api/players');
-            this.players = resp.data;
+            const playersSorted = resp.data.sort((a, b) => b.mmr - a.mmr);
+            this.players = playersSorted;
+
+            // Crear mapa de posiciones reales por ID
+            const rankMap = {};
+            playersSorted.forEach((p, idx) => {
+              rankMap[p.id] = idx + 1;
+            });
+            this.playerRankMap = rankMap;
           } catch (err) {
             console.error(err);
             alert('Error al cargar los datos de jugadores');
@@ -136,12 +142,20 @@
         },
         flagUrl(cc) {
           return `https://flagcdn.com/24x18/${cc.toLowerCase()}.png`;
+        },
+        rankClass(rank) {
+          return `rank-${rank}`;
         }
       },
       mounted() {
         this.fetchPlayers();
+        setInterval(() => {
+          this.fetchPlayers();
+        }, 10000); // actualiza cada 10 segundos
       }
     }).mount('#app');
   </script>
 </body>
 </html>
+
+
