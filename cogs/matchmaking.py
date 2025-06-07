@@ -1,14 +1,6 @@
 # ------------- matchmaking.py (versión completa con la poll de 9 canciones) -------------
 import os
-
-print("DEBUG: Working directory:", os.getcwd())
-DB_PATH = "matchmaking2.db"
-if os.path.exists(DB_PATH):
-    print("DEBUG: matchmaking2.db exists, removing...")
-    os.remove(DB_PATH)
-else:
-    print("DEBUG: matchmaking2.db does NOT exist, will be created")
-
+DB_PATH = "matchmaking.db"
 import re
 import random
 import asyncio
