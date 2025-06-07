@@ -127,22 +127,31 @@ class Matchmaking(commands.Cog):
         self.rooms: dict[int, dict] = {}
 
     # ----------  SQL SETUP ----------
-    async def cog_load(self):
-        self.db = await aiosqlite.connect(DB_PATH)
-        await self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS players (
-                user_id INTEGER PRIMARY KEY,
-                mmr     INTEGER DEFAULT 0,
-                role    TEXT DEFAULT 'Placement'
-            );
-            """
-        )
-        await self.db.commit()
+async def cog_load(self):
+    self.db = await aiosqlite.connect(DB_PATH)
+    await self.db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            user_id INTEGER PRIMARY KEY,
+            mmr     INTEGER DEFAULT 0,
+            role    TEXT DEFAULT 'Placement'
+        );
+        """
+    )
+    await self.db.commit()
 
-        # arranca el loop que refresca las canciones
-        self.refresh_songs.start()
-        await self.refresh_songs()
+    # PASO 2: AÑADIR COLUMNAS FALTANTES SI NO EXISTEN
+    for column in ["name", "season"]:
+        try:
+            await self.db.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT;")
+        except Exception:
+            pass  # Ya existe, ignora el error
+    await self.db.commit()
+
+    # arranca el loop que refresca las canciones
+    self.refresh_songs.start()
+    await self.refresh_songs()
+
 
     async def cog_unload(self):
         await self.db.close()
