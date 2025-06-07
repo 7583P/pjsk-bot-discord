@@ -1,10 +1,9 @@
 # ------------- matchmaking.py (versión completa con la poll de 9 canciones) -------------
 import os
 
-DB_PATH = "matchmaking.db"
+DB_PATH = "matchmaking2.db"
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
-
 import re
 import random
 import asyncio
