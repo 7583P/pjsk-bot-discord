@@ -137,7 +137,7 @@ class Matchmaking(commands.Cog):
     # ----------  SQL SETUP ----------
 async def cog_load(self):
     self.db = await aiosqlite.connect(DB_PATH)
-# SOLO para migrar, después bórralo:
+    # SOLO PARA MIGRAR, después bórralo:
     await self.db.execute("DROP TABLE IF EXISTS players;")
     await self.db.commit()
     await self.db.executescript(
@@ -150,18 +150,8 @@ async def cog_load(self):
         season  TEXT
     );
     """
-)
+    )
     await self.db.commit()
-
-
-    # --- MIGRACIÓN de columnas ---
-    for column in ["name", "season"]:
-        try:
-            await self.db.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT;")
-        except Exception:
-            pass  # Ya existe
-    await self.db.commit()
-    # --- FIN migración ---
     # Luego sí puedes usar self.db normalmente
     self.refresh_songs.start()
     await self.refresh_songs()
