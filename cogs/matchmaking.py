@@ -1,6 +1,9 @@
 # ------------- matchmaking.py (versión completa con la poll de 9 canciones) -------------
 
 import os
+import os
+if os.path.exists(DB_PATH):
+    os.remove(DB_PATH)
 import re
 import random
 import asyncio
@@ -139,19 +142,17 @@ async def cog_load(self):
         """
     )
     await self.db.commit()
-
-    # PASO 2: AÑADIR COLUMNAS FALTANTES SI NO EXISTEN
+    # --- MIGRACIÓN de columnas ---
     for column in ["name", "season"]:
         try:
             await self.db.execute(f"ALTER TABLE players ADD COLUMN {column} TEXT;")
         except Exception:
-            pass  # Ya existe, ignora el error
+            pass  # Ya existe
     await self.db.commit()
-
-    # arranca el loop que refresca las canciones
+    # --- FIN migración ---
+    # Luego sí puedes usar self.db normalmente
     self.refresh_songs.start()
     await self.refresh_songs()
-
 
     async def cog_unload(self):
         await self.db.close()
