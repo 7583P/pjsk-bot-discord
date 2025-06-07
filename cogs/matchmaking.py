@@ -137,15 +137,18 @@ class Matchmaking(commands.Cog):
 async def cog_load(self):
     self.db = await aiosqlite.connect(DB_PATH)
     await self.db.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS players (
-            user_id INTEGER PRIMARY KEY,
-            mmr     INTEGER DEFAULT 0,
-            role    TEXT DEFAULT 'Placement'
-        );
-        """
-    )
+    """
+    CREATE TABLE IF NOT EXISTS players (
+        user_id INTEGER PRIMARY KEY,
+        mmr     INTEGER DEFAULT 0,
+        role    TEXT DEFAULT 'Placement',
+        name    TEXT,
+        season  TEXT
+    );
+    """
+)
     await self.db.commit()
+
     # --- MIGRACIÓN de columnas ---
     for column in ["name", "season"]:
         try:
