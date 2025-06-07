@@ -2,8 +2,12 @@
 
 import os
 import os
+
+DB_PATH = "matchmaking.db"
+
 if os.path.exists(DB_PATH):
     os.remove(DB_PATH)
+
 import re
 import random
 import asyncio
