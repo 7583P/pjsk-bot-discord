@@ -83,6 +83,7 @@ class SongPollView(discord.ui.View):
         self.stop()
         
 
+
 # ------------- CONFIGURACIÓN GLOBAL DEL COG -------------
 DB_PATH           = "matchmaking.db"
 GUILD_ID          = int(os.getenv("GUILD_ID", "0"))
@@ -155,7 +156,6 @@ class Matchmaking(commands.Cog):
                     async with s.get(f"{self.RAW_EN}/{name}.json") as r:
                         return await r.json(content_type=None)
 
-
                 musics = await grab("musics")
                 diffs  = await grab("musicDifficulties")
 
@@ -184,7 +184,7 @@ class Matchmaking(commands.Cog):
         async with self._songs_lock:
             rows = await self.db.execute_fetchall(
                 f"""SELECT title, level, diff FROM songs
-                    WHERE level BETWEEN ? AND ?
+                    WHERE level BETWEEN ? AND ? 
                     AND diff IN ({','.join('?'*len(self.DIFFS))})""",
                 (low, high, *self.DIFFS),
             )
@@ -237,12 +237,17 @@ class Matchmaking(commands.Cog):
         row = await cur.fetchone()
         if row:
             return row
+
         await self.db.execute(
-            "INSERT INTO players (user_id, mmr, role) VALUES (?, 0, 'Placement')",
+            "INSERT OR IGNORE INTO players (user_id, mmr, role) VALUES (?, 0, 'Placement')",
             (user_id,),
         )
         await self.db.commit()
-        return (0, "Placement")
+        cur = await self.db.execute(
+            "SELECT mmr, role FROM players WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        return row
 
     async def ensure_join_channel(self, guild: discord.Guild):
         for ch in guild.text_channels:
@@ -272,15 +277,18 @@ class Matchmaking(commands.Cog):
             new_rooms[idx] = info
         self.rooms = new_rooms
 
-    # ----------  COMANDOS  ----------
+    # ----------  COMANDOS ----------
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="c", description="Unirse a una sala")
     async def join_room(self, interaction: discord.Interaction):
+        # ─────────────── Validación: solo canal "join" ───────────────
         if interaction.channel.name != JOIN_CHANNEL_NAME:
             return await interaction.response.send_message(
-                f"❌ Usa /c en #{JOIN_CHANNEL_NAME}", ephemeral=True
+                f"❌ Este comando solo funciona en el canal #{JOIN_CHANNEL_NAME}.",
+                ephemeral=True
             )
 
+        # ─────────── Lógica original de emparejamiento ───────────
         member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
@@ -289,20 +297,27 @@ class Matchmaking(commands.Cog):
         for rid, info in self.rooms.items():
             if len(info["players"]) >= 5:
                 continue
+
             vals = []
             for m in info["players"]:
                 m_mmr, _ = await self.fetch_player(m.id)
                 vals.append(m_mmr)
+
             if not vals:
                 continue
+
             avg = sum(vals) / len(vals)
             diff = abs(avg - mmr_val)
             if diff < best_score:
                 best_rid, best_score = rid, diff
 
+        # Si no existe sala libre, crear nueva
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
-            ch = await self.ensure_join_channel(interaction.guild)
+
+            # Creamos el hilo justo en este canal "join"
+            ch = interaction.channel
+
             thread = await ch.create_thread(
                 name=f"sala-{new_id}",
                 auto_archive_duration=60,
@@ -311,6 +326,7 @@ class Matchmaking(commands.Cog):
             self.rooms[new_id] = {"players": [], "thread": thread}
             best_rid = new_id
 
+        # Una vez tenemos la sala (best_rid), unimos al jugador
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
@@ -323,11 +339,14 @@ class Matchmaking(commands.Cog):
         )
         await room["thread"].add_user(member)
         await room["thread"].send(f"{member.display_name} se unió — MMR {mmr_val}")
+
+        # Reordenar y renombrar salas según promedio de MMR
         await self.sort_and_rename_rooms(interaction.guild)
 
-        # ----------  NUEVA POLL ----------
+        # Si la sala llega a 5 jugadores, lanzar la votación de canciones
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="d", description="Salir de la sala")
@@ -398,6 +417,7 @@ class Matchmaking(commands.Cog):
             nm = mem.display_name if mem else f"ID {uid}"
             lines.append(f"{i}. {nm} — {mmr_val} MMR")
         await interaction.response.send_message("\n".join(lines))
+
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
         """Muestra las dificultades únicas cargadas en la tabla songs."""
@@ -422,7 +442,6 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-    
     # -----------------  ¡submit5!  -----------------
     @commands.command(name="submit5")
     async def submit5(self, ctx: commands.Context, *, block: str):
