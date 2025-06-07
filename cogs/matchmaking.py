@@ -5,8 +5,6 @@ import os
 
 DB_PATH = "matchmaking.db"
 
-if os.path.exists(DB_PATH):
-    os.remove(DB_PATH)
 
 import re
 import random
@@ -136,9 +134,12 @@ class Matchmaking(commands.Cog):
     # ----------  SQL SETUP ----------
 async def cog_load(self):
     self.db = await aiosqlite.connect(DB_PATH)
+# SOLO para migrar, después bórralo:
+    await self.db.execute("DROP TABLE IF EXISTS players;")
+    await self.db.commit()
     await self.db.executescript(
     """
-    CREATE TABLE IF NOT EXISTS players (
+    CREATE TABLE players (
         user_id INTEGER PRIMARY KEY,
         mmr     INTEGER DEFAULT 0,
         role    TEXT DEFAULT 'Placement',
@@ -148,6 +149,7 @@ async def cog_load(self):
     """
 )
     await self.db.commit()
+
 
     # --- MIGRACIÓN de columnas ---
     for column in ["name", "season"]:
