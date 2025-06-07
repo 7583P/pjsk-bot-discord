@@ -137,7 +137,7 @@ class Matchmaking(commands.Cog):
     # ----------  SQL SETUP ----------
 async def cog_load(self):
     self.db = await aiosqlite.connect(DB_PATH)
-    # SOLO PARA MIGRAR, después bórralo:
+    # SOLO PARA MIGRAR: elimina la tabla vieja y la crea limpia (luego puedes borrar esto)
     await self.db.execute("DROP TABLE IF EXISTS players;")
     await self.db.commit()
     await self.db.executescript(
@@ -152,9 +152,10 @@ async def cog_load(self):
     """
     )
     await self.db.commit()
-    # Luego sí puedes usar self.db normalmente
+    # Ahora sí, el resto de tu inicialización
     self.refresh_songs.start()
     await self.refresh_songs()
+
 
     async def cog_unload(self):
         await self.db.close()
