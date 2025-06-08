@@ -1,6 +1,6 @@
 import os
 import re
-import aiosqlite
+import asyncpg
 from datetime import datetime
 import discord
 from discord import app_commands
@@ -8,11 +8,9 @@ from discord.ext import commands
 from dotenv import load_dotenv
 
 # Cargar variables de entorno
-t = load_dotenv()
+load_dotenv()
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
-
-# Ruta absoluta a la base de datos
-DB_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, "matchmaking.db"))
+DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
 
 # Calcula la temporada actual ('beta' o número cada 3 meses)
 def get_current_season_label() -> str:
@@ -22,34 +20,42 @@ def get_current_season_label() -> str:
     period = months // 3
     return "beta" if period == 0 else str(period)
 
+# Crea una conexión temporal a PostgreSQL (usa un pool en producción)
+async def get_conn():
+    return await asyncpg.connect(DATABASE_URL)
+
 # Inserta o actualiza un jugador (comando /register)
 async def upsert_player(user_id: int, name: str, country: str):
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
-    VALUES (?, ?, 0, 'Placement', ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      name    = excluded.name,
-      country = excluded.country,
-      season  = excluded.season
+    VALUES ($1, $2, 0, 'Placement', $3, $4)
+    ON CONFLICT (user_id) DO UPDATE SET
+      name    = EXCLUDED.name,
+      country = EXCLUDED.country,
+      season  = EXCLUDED.season
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(sql, (user_id, name, country, season))
-        await db.commit()
+    conn = await get_conn()
+    try:
+        await conn.execute(sql, user_id, name, country, season)
+    finally:
+        await conn.close()
 
 # Sincronización inicial sin sobreescribir country
 async def upsert_player_load(user_id: int, name: str):
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
-    VALUES (?, ?, 0, 'Placement', '', ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      name    = excluded.name,
-      season  = excluded.season
+    VALUES ($1, $2, 0, 'Placement', '', $3)
+    ON CONFLICT (user_id) DO UPDATE SET
+      name    = EXCLUDED.name,
+      season  = EXCLUDED.season
     """
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(sql, (user_id, name, season))
-        await db.commit()
+    conn = await get_conn()
+    try:
+        await conn.execute(sql, user_id, name, season)
+    finally:
+        await conn.close()
 
 class PlayersCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -57,7 +63,6 @@ class PlayersCog(commands.Cog):
         self.synced = False
 
     async def cog_load(self):
-        # Registrar y sincronizar el comando en el guild
         await self.bot.tree.sync(guild=discord.Object(id=GUILD_ID))
 
     @commands.Cog.listener()
@@ -99,4 +104,3 @@ class PlayersCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayersCog(bot))
-
