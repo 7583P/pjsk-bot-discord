@@ -24,6 +24,7 @@ def get_current_season_label() -> str:
 
 # Inserta o actualiza un jugador (comando /register)
 async def upsert_player(user_id: int, name: str, country: str):
+    print DB_PATH
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
