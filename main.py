@@ -84,3 +84,8 @@ if __name__ == "__main__":
         sys.exit(1)
     bot.run(TOKEN)
 
+async def run_bot_async():
+    if not TOKEN:
+        print("❌ DISCORD_TOKEN no definido.")
+        return
+    await bot.start(TOKEN)
