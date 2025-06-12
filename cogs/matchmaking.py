@@ -289,11 +289,11 @@ class Matchmaking(commands.Cog):
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "❌ Ya estás en esa sala.", ephemeral=True
+                "Your are already in a room", ephemeral=True
             )
         room["players"].append(member)
         await interaction.response.send_message(
-            f"✅ Te uniste a sala-{best_rid} — MMR {mmr_val}"
+            f"Joined room {best_rid} — MMR {mmr_val}"
         )
         await room["thread"].add_user(member)
         await room["thread"].send(f"{member.display_name} se unió — MMR {mmr_val}")
@@ -317,12 +317,12 @@ class Matchmaking(commands.Cog):
                         pass
                     self.rooms.pop(rid)
                 await interaction.response.send_message(
-                    f"🚪 Saliste de sala-{rid}."
+                    f"Leaved the room{rid}."
                 )
                 await self.sort_and_rename_rooms(interaction.guild)
                 return
         await interaction.response.send_message(
-            "❌ No estás en ninguna sala.", ephemeral=True
+            "You are not in a room", ephemeral=True
         )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
