@@ -84,7 +84,7 @@ class PlayersCog(commands.Cog):
             await upsert_player(member.id, member.display_name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"👋 Bienvenido {member.mention}! Ejecuta `/register <ISO2>` para guardar tu país."
+                    f"Welcome {member.mention} execute command `/register <ISO2>` on #register to save your country"
                 )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))

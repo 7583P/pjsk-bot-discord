@@ -346,7 +346,7 @@ class Matchmaking(commands.Cog):
         name = user.display_name
         if role == "Placement":
             await interaction.response.send_message(
-                f"{name} está en estado Placement y aún no tiene MMR asignado."
+                f"{name} Is in placement"
             )
         else:
             await interaction.response.send_message(
