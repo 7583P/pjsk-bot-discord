@@ -84,7 +84,7 @@ class PlayersCog(commands.Cog):
             await upsert_player(member.id, member.display_name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention}Execute command `/register <ISO2>` into #register to see your country in the page"
+                    f"Welcome {member.mention} Execute command `/register <ISO2>` into #register to see your country in the page"
                 )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -94,11 +94,11 @@ class PlayersCog(commands.Cog):
         code = country.strip().upper()
         if not re.match(r'^[A-Z]{2}$', code):
             return await interaction.response.send_message(
-                "❌ Debes indicar un código ISO de dos letras.", ephemeral=True
+                "You should especify your country with 2 letters (ISO2)", ephemeral=True
             )
         await upsert_player(interaction.user.id, interaction.user.display_name, code)
         await interaction.response.send_message(
-            f"✅ {interaction.user.display_name}, país registrado **{code}**.",
+            f"✅ {interaction.user.display_name}, country registered **{code}**.",
             ephemeral=True
         )
 
