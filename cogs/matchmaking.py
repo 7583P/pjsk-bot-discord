@@ -296,7 +296,7 @@ class Matchmaking(commands.Cog):
             f"Joined room {best_rid} — MMR {mmr_val}"
         )
         await room["thread"].add_user(member)
-        await room["thread"].send(f"{member.display_name} se unió — MMR {mmr_val}")
+        await room["thread"].send(f"{member.display_name} Joined — MMR {mmr_val}")
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
@@ -404,7 +404,7 @@ class Matchmaking(commands.Cog):
             None,
         )
         if not room:
-            return await ctx.send("❌ Usa este comando dentro de un hilo de sala.")
+            return await ctx.send("Use this command into a room thread")
 
         players_list = []
         for ln in lines:
