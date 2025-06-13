@@ -245,14 +245,14 @@ class Matchmaking(commands.Cog):
         for idx, (old_rid, _) in enumerate(avgs, start=1):
             info = self.rooms[old_rid]
             try:
-                await info["thread"].edit(name=f"sala-{idx}")
+                await info["thread"].edit(name=f"room-{idx}")
             except:
                 pass
             new_rooms[idx] = info
         self.rooms = new_rooms
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="c", description="Unirse a una sala")
+    @app_commands.command(name="c", description="Join a room")
     async def join_room(self, interaction: discord.Interaction):
         if interaction.channel.name != JOIN_CHANNEL_NAME:
             return await interaction.response.send_message(
