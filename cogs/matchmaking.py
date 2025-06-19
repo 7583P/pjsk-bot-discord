@@ -65,31 +65,30 @@ class SongPollView(discord.ui.View):
         select.callback = select_callback
         self.add_item(select)
 
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        try:
-            await self.message.edit(view=self)
-        except:
-            pass
+async def on_timeout(self):
+    for child in self.children:
+        child.disabled = True
+    try:
+        await self.message.edit(view=self)
+    except:
+        pass
 
-        if not self.votes:
-            return await self.thread.send(
-                "⚠️ No se registraron votos en el tiempo establecido."
-            )
-
-        max_votes = max(self.votes.values())
-        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
-        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
-        title, lvl, diff = chosen.split("|")
-
-        await self.thread.send(
-            f"🏆 **Resultado de la votación** 🏆\n"
-            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
+    if not self.votes:
+        return await self.thread.send(
+            "⚠️ No se registraron votos en el tiempo establecido."
         )
-        self.stop()
 
+    max_votes = max(self.votes.values())
+    winners   = [opt for opt, c in self.votes.items() if c == max_votes]
+    chosen    = random.choice(winners) if len(winners) > 1 else winners[0]
+    title, lvl, diff = chosen.split("|")
 
+    await self.thread.send(
+        f"🏆 **Resultado de la votación** 🏆\n"
+        f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
+    )
+    self.stop()
+    
 class Matchmaking(commands.Cog):
     RAW_EN = (
         "https://raw.githubusercontent.com/"
@@ -207,6 +206,20 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
+    async def _room_timeout(self, room_id: int):
+        await asyncio.sleep(30 * 60)
+        room = self.rooms.get(room_id)
+        if room and len(room["players"]) < 5:
+            thread = room["thread"]
+            try:
+                await thread.send(
+                    "⚠️ Sala eliminada por inactividad: no alcanzó 5 jugadores en 30 min."
+                )
+                await thread.delete()
+            except:
+                pass
+            self.rooms.pop(room_id, None)
+
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -276,6 +289,8 @@ class Matchmaking(commands.Cog):
             diff = abs(avg - mmr_val)
             if diff < best_score:
                 best_rid, best_score = rid, diff
+                
+       # Buscamos la mejor sala
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
             ch = interaction.channel
@@ -284,13 +299,18 @@ class Matchmaking(commands.Cog):
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread,
             )
+            # ← dentro del IF, 12 espacios de indentación
             self.rooms[new_id] = {"players": [], "thread": thread}
+            asyncio.create_task(self._room_timeout(new_id))
             best_rid = new_id
+
+        # ← fuera del IF, vuelve a 8 espacios de indentación
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "Your are already in a room", ephemeral=True
+                "You are already in a room", ephemeral=True
             )
+
         room["players"].append(member)
         await interaction.response.send_message(
             f"Joined room {best_rid} — MMR {mmr_val}"
