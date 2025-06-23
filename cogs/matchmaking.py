@@ -2,7 +2,7 @@ import os
 import re
 import random
 import asyncio
-
+import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
@@ -65,30 +65,31 @@ class SongPollView(discord.ui.View):
         select.callback = select_callback
         self.add_item(select)
 
-async def on_timeout(self):
-    for child in self.children:
-        child.disabled = True
-    try:
-        await self.message.edit(view=self)
-    except:
-        pass
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except:
+            pass
 
-    if not self.votes:
-        return await self.thread.send(
-            "⚠️ No se registraron votos en el tiempo establecido."
+        if not self.votes:
+            return await self.thread.send(
+                "⚠️ No se registraron votos en el tiempo establecido."
+            )
+
+        max_votes = max(self.votes.values())
+        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
+        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
+        title, lvl, diff = chosen.split("|")
+
+        await self.thread.send(
+            f"🏆 **Resultado de la votación** 🏆\n"
+            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
         )
+        self.stop()
 
-    max_votes = max(self.votes.values())
-    winners   = [opt for opt, c in self.votes.items() if c == max_votes]
-    chosen    = random.choice(winners) if len(winners) > 1 else winners[0]
-    title, lvl, diff = chosen.split("|")
 
-    await self.thread.send(
-        f"🏆 **Resultado de la votación** 🏆\n"
-        f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
-    )
-    self.stop()
-    
 class Matchmaking(commands.Cog):
     RAW_EN = (
         "https://raw.githubusercontent.com/"
@@ -110,6 +111,7 @@ class Matchmaking(commands.Cog):
         self.bot = bot
         self._songs_lock = asyncio.Lock()
         self.rooms: dict[int, dict] = {}
+        self.inactivity: dict[int, dict[int, dict[str, datetime.datetime]]] = {}
 
     async def cog_load(self):
         # Pool global de PostgreSQL
@@ -127,6 +129,7 @@ class Matchmaking(commands.Cog):
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
         await self.refresh_songs()
+        self.monitor_inactivity.start()
 
     async def cog_unload(self):
         await self.db_pool.close()
@@ -162,6 +165,11 @@ class Matchmaking(commands.Cog):
     @refresh_songs.before_loop
     async def _wait_ready(self):
         await self.bot.wait_until_ready()
+
+    @monitor_inactivity.before_loop
+    async def _wait_for_ready_inactivity(self):
+        await self.bot.wait_until_ready()
+
 
     async def _get_9_songs(self, low, high):
         async with self._songs_lock:
@@ -205,20 +213,6 @@ class Matchmaking(commands.Cog):
             view=view
         )
         view.message = msg
-
-    async def _room_timeout(self, room_id: int):
-        await asyncio.sleep(30 * 60)
-        room = self.rooms.get(room_id)
-        if room and len(room["players"]) < 5:
-            thread = room["thread"]
-            try:
-                await thread.send(
-                    "⚠️ Sala eliminada por inactividad: no alcanzó 5 jugadores en 30 min."
-                )
-                await thread.delete()
-            except:
-                pass
-            self.rooms.pop(room_id, None)
 
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
@@ -264,6 +258,43 @@ class Matchmaking(commands.Cog):
             new_rooms[idx] = info
         self.rooms = new_rooms
 
+    @tasks.loop(minutes=1)
+    async def monitor_inactivity(self):
+        now = datetime.datetime.utcnow()
+        for rid, info in list(self.rooms.items()):
+            thread = info["thread"]
+            players = info["players"]
+
+            # Si el hilo está lleno, resetea y sigue
+            if len(players) >= 5:
+                self.inactivity.pop(thread.id, None)
+                continue
+
+            data = self.inactivity.setdefault(thread.id, {})
+
+            for member in list(players):
+                entry = data.setdefault(member.id, {"last": now, "warned_at": None})
+                last = entry["last"]
+                warned = entry["warned_at"]
+
+                # Aviso tras 5 min sin escribir
+                if warned is None and (now - last) > datetime.timedelta(minutes=5):
+                    await thread.send(
+                        f"{member.mention} ¡Hace rato que no escribes! Tienes 2 min para responder o serás eliminado."
+                    )
+                    entry["warned_at"] = now
+
+                # Si ya avisamos y pasaron 2 min sin escribir, expulsión
+                elif warned and (now - warned) > datetime.timedelta(minutes=2) and (now - last) > datetime.timedelta(minutes=5):
+                    await thread.send(f"{member.mention} has sido eliminado por inactividad.")
+                    try:
+                        await thread.remove_user(member)
+                    except:
+                        pass
+                    info["players"].remove(member)
+                    data.pop(member.id, None)
+
+
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="c", description="Join a room")
     async def join_room(self, interaction: discord.Interaction):
@@ -289,8 +320,6 @@ class Matchmaking(commands.Cog):
             diff = abs(avg - mmr_val)
             if diff < best_score:
                 best_rid, best_score = rid, diff
-                
-       # Buscamos la mejor sala
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
             ch = interaction.channel
@@ -299,18 +328,13 @@ class Matchmaking(commands.Cog):
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread,
             )
-            # ← dentro del IF, 12 espacios de indentación
             self.rooms[new_id] = {"players": [], "thread": thread}
-            asyncio.create_task(self._room_timeout(new_id))
             best_rid = new_id
-
-        # ← fuera del IF, vuelve a 8 espacios de indentación
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "You are already in a room", ephemeral=True
+                "Your are already in a room", ephemeral=True
             )
-
         room["players"].append(member)
         await interaction.response.send_message(
             f"Joined room {best_rid} — MMR {mmr_val}"
@@ -320,6 +344,26 @@ class Matchmaking(commands.Cog):
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # Ignorar bots y mensajes fuera de threads
+        if message.author.bot or not isinstance(message.channel, discord.Thread):
+            return
+
+        thread_id = message.channel.id
+        user_id   = message.author.id
+        now = datetime.datetime.utcnow()
+
+        # Solo si el thread está en self.rooms
+        if thread_id not in self.rooms:
+            return
+
+        data = self.inactivity.setdefault(thread_id, {})
+        entry = data.setdefault(user_id, {"last": now, "warned_at": None})
+        entry["last"] = now
+        entry["warned_at"] = None
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="d", description="Salir de la sala")
@@ -430,7 +474,7 @@ class Matchmaking(commands.Cog):
         for ln in lines:
             m = ENTRY_RE.match(ln)
             if not m:
-                return await ctx.send(f"❌ Formato incorrecto: `{ln}`")
+                return await ctx.send(f"❌ Formato incorrecto: {ln}")
             uid = int(m.group("id"))
             cc = m.group("cc")
             stats = list(map(int, m.group("stats").split(",")))
