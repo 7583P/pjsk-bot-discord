@@ -2,10 +2,11 @@ import os
 import re
 import random
 import asyncio
-
+import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
+from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord import app_commands
 
@@ -111,6 +112,68 @@ class Matchmaking(commands.Cog):
         self.bot = bot
         self._songs_lock = asyncio.Lock()
         self.rooms: dict[int, dict] = {}
+        self.inactivity: dict[int, dict[int, dict]] = {}
+        self.monitor_inactivity.start()
+
+
+    @tasks.loop(minutes=1)
+    async def monitor_inactivity(self):
+        now = datetime.datetime.utcnow()
+        for rid, info in list(self.rooms.items()):
+            thread  = info["thread"]
+            players = info["players"]
+
+            # Si la sala está llena, desactivar monitoreo
+            if len(players) >= 5:
+                self.inactivity.pop(thread.id, None)
+                continue
+
+            data = self.inactivity.setdefault(thread.id, {})
+            for member in list(players):
+                entry = data.setdefault(member.id, {"last": now, "warned_at": None})
+                last, warned = entry["last"], entry["warned_at"]
+
+                # 5 min sin escribir → avisar
+                if warned is None and now - last > datetime.timedelta(minutes=5):
+                    await thread.send(
+                        f"{member.mention} ¡Hace 5 minutos que no escribes! Tienes 2 min para responder."
+                    )
+                    entry["warned_at"] = now
+
+                # 2 min después del aviso y sigue inactivo → expulsar
+                elif warned and now - warned > datetime.timedelta(minutes=2) \
+                     and now - last > datetime.timedelta(minutes=7):
+                    try:
+                        await thread.remove_user(member)
+                    except:
+                        pass
+                    players.remove(member)
+                    data.pop(member.id, None)
+                    await thread.send(f"{member.mention} ha sido eliminado por inactividad.")
+
+    @monitor_inactivity.before_loop
+    async def before_monitor(self):
+        await self.bot.wait_until_ready()
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        # — Inicio: reset de inactividad en hilos privados —
+        if isinstance(message.channel, discord.Thread) and not message.author.bot:
+            now = datetime.datetime.utcnow()
+            data = self.inactivity.setdefault(message.channel.id, {})
+            entry = data.setdefault(
+                message.author.id,
+                {"last": now, "warned_at": None}
+            )
+            entry["last"] = now
+            entry["warned_at"] = None
+        # — Fin: reset de inactividad —
+
+        # Tu lógica normal de on_message (si la tienes) o simplemente retorna si no la hay
+        if message.author.bot:
+            return
+        # … resto de tu código de on_message si aplica …
+
 
     async def cog_load(self):
         # Pool global de PostgreSQL
@@ -251,52 +314,65 @@ class Matchmaking(commands.Cog):
             new_rooms[idx] = info
         self.rooms = new_rooms
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="c", description="Join a room")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
-        if interaction.channel.name != JOIN_CHANNEL_NAME:
+        # 1) Validación de canal
+        ch = interaction.channel
+        if not isinstance(ch, TextChannel):
             return await interaction.response.send_message(
-                f"❌ Este comando solo funciona en el canal #{JOIN_CHANNEL_NAME}.",
+                "❌ Este comando solo funciona en el canal de texto #join.",
                 ephemeral=True
             )
+
         member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
+        # 2) Buscar sala existente o crear una nueva
         best_rid, best_score = None, float("inf")
         for rid, info in self.rooms.items():
             if len(info["players"]) >= 5:
                 continue
-            vals = []
-            for m in info["players"]:
-                m_mmr, _ = await self.fetch_player(m.id)
-                vals.append(m_mmr)
-            if not vals:
-                continue
-            avg = sum(vals) / len(vals)
-            diff = abs(avg - mmr_val)
-            if diff < best_score:
-                best_rid, best_score = rid, diff
+            # … aquí tu cálculo de diff …
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
-            ch = interaction.channel
+
+            # 3) Crear hilo privado
             thread = await ch.create_thread(
                 name=f"sala-{new_id}",
                 auto_archive_duration=60,
-                type=discord.ChannelType.public_thread,
+                type=discord.ChannelType.private_thread,
+                invitable=False
             )
             self.rooms[new_id] = {"players": [], "thread": thread}
             best_rid = new_id
+
+            # 4) Borrar notificación automática
+            async for msg in ch.history(limit=5):
+                if msg.type == MessageType.thread_created and msg.author == interaction.user:
+                    await msg.delete()
+                    break
+
+        # 5) Añadir al jugador y enviar mensajes
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "Your are already in a room", ephemeral=True
+                "Ya estás en una sala.", ephemeral=True
             )
         room["players"].append(member)
+
+        # Mensaje efímero al usuario
         await interaction.response.send_message(
-            f"Joined room {best_rid} — MMR {mmr_val}"
+            f"Te metí en sala-{best_rid} 🎉", ephemeral=True
         )
+        # Mensaje limpio en #join
+        await ch.send(
+            f"{member.mention} Joined Room **{best_rid}**, MMR: **{mmr_val}**"
+        )
+        # Finalmente, añadirlo al hilo privado
         await room["thread"].add_user(member)
-        await room["thread"].send(f"{member.display_name} Joined — MMR {mmr_val}")
+
+        # 6) Reordenar nombres y lanzar votación si la sala se llena
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
