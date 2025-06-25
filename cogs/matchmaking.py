@@ -130,7 +130,7 @@ class Matchmaking(commands.Cog):
 
             data = self.inactivity.setdefault(thread.id, {})
             for member in list(players):
-                entry = data.setdefault(member.id, {"last": now, "warned_at": None})
+                entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
                 last, warned = entry["last"], entry["warned_at"]
 
                 # 5 min sin escribir → avisar
@@ -149,11 +149,29 @@ class Matchmaking(commands.Cog):
                         pass
                     players.remove(member)
                     data.pop(member.id, None)
-                    await thread.send(f"{member.mention} ha sido eliminado por inactividad.")
+                    await thread.send(
+                        f"{member.mention} ha sido eliminado por inactividad."
+                    )
+
+                    # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
+                    if not players:
+                        try:
+                            # Archivamos y bloqueamos el hilo
+                            await thread.edit(archived=True, locked=True)
+                            # Lo borramos del servidor
+                            await thread.delete()
+                        except:
+                            pass
+                        # Limpiamos las estructuras internas
+                        self.rooms.pop(rid, None)
+                        self.inactivity.pop(thread.id, None)
+                        # Pasamos a la siguiente sala
+                        continue
 
     @monitor_inactivity.before_loop
     async def before_monitor(self):
         await self.bot.wait_until_ready()
+
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -328,12 +346,13 @@ class Matchmaking(commands.Cog):
         member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
-        # 2) Buscar sala existente o crear una nueva
-        best_rid, best_score = None, float("inf")
+        # 2) Buscar la PRIMERA sala con menos de 5 jugadores
+        best_rid = None
         for rid, info in self.rooms.items():
-            if len(info["players"]) >= 5:
-                continue
-            # … aquí tu cálculo de diff …
+            if len(info["players"]) < 5:
+                best_rid = rid
+                break
+
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
 
