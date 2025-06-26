@@ -136,7 +136,7 @@ class Matchmaking(commands.Cog):
                 # 5 min sin escribir → avisar
                 if warned is None and now - last > datetime.timedelta(minutes=5):
                     await thread.send(
-                        f"{member.mention} ¡Hace 5 minutos que no escribes! Tienes 2 min para responder."
+                        f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
                     )
                     entry["warned_at"] = now
 
@@ -150,7 +150,7 @@ class Matchmaking(commands.Cog):
                     players.remove(member)
                     data.pop(member.id, None)
                     await thread.send(
-                        f"{member.mention} ha sido eliminado por inactividad."
+                        f"{member.mention} have been kicked due to inactivity"
                     )
 
                     # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
