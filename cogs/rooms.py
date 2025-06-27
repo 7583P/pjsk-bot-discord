@@ -71,7 +71,7 @@ class Rooms(commands.Cog):
 
     async def on_room_finished(self, room_id: int):
         """
-        Listener para evento 'room_finished' que programa la eliminación de la sala.
+        Listener para evento 'room_finished' que programa la eliminación de la salaa.
         """
         await asyncio.sleep(10)
         matchmaking = self.bot.get_cog("Matchmaking")
