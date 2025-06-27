@@ -16,7 +16,7 @@ async def setup(bot: commands.Bot):
 class Rooms(commands.Cog):
     """
     Cog que publica en un único mensaje el listado de salas activas y sus jugadores.
-    En lugar de borrar y reenviar, edita el mensaje para añadir un footer con tiempo de actualización.
+    Edita el mensaje cada 5 s e incluye un indicador de "Last Updated".
     Elimina salas 10 s después de recibir evento 'room_finished'.
     """
     def __init__(self, bot: commands.Bot):
@@ -51,7 +51,7 @@ class Rooms(commands.Cog):
             rooms = matchmaking.rooms
             # Construir líneas de estado
             if not rooms:
-                content = "**No active rooms**"
+                lines = ["**No hay salas activas.**"]
             else:
                 sorted_rooms = []
                 for room_id, players in rooms.items():
@@ -59,33 +59,29 @@ class Rooms(commands.Cog):
                     avg = sum(mmrs)//len(mmrs) if mmrs else 0
                     sorted_rooms.append((room_id, avg, players))
                 sorted_rooms.sort(key=lambda x: x[1], reverse=True)
-                lines: list[str] = []
+                lines = []
                 for room_id, avg_mmr, players in sorted_rooms:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
                     for member, mmr in players:
                         lines.append(f"{member.mention} ({mmr})")
                     lines.append("")
-                content = "\n".join(lines)
 
-            # Footer de tiempo
+            # Calcular tiempo transcurrido
             now = int(time.time())
-            if self.last_update:
-                elapsed = now - self.last_update
-            else:
-                elapsed = 0
-            footer = f"\n*Actualizado hace {elapsed} segundos.*"
-            full = content + footer
+            elapsed = now - self.last_update if self.last_update else 0
+            self.last_update = now
+            # Indicador de última actualización
+            lines.append(f"**Last Updated:** hace {elapsed} segundos. (editado)")
 
-            # Si no hay mensaje previo, envia uno nuevo
+            content = "\n".join(lines)
+            # Enviar o editar mensaje
             if not self.posted_message:
-                self.posted_message = await channel.send(full)
+                self.posted_message = await channel.send(content)
             else:
                 try:
-                    await self.posted_message.edit(content=full)
+                    await self.posted_message.edit(content=content)
                 except discord.NotFound:
-                    # Si fue borrado, crear de nuevo
-                    self.posted_message = await channel.send(full)
-            self.last_update = now
+                    self.posted_message = await channel.send(content)
 
         except Exception as e:
             print(f"›› [Rooms] Error en actualización: {e}")
