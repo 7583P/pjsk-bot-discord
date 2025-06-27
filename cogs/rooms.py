@@ -81,29 +81,36 @@ class Rooms(commands.Cog):
                 # Preparar lista de tuplas (room_id, avg_mmr, players)
                 rooms_list = []
                 for room_id, players in rooms.items():
+                    # Convertir todos los valores de MMR a entero
                     mmr_vals = []
                     for p in players:
                         try:
                             val = int(p[1])
                         except Exception:
-                            # Si no es entero, omitir o poner 0
                             val = 0
                         mmr_vals.append(val)
                     avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
                     rooms_list.append((room_id, avg_mmr, players))
                 # Ordenar por MMR promedio descendente
-                sorted_rooms = sorted(rooms_list, key=lambda item: item[1], reverse=True)
+                sorted_rooms = sorted(rooms_list, key=lambda x: x[1], reverse=True)
 
                 # Construir líneas
                 for room_id, avg_mmr, players in sorted_rooms:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
                     for player in players:
                         member = player[0]
+                        # Obtener nombre sin usar mención
+                        if hasattr(member, 'display_name'):
+                            name = member.display_name
+                        elif hasattr(member, 'name'):
+                            name = member.name
+                        else:
+                            name = str(member)
                         try:
                             mmr = int(player[1])
                         except Exception:
                             mmr = 0
-                        lines.append(f"{member.mention} ({mmr})")
+                        lines.append(f"{name} ({mmr})")
                     lines.append("")
 
             # Añadir timestamp relativo de Discord
