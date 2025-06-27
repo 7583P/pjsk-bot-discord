@@ -7,19 +7,10 @@ from discord.ext import commands, tasks
 ROOMS_CHANNEL_ID = 1371307831176728706
 
 async def setup(bot: commands.Bot):
-    """
-    Setup asíncrono para discord.py v2: registra el cog Rooms.
-    """
     await bot.add_cog(Rooms(bot))
     print("✅ Cog cargado: cogs.rooms")
 
 class Rooms(commands.Cog):
-    """
-    Cog que publica en un único mensaje el listado de salas activas y sus jugadores.
-    Edita el mensaje usando Discord timestamps (<t:epoch:R>) para mostrar 'Last Updated'.
-    Actualiza el mensaje cada 15 s y al recibir eventos 'room_updated' y 'room_finished'.
-    """
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.posted_message: discord.Message | None = None
@@ -33,10 +24,7 @@ class Rooms(commands.Cog):
         self.bot.remove_listener(self.on_room_finished)
 
     def _get_channel(self) -> discord.TextChannel | None:
-        channel = self.bot.get_channel(ROOMS_CHANNEL_ID)
-        if not channel:
-            print(f"›› [Rooms] Canal ID {ROOMS_CHANNEL_ID} no encontrado.")
-        return channel
+        return self.bot.get_channel(ROOMS_CHANNEL_ID)
 
     @tasks.loop(seconds=15.0)
     async def update_rooms(self):
@@ -45,11 +33,6 @@ class Rooms(commands.Cog):
     @update_rooms.before_loop
     async def before_update(self):
         await self.bot.wait_until_ready()
-        print("›› [Rooms] Loop de salas listo (15s interval).")
-
-    @update_rooms.error
-    async def update_error(self, error):
-        print(f"›› [Rooms] Error en loop de actualización: {error}")
 
     async def on_room_updated(self, room_id: int | None = None):
         await self._do_update()
@@ -60,75 +43,56 @@ class Rooms(commands.Cog):
             if not channel:
                 return
 
-            matchmaking = self.bot.get_cog("Matchmaking")
-            if not matchmaking or not hasattr(matchmaking, 'rooms'):
-                return
-            rooms = matchmaking.rooms
+            mm_cog = self.bot.get_cog("Matchmaking")
+            rooms = getattr(mm_cog, 'rooms', {}) if mm_cog else {}
             lines: list[str] = []
 
             if not rooms:
                 lines.append("**No hay salas activas.**")
             else:
                 rooms_list = []
-                for room_id, players in rooms.items():
+                # Recolectar datos de cada sala
+                for rid, info in rooms.items():
+                    players = info.get('players', [])
+                    player_data = []
                     mmr_vals = []
-                    valid_players: list[tuple[discord.Member, int]] = []
-                    for entry in players:
-                        # Resolver miembro si es ID o Member
-                        member = None
-                        raw_mmr = None
-                        if isinstance(entry, discord.Member):
-                            member = entry
-                            raw_mmr = None  # fallback later
-                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
-                            raw_member, raw_mmr = entry[0], entry[1]
-                            if isinstance(raw_member, discord.Member):
-                                member = raw_member
-                            else:
-                                try:
-                                    member_id = int(raw_member)
-                                    member = channel.guild.get_member(member_id)
-                                except Exception:
-                                    member = None
-                        if not member:
-                            continue
-                        # procesar MMR como entero
-                        try:
-                            mmr_value = int(raw_mmr) if raw_mmr is not None else 0
-                        except Exception:
-                            mmr_value = 0
-                        mmr_vals.append(mmr_value)
-                        valid_players.append((member, mmr_value))
-                    avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
-                    rooms_list.append((room_id, avg_mmr, valid_players))
+                    # Para cada miembro, obtener mmr desde DB y nombre
+                    for mem in players:
+                        if isinstance(mem, discord.Member):
+                            # obtener mmr (sincrónico en loop async)
+                            try:
+                                mmr_val, _ = await mm_cog.fetch_player(mem.id)
+                            except:
+                                mmr_val = 0
+                            player_data.append((mem, mmr_val))
+                            mmr_vals.append(mmr_val)
+                    avg_mmr = sum(mmr_vals)//len(mmr_vals) if mmr_vals else 0
+                    rooms_list.append((rid, avg_mmr, player_data))
 
-                # ordenar por MMR descendente
+                # ordenar por MMR promedio descendente
                 rooms_list.sort(key=lambda x: x[1], reverse=True)
-                for room_id, avg_mmr, players in rooms_list:
-                    lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
-                    for member, mmr_value in players:
-                        name = member.display_name or member.name
-                        lines.append(f"{name} ({mmr_value})")
+
+                # Construir líneas
+                for rid, avg, pdata in rooms_list:
+                    lines.append(f"**Sala {rid}** - MMR promedio: **{avg}**")
+                    for mem, mmr in pdata:
+                        lines.append(f"{mem.display_name} ({mmr})")
                     lines.append("")
 
             now = int(time.time())
             lines.append(f"**Last Updated:** <t:{now}:R>")
-
             content = "\n".join(lines)
+
             if not self.posted_message:
                 self.posted_message = await channel.send(content)
             else:
-                try:
-                    await self.posted_message.edit(content=content)
-                except discord.NotFound:
-                    pass
-
+                await self.posted_message.edit(content=content)
         except Exception as e:
-            print(f"›› [Rooms] Excepción en _do_update: {e}")
+            print(f"›› [Rooms] Error: {e}")
 
     async def on_room_finished(self, room_id: int):
         await asyncio.sleep(10)
-        matchmaking = self.bot.get_cog("Matchmaking")
-        if matchmaking and hasattr(matchmaking, 'rooms') and room_id in matchmaking.rooms:
-            del matchmaking.rooms[room_id]
+        mm_cog = self.bot.get_cog("Matchmaking")
+        if mm_cog and room_id in getattr(mm_cog, 'rooms', {}):
+            del mm_cog.rooms[room_id]
             await self._do_update()
