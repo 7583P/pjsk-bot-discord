@@ -48,7 +48,7 @@ class Rooms(commands.Cog):
             lines: list[str] = []
 
             if not rooms:
-                lines.append("**No hay salas activas.**")
+                lines.append("**No active rooms**")
             else:
                 rooms_list = []
                 # Recolectar datos de cada sala
@@ -74,7 +74,7 @@ class Rooms(commands.Cog):
 
                 # Construir líneas
                 for rid, avg, pdata in rooms_list:
-                    lines.append(f"**Sala {rid}** - MMR promedio: **{avg}**")
+                    lines.append(f"**Room {rid}** - Average MMR: **{avg}**")
                     for mem, mmr in pdata:
                         lines.append(f"{mem.display_name} ({mmr})")
                     lines.append("")
