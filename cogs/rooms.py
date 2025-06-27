@@ -81,7 +81,9 @@ class Rooms(commands.Cog):
                 # Preparar lista de tuplas (room_id, avg_mmr, players)
                 rooms_list = []
                 for room_id, players in rooms.items():
-                    avg_mmr = (sum(p[1] for p in players) // len(players)) if players else 0
+                    # Asegurar MMR entero
+                    mmr_vals = [int(p[1]) for p in players]
+                    avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
                     rooms_list.append((room_id, avg_mmr, players))
                 # Ordenar por MMR promedio descendente
                 sorted_rooms = sorted(rooms_list, key=lambda item: item[1], reverse=True)
@@ -91,7 +93,7 @@ class Rooms(commands.Cog):
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
                     for player in players:
                         member = player[0]
-                        mmr    = player[1]
+                        mmr    = int(player[1])
                         lines.append(f"{member.mention} ({mmr})")
                     lines.append("")
 
