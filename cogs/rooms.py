@@ -19,12 +19,11 @@ class Rooms(commands.Cog):
     Edita el mensaje usando Discord timestamps (<t:epoch:R>) para mostrar 'Last Updated'.
     Actualiza el mensaje cada 15 s y al recibir eventos 'room_updated' y 'room_finished'.
     """
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.posted_message: discord.Message | None = None
-        # Iniciar loop de actualización cada 15 segundos
         self.update_rooms.start()
-        # Listeners para eventos externos
         bot.add_listener(self.on_room_updated, 'room_updated')
         bot.add_listener(self.on_room_finished, 'room_finished')
 
@@ -64,35 +63,44 @@ class Rooms(commands.Cog):
             if not matchmaking or not hasattr(matchmaking, 'rooms'):
                 return
             rooms = matchmaking.rooms
-            lines = []
+            lines: list[str] = []
+
             if not rooms:
                 lines.append("**No hay salas activas.**")
             else:
+                # Preparar y filtrar jugadores válidos
                 rooms_list = []
                 for room_id, players in rooms.items():
                     mmr_vals = []
-                    valid_players = []
-                    for item in players:
-                        if isinstance(item, (list, tuple)) and len(item) >= 2:
-                            member, raw_mmr = item[0], item[1]
+                    valid_players: list[tuple[discord.Member, int]] = []
+                    for entry in players:
+                        if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            member, raw_mmr = entry[0], entry[1]
                             try:
-                                val = int(raw_mmr)
+                                mmr_value = int(raw_mmr)
                             except Exception:
-                                val = 0
-                            mmr_vals.append(val)
-                            valid_players.append((member, val))
+                                mmr_value = 0
+                            mmr_vals.append(mmr_value)
+                            valid_players.append((member, mmr_value))
                     avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
                     rooms_list.append((room_id, avg_mmr, valid_players))
+
+                # Ordenar salas por MMR descendente
                 sorted_rooms = sorted(rooms_list, key=lambda x: x[1], reverse=True)
+
+                # Construir líneas para cada sala
                 for room_id, avg_mmr, players in sorted_rooms:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
-                    for member, mmr in players:
-                        # Obtener nombre de display sin @mention
+                    for member, mmr_value in players:
+                        # Extraer nombre sin mención
                         name = getattr(member, 'display_name', None) or getattr(member, 'name', None) or str(member)
-                        lines.append(f"{name} ({mmr})")
+                        lines.append(f"{name} ({mmr_value})")
                     lines.append("")
+
+            # Timestamp relativo de Discord
             now = int(time.time())
             lines.append(f"**Last Updated:** <t:{now}:R>")
+
             content = "\n".join(lines)
             if not self.posted_message:
                 self.posted_message = await channel.send(content)
@@ -100,7 +108,7 @@ class Rooms(commands.Cog):
                 try:
                     await self.posted_message.edit(content=content)
                 except discord.NotFound:
-                    self.posted_message = await channel.send(content)
+                    print("›› [Rooms] Mensaje original no encontrado, no se reenvía.")
         except Exception as e:
             print(f"›› [Rooms] Excepción en _do_update: {e}")
 

@@ -386,7 +386,7 @@ class Matchmaking(commands.Cog):
         )
         # Mensaje limpio en #join
         await ch.send(
-            f"{member.mention} Joined Room **{best_rid}**, MMR: **{mmr_val}**"
+            f"{member.mention} Joined Room **{best_rid}** ( MMR  **{mmr_val}** )"
         )
         # Finalmente, añadirlo al hilo privado
         await room["thread"].add_user(member)
