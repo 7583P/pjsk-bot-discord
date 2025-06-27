@@ -19,7 +19,6 @@ class Rooms(commands.Cog):
     Edita el mensaje usando Discord timestamps (<t:epoch:R>) para mostrar 'Last Updated'.
     Actualiza el mensaje cada 15 s y al recibir eventos 'room_updated' y 'room_finished'.
     """
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.posted_message: discord.Message | None = None
@@ -42,9 +41,6 @@ class Rooms(commands.Cog):
 
     @tasks.loop(seconds=15.0)
     async def update_rooms(self):
-        """
-        Loop que actualiza el mensaje cada 15 segundos.
-        """
         await self._do_update()
 
     @update_rooms.before_loop
@@ -57,9 +53,6 @@ class Rooms(commands.Cog):
         print(f"›› [Rooms] Error en loop de actualización: {error}")
 
     async def on_room_updated(self, room_id: int | None = None):
-        """
-        Listener que actualiza inmediatamente tras cambios en join/leave/inactividad.
-        """
         await self._do_update()
 
     async def _do_update(self):
@@ -67,56 +60,39 @@ class Rooms(commands.Cog):
             channel = self._get_channel()
             if not channel:
                 return
-
             matchmaking = self.bot.get_cog("Matchmaking")
             if not matchmaking or not hasattr(matchmaking, 'rooms'):
                 return
-
             rooms = matchmaking.rooms
             lines = []
-
             if not rooms:
                 lines.append("**No hay salas activas.**")
             else:
-                # Preparar lista de tuplas (room_id, avg_mmr, players)
                 rooms_list = []
                 for room_id, players in rooms.items():
-                    # Convertir todos los valores de MMR a entero
                     mmr_vals = []
-                    for p in players:
-                        try:
-                            val = int(p[1])
-                        except Exception:
-                            val = 0
-                        mmr_vals.append(val)
+                    valid_players = []
+                    for item in players:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            member, raw_mmr = item[0], item[1]
+                            try:
+                                val = int(raw_mmr)
+                            except Exception:
+                                val = 0
+                            mmr_vals.append(val)
+                            valid_players.append((member, val))
                     avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
-                    rooms_list.append((room_id, avg_mmr, players))
-                # Ordenar por MMR promedio descendente
+                    rooms_list.append((room_id, avg_mmr, valid_players))
                 sorted_rooms = sorted(rooms_list, key=lambda x: x[1], reverse=True)
-
-                # Construir líneas
                 for room_id, avg_mmr, players in sorted_rooms:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
-                    for player in players:
-                        member = player[0]
-                        # Obtener nombre sin usar mención
-                        if hasattr(member, 'display_name'):
-                            name = member.display_name
-                        elif hasattr(member, 'name'):
-                            name = member.name
-                        else:
-                            name = str(member)
-                        try:
-                            mmr = int(player[1])
-                        except Exception:
-                            mmr = 0
+                    for member, mmr in players:
+                        # Obtener nombre de display sin @mention
+                        name = getattr(member, 'display_name', None) or getattr(member, 'name', None) or str(member)
                         lines.append(f"{name} ({mmr})")
                     lines.append("")
-
-            # Añadir timestamp relativo de Discord
             now = int(time.time())
             lines.append(f"**Last Updated:** <t:{now}:R>")
-
             content = "\n".join(lines)
             if not self.posted_message:
                 self.posted_message = await channel.send(content)
@@ -125,14 +101,10 @@ class Rooms(commands.Cog):
                     await self.posted_message.edit(content=content)
                 except discord.NotFound:
                     self.posted_message = await channel.send(content)
-
         except Exception as e:
             print(f"›› [Rooms] Excepción en _do_update: {e}")
 
     async def on_room_finished(self, room_id: int):
-        """
-        Listener para evento 'room_finished': espera 10s, borra la sala y actualiza.
-        """
         await asyncio.sleep(10)
         matchmaking = self.bot.get_cog("Matchmaking")
         if matchmaking and hasattr(matchmaking, 'rooms') and room_id in matchmaking.rooms:
