@@ -382,7 +382,7 @@ class Matchmaking(commands.Cog):
 
         # Mensaje efímero al usuario
         await interaction.response.send_message(
-            f"Te metí en sala-{best_rid} 🎉", ephemeral=True
+            f"Joined room ({best_rid}) ", ephemeral=True
         )
         # Mensaje limpio en #join
         await ch.send(
