@@ -1,5 +1,6 @@
 import discord
 import asyncio
+import time
 from discord.ext import commands, tasks
 
 # Configuración: ID fijo del canal #rooms (hardcode)
@@ -15,23 +16,22 @@ async def setup(bot: commands.Bot):
 class Rooms(commands.Cog):
     """
     Cog que publica en un único mensaje el listado de salas activas y sus jugadores.
-    Edita el mensaje cada 5 s usando Discord timestamps (<t:...:R>) para el "Last Updated".
-    Además proporciona un listener para actualizar inmediatamente al recibir 'room_updated'.
-    Elimina salas 10 s después de recibir evento 'room_finished'.
+    Edita el mensaje usando Discord timestamps (<t:epoch:R>) para mostrar 'Last Updated'.
+    Actualiza el mensaje cada 15 s y al recibir eventos 'room_updated' y 'room_finished'.
     """
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.posted_message: discord.Message | None = None
-        # Iniciar loop cada 5 s
+        # Loop de actualización cada 15 segundos
         self.update_rooms.start()
-        # Listeners de eventos personalizados
-        bot.add_listener(self.on_room_finished, 'room_finished')
+        # Listeners para eventos externos
         bot.add_listener(self.on_room_updated, 'room_updated')
+        bot.add_listener(self.on_room_finished, 'room_finished')
 
     def cog_unload(self):
         self.update_rooms.cancel()
-        self.bot.remove_listener(self.on_room_finished)
         self.bot.remove_listener(self.on_room_updated)
+        self.bot.remove_listener(self.on_room_finished)
 
     def _get_channel(self) -> discord.TextChannel | None:
         channel = self.bot.get_channel(ROOMS_CHANNEL_ID)
@@ -39,21 +39,21 @@ class Rooms(commands.Cog):
             print(f"›› [Rooms] Canal ID {ROOMS_CHANNEL_ID} no encontrado.")
         return channel
 
-    @tasks.loop(seconds=5.0)
+    @tasks.loop(seconds=15.0)
     async def update_rooms(self):
-        """
-        Loop que actualiza el mensaje cada 5 segundos.
-        """
         await self._do_update()
+
+    @update_rooms.before_loop
+    async def before_update(self):
+        await self.bot.wait_until_ready()
+        print("›› [Rooms] Loop de salas listo (15s interval).")
 
     @update_rooms.error
     async def update_error(self, error):
-        print(f"›› [Rooms] Error en loop: {error}")
+        print(f"›› [Rooms] Error en loop de actualización: {error}")
 
     async def on_room_updated(self, room_id: int | None = None):
-        """
-        Listener que actualiza inmediatamente cuando se despacha 'room_updated'.
-        """
+        # Actualiza inmediatamente tras cambios en join/leave/inactividad
         await self._do_update()
 
     async def _do_update(self):
@@ -70,6 +70,7 @@ class Rooms(commands.Cog):
             if not rooms:
                 lines = ["**No hay salas activas.**"]
             else:
+                # Ordenar salas por MMR promedio descendente
                 sorted_rooms = sorted(
                     ((rid, sum(m for (_u,m) in players)//len(players), players)
                      for rid, players in rooms.items()),
@@ -82,8 +83,8 @@ class Rooms(commands.Cog):
                         lines.append(f"{member.mention} ({mmr})")
                     lines.append("")
 
-            now = int(asyncio.get_event_loop().time())
-            # Discord relative timestamp
+            # Timestamp relativo de Discord
+            now = int(time.time())
             lines.append(f"**Last Updated:** <t:{now}:R>")
 
             content = "\n".join(lines)
@@ -96,17 +97,12 @@ class Rooms(commands.Cog):
                     self.posted_message = await channel.send(content)
 
         except Exception as e:
-            print(f"›› [Rooms] Error en actualización: {e}")
-
-    @update_rooms.before_loop
-    async def before_update(self):
-        await self.bot.wait_until_ready()
-        print("›› [Rooms] Loop de salas listo.")
+            print(f"›› [Rooms] Excepción en _do_update: {e}")
 
     async def on_room_finished(self, room_id: int):
+        # Tras finalizar sala, esperar 10s, eliminar de rooms y actualizar
         await asyncio.sleep(10)
         matchmaking = self.bot.get_cog("Matchmaking")
         if matchmaking and hasattr(matchmaking, 'rooms') and room_id in matchmaking.rooms:
             del matchmaking.rooms[room_id]
-            # Forzar actualización al eliminar sala
             await self._do_update()
