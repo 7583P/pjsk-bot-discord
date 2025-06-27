@@ -10,7 +10,7 @@ async def setup(bot: commands.Bot):
     """
     Setup asíncrono para discord.py v2: registra el cog Rooms.
     """
-    bot.add_cog(Rooms(bot))
+    await bot.add_cog(Rooms(bot))
     print("✅ Cog cargado: cogs.rooms")
 
 class Rooms(commands.Cog):
@@ -19,10 +19,11 @@ class Rooms(commands.Cog):
     Edita el mensaje usando Discord timestamps (<t:epoch:R>) para mostrar 'Last Updated'.
     Actualiza el mensaje cada 15 s y al recibir eventos 'room_updated' y 'room_finished'.
     """
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.posted_message: discord.Message | None = None
-        # Loop de actualización cada 15 segundos
+        # Iniciar loop de actualización cada 15 segundos
         self.update_rooms.start()
         # Listeners para eventos externos
         bot.add_listener(self.on_room_updated, 'room_updated')
@@ -41,6 +42,9 @@ class Rooms(commands.Cog):
 
     @tasks.loop(seconds=15.0)
     async def update_rooms(self):
+        """
+        Loop que actualiza el mensaje cada 15 segundos.
+        """
         await self._do_update()
 
     @update_rooms.before_loop
@@ -53,7 +57,9 @@ class Rooms(commands.Cog):
         print(f"›› [Rooms] Error en loop de actualización: {error}")
 
     async def on_room_updated(self, room_id: int | None = None):
-        # Actualiza inmediatamente tras cambios en join/leave/inactividad
+        """
+        Listener que actualiza inmediatamente tras cambios en join/leave/inactividad.
+        """
         await self._do_update()
 
     async def _do_update(self):
@@ -67,23 +73,29 @@ class Rooms(commands.Cog):
                 return
 
             rooms = matchmaking.rooms
+            lines = []
+
             if not rooms:
-                lines = ["**No hay salas activas.**"]
+                lines.append("**No hay salas activas.**")
             else:
-                # Ordenar salas por MMR promedio descendente
-                sorted_rooms = sorted(
-                    ((rid, sum(m for (_u,m) in players)//len(players), players)
-                     for rid, players in rooms.items()),
-                    key=lambda x: x[1], reverse=True
-                )
-                lines = []
+                # Preparar lista de tuplas (room_id, avg_mmr, players)
+                rooms_list = []
+                for room_id, players in rooms.items():
+                    avg_mmr = (sum(p[1] for p in players) // len(players)) if players else 0
+                    rooms_list.append((room_id, avg_mmr, players))
+                # Ordenar por MMR promedio descendente
+                sorted_rooms = sorted(rooms_list, key=lambda item: item[1], reverse=True)
+
+                # Construir líneas
                 for room_id, avg_mmr, players in sorted_rooms:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
-                    for member, mmr in players:
+                    for player in players:
+                        member = player[0]
+                        mmr    = player[1]
                         lines.append(f"{member.mention} ({mmr})")
                     lines.append("")
 
-            # Timestamp relativo de Discord
+            # Añadir timestamp relativo de Discord
             now = int(time.time())
             lines.append(f"**Last Updated:** <t:{now}:R>")
 
@@ -100,7 +112,9 @@ class Rooms(commands.Cog):
             print(f"›› [Rooms] Excepción en _do_update: {e}")
 
     async def on_room_finished(self, room_id: int):
-        # Tras finalizar sala, esperar 10s, eliminar de rooms y actualizar
+        """
+        Listener para evento 'room_finished': espera 10s, borra la sala y actualiza.
+        """
         await asyncio.sleep(10)
         matchmaking = self.bot.get_cog("Matchmaking")
         if matchmaking and hasattr(matchmaking, 'rooms') and room_id in matchmaking.rooms:
