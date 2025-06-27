@@ -74,22 +74,40 @@ class Rooms(commands.Cog):
                     mmr_vals = []
                     valid_players: list[tuple[discord.Member, int]] = []
                     for entry in players:
-                        if isinstance(entry, (list, tuple)) and len(entry) >= 2 and isinstance(entry[0], discord.Member):
-                            member, raw_mmr = entry
-                            try:
-                                mmr_value = int(raw_mmr)
-                            except Exception:
-                                mmr_value = 0
-                            mmr_vals.append(mmr_value)
-                            valid_players.append((member, mmr_value))
+                        # Resolver miembro si es ID o Member
+                        member = None
+                        raw_mmr = None
+                        if isinstance(entry, discord.Member):
+                            member = entry
+                            raw_mmr = None  # fallback later
+                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            raw_member, raw_mmr = entry[0], entry[1]
+                            if isinstance(raw_member, discord.Member):
+                                member = raw_member
+                            else:
+                                try:
+                                    member_id = int(raw_member)
+                                    member = channel.guild.get_member(member_id)
+                                except Exception:
+                                    member = None
+                        if not member:
+                            continue
+                        # procesar MMR como entero
+                        try:
+                            mmr_value = int(raw_mmr) if raw_mmr is not None else 0
+                        except Exception:
+                            mmr_value = 0
+                        mmr_vals.append(mmr_value)
+                        valid_players.append((member, mmr_value))
                     avg_mmr = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
                     rooms_list.append((room_id, avg_mmr, valid_players))
 
+                # ordenar por MMR descendente
                 rooms_list.sort(key=lambda x: x[1], reverse=True)
                 for room_id, avg_mmr, players in rooms_list:
                     lines.append(f"**Sala {room_id}** - MMR promedio: **{avg_mmr}**")
                     for member, mmr_value in players:
-                        name = getattr(member, 'display_name', None) or getattr(member, 'name', None) or str(member)
+                        name = member.display_name or member.name
                         lines.append(f"{name} ({mmr_value})")
                     lines.append("")
 
