@@ -33,6 +33,13 @@ class MyBot(commands.Bot):
             print("✅ Cog cargado: cogs.matchmaking")
         except Exception as e:
             print(f"❌ Error cargando cogs.matchmaking: {e}")
+             # Cargar Rooms Cog
+        try:
+            await self.load_extension("cogs.rooms")
+            print("✅ Cog cargado: cogs.rooms")
+        except Exception as e:
+            print(f"❌ Error cargando cogs.rooms: {e}")
+
 
         # Cargar AutoRoles Cog
         try:
