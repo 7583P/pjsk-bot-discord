@@ -353,26 +353,42 @@ class Matchmaking(commands.Cog):
                 best_rid = rid
                 break
 
+        # 3) Si no hay sala disponible, crear nueva
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
 
-            # 3) Crear hilo privado
+            # Determinar canal padre si estamos en un Thread
+            chan = interaction.channel
+            if isinstance(chan, Thread) and chan.parent:
+                chan = chan.parent
+            cat_id = chan.category_id or 0
+
+            # Crear Thread privado
             thread = await ch.create_thread(
                 name=f"sala-{new_id}",
                 auto_archive_duration=60,
                 type=discord.ChannelType.private_thread,
                 invitable=False
             )
-            self.rooms[new_id] = {"players": [], "thread": thread}
+
+            # Guardar la nueva sala con category_id
+            self.rooms[new_id] = {
+                "players": [],
+                "thread": thread,
+                "category_id": cat_id,
+            }
             best_rid = new_id
 
-            # 4) Borrar notificación automática
+            # Borrar el mensaje automático de Thread creado
             async for msg in ch.history(limit=5):
                 if msg.type == MessageType.thread_created and msg.author == interaction.user:
                     await msg.delete()
                     break
 
-        # 5) Añadir al jugador y enviar mensajes
+            # Notificar a Rooms-Cog que hay una sala nueva
+            self.bot.dispatch('room_updated', best_rid)
+
+        # 4) Añadir al jugador a la sala
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
@@ -380,42 +396,54 @@ class Matchmaking(commands.Cog):
             )
         room["players"].append(member)
 
-        # Mensaje efímero al usuario
+        # 5) Mensajes de confirmación
         await interaction.response.send_message(
-            f"Joined room ({best_rid}) ", ephemeral=True
+            f"Joined room ({best_rid})", ephemeral=True
         )
-        # Mensaje limpio en #join
         await ch.send(
-            f"{member.mention} Joined Room **{best_rid}** ( MMR  **{mmr_val}** )"
+            f"{member.mention} Joined Room **{best_rid}** (MMR **{mmr_val}**)"
         )
-        # Finalmente, añadirlo al hilo privado
         await room["thread"].add_user(member)
 
-        # 6) Reordenar nombres y lanzar votación si la sala se llena
+        # 6) Renombrar salas y lanzar votación si la sala se llena
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
+
     @app_commands.command(name="d", description="Salir de la sala")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def leave_room(self, interaction: discord.Interaction):
         member = interaction.user
+
+        # Recorremos copia de self.rooms para poder modificar el dict
         for rid, info in list(self.rooms.items()):
             if member in info["players"]:
+                # 1) Quitar al jugador del thread y de la lista
                 info["players"].remove(member)
                 await info["thread"].send(f"{member.display_name} salió.")
                 await info["thread"].remove_user(member)
+
+                # 2) Si la sala quedó vacía, archivarla y borrarla
                 if not info["players"]:
                     try:
                         await info["thread"].edit(archived=True, locked=True)
+                        await info["thread"].delete()
                     except:
                         pass
+
+                    # Estas dos líneas se ejecutan SIEMPRE tras borrar el thread
                     self.rooms.pop(rid)
+                    self.bot.dispatch('room_finished', rid)
+
+                # 3) Confirmación al usuario y reordenamiento de nombres
                 await interaction.response.send_message(
-                    f"Leaved the room{rid}."
+                    f"Leaved the room {rid}.", ephemeral=True
                 )
                 await self.sort_and_rename_rooms(interaction.guild)
                 return
+
+        # Si no encontró al usuario en ninguna sala:
         await interaction.response.send_message(
             "You are not in a room", ephemeral=True
         )
