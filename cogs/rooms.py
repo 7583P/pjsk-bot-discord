@@ -2,15 +2,18 @@ import discord
 import asyncio
 import time
 from discord.ext import commands, tasks
+from discord import app_commands
 
 # Mapea category_id → canal "rooms" correspondiente
-CATEGORY_TO_ROOM_CHANNEL = {
+tuple[int, int]
+CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
     1371306302671687710: 1371307831176728706,  # Categoría A → canal Rooms A
     1371951461612912802: 1388515368934309978,  # Categoría B → canal Rooms B
 }
 
 class Matchmaking(commands.Cog):
     """Cog para gestionar comandos de emparejamiento y creación de salas."""
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         # rooms: { room_id: { players: [...], category_id: int }}
@@ -20,7 +23,7 @@ class Matchmaking(commands.Cog):
     async def on_ready(self):
         print("✅ Cog cargado: cogs.matchmaking")
 
-    @commands.tree.command(name="c", description="Crear sala por MMR")
+    @app_commands.command(name="c", description="Crear sala por MMR")
     async def cmd_c(self, interaction: discord.Interaction):
         cat_id = interaction.channel.category_id
         # Validar que la categoría está permitida
@@ -41,12 +44,12 @@ class Matchmaking(commands.Cog):
         self.bot.dispatch('room_updated', room_id)
 
         await interaction.response.send_message(
-            f"🔔 Sala {room_id} creada en la categoría <#{cat_id}>.",
-            ephemeral=True
+            f"🔔 Sala {room_id} creada en la categoría <#{cat_id}>.", ephemeral=True
         )
 
 class Rooms(commands.Cog):
     """Cog para publicar y actualizar el estado de las salas en sus canales correspondientes."""
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         # Guarda el mensaje de estado por channel_id
@@ -140,6 +143,11 @@ class Rooms(commands.Cog):
             await self._do_update()
 
 async def setup(bot: commands.Bot):
+    # Registrar comandos de app_commands
+    bot.tree.add_command(Matchmaking.cmd_c)
     await bot.add_cog(Matchmaking(bot))
     await bot.add_cog(Rooms(bot))
+    # Sincronizar slash commands (para un guild específico si se desea)
+    # await bot.tree.sync(guild=discord.Object(id=TU_GUILD_ID))
+    await bot.tree.sync()
     print("✅ Cogs cargados: Matchmaking, Rooms")
