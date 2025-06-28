@@ -5,22 +5,23 @@ import asyncio
 import time
 from discord.ext import commands, tasks
 
-# Ajusta estos mapeos a los IDs de tus categorías y canales rooms
+# Ajusta estos IDs a tu servidor
 CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
     1371306302671687710: 1371307831176728706,  # pjsk queue → rooms pjsk queue
     1371951461612912802: 1388515368934309978,  # jp-pjsk    → rooms jp-pjsk
 }
 
 class Rooms(commands.Cog):
-    """Lee Matchmaking.rooms y publica/actualiza cada canal de rooms."""
+    """Cog que lee las salas de Matchmaking.rooms y publica/actualiza
+       el listado en cada canal de #rooms según la categoría."""
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        # Guardamos el mensaje enviado en cada canal para editarlo después
+        # Mensaje enviado en cada canal de rooms, para editarlo luego
         self.posted_messages: dict[int, discord.Message] = {}
-
-        # Lanzamos el loop y escuchamos los eventos de Matchmaking
+        # Arranca el loop de actualización periódica
         self.update_rooms.start()
+        # Escucha los eventos disparados en matchmaking.py
         bot.add_listener(self.on_room_updated, 'room_updated')
         bot.add_listener(self.on_room_finished, 'room_finished')
 
@@ -35,7 +36,7 @@ class Rooms(commands.Cog):
 
     @tasks.loop(seconds=15.0)
     async def update_rooms(self):
-        # Refresca cada 15s por seguridad
+        # Backup refresco periódico
         await self._do_update()
 
     @update_rooms.before_loop
@@ -43,52 +44,56 @@ class Rooms(commands.Cog):
         await self.bot.wait_until_ready()
 
     async def on_room_updated(self, room_id: int | None = None):
-        # Disparado desde matchmaking.py tras /c o /d
+        """Llamado por matchmaking.py tras /c."""
         await self._do_update()
 
     async def on_room_finished(self, room_id: int):
-        # Disparado desde matchmaking.py al vaciar y cerrar una sala
+        """Llamado por matchmaking.py al cerrar una sala vacía."""
         await asyncio.sleep(1)
         await self._do_update()
 
     async def _do_update(self):
         try:
-            # 1) Obtiene el cog de Matchmaking y su dict de rooms
+            # Obtener el cog de Matchmaking y su diccionario de salas
             mm = self.bot.get_cog("Matchmaking")
             all_rooms = getattr(mm, "rooms", {})
 
-            # 2) Agrupa por categoría
+            # Agrupar salas por categoría
             grouped: dict[int, list[tuple[int,int,list[tuple[discord.Member,int]]]]] = {}
-            for rid, info in all_rooms.items():
+            for room_id, info in all_rooms.items():
                 cat = info.get("category_id")
                 if cat not in CATEGORY_TO_ROOM_CHANNEL:
                     continue
 
-                pdata, mmr_vals = [], []
-                for member in info.get("players", []):
+                players = info.get("players", [])
+                pdata: list[tuple[discord.Member,int]] = []
+                mmr_vals: list[int] = []
+
+                for member in players:
                     if not isinstance(member, discord.Member):
                         continue
-                    # Llama a tu función real de fetch_player en matchmaking
+                    # Aquí llamamos al fetch_player de matchmaking.py
                     try:
                         mmr, _ = await mm.fetch_player(member.id)
-                    except:
+                    except Exception:
                         mmr = 0
                     pdata.append((member, mmr))
                     mmr_vals.append(mmr)
 
-                avg = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
-                grouped.setdefault(cat, []).append((rid, avg, pdata))
+                avg = sum(mmr_vals)//len(mmr_vals) if mmr_vals else 0
+                grouped.setdefault(cat, []).append((room_id, avg, pdata))
 
             now = int(time.time())
 
-            # 3) Para cada categoría, envía o edita en su canal rooms
-            for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
-                channel = self.bot.get_channel(room_chan_id)
+            # Para cada categoría, construye y publica/edita el mensaje en #rooms
+            for cat_id, channel_id in CATEGORY_TO_ROOM_CHANNEL.items():
+                channel = self.bot.get_channel(channel_id)
                 if not channel:
                     continue
 
                 lines: list[str] = []
                 rooms_list = grouped.get(cat_id, [])
+
                 if not rooms_list:
                     lines.append("**No active rooms**")
                 else:
@@ -98,17 +103,19 @@ class Rooms(commands.Cog):
                         lines.append(f"**Room {rid}** – Average MMR: **{avg}**")
                         for mem, mmr in pdata:
                             lines.append(f"{mem.display_name} ({mmr})")
-                        lines.append("")  # línea en blanco entre salas
+                        lines.append("")  # separador
 
                 lines.append(f"**Last Updated:** <t:{now}:R>")
                 content = "\n".join(lines)
 
-                prev = self.posted_messages.get(cat_id)
-                if prev is None or prev.channel.id != room_chan_id:
+                prev_msg = self.posted_messages.get(cat_id)
+                if not prev_msg or prev_msg.channel.id != channel_id:
+                    # Enviar mensaje nuevo
                     msg = await channel.send(content)
                     self.posted_messages[cat_id] = msg
                 else:
-                    await prev.edit(content=content)
+                    # Editar mensaje existente
+                    await prev_msg.edit(content=content)
 
         except Exception as e:
             print(f"›› [Rooms] Error en _do_update: {e}")
