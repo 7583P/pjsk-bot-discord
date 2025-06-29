@@ -181,22 +181,19 @@ class Matchmaking(commands.Cog):
             entry["last"] = now
             entry["warned_at"] = None
 
-            # — BLOQUEO DE TODAS LAS MENCIÓNS EN HILOS —
-            # (usuarios, roles y everyone/here)
+            # — Borra TODO mensaje con mención (usuarios, roles, everyone) —
             if message.mentions or message.role_mentions or message.mention_everyone:
                 try:
                     await message.delete()
                 except:
                     pass
                 return
-        # — Fin de on_message —
 
-        # Si es mensaje del bot, ignorar
+        # Ignorar mensajes del bot
         if message.author.bot:
             return
 
-        # … tu lógica adicional de on_message …
-
+        # … el resto de tu lógica on_message …
 
 
     async def cog_load(self):
@@ -344,7 +341,7 @@ class Matchmaking(commands.Cog):
         ch = interaction.channel
         if not isinstance(ch, TextChannel):
             return await interaction.response.send_message(
-                "❌ Este comando solo funciona en un canal de texto.", ephemeral=True
+                "This command only work on #join", ephemeral=True
             )
 
         # Determinar la categoría padre (si viene de Thread)
@@ -394,15 +391,15 @@ class Matchmaking(commands.Cog):
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "❌ Ya estás en una sala de esta categoría.", ephemeral=True
+                "Your are already in a room", ephemeral=True
             )
         room["players"].append(member)
 
         # Confirmaciones
         await interaction.response.send_message(
-            f"✅ Te has unido a sala-{best_rid}.", ephemeral=True
+            f"Joined Room-{best_rid}.", ephemeral=True
         )
-        await ch.send(f"**{member.display_name}** se unió a sala-{best_rid} (MMR {mmr_val})")
+        await ch.send(f"**{member.display_name}** Joined Room {best_rid} (MMR {mmr_val})")
         await room["thread"].add_user(member)
 
         # Rename + votación
@@ -431,7 +428,7 @@ class Matchmaking(commands.Cog):
             if member in info["players"]:
                 # 3a) Quitar al jugador del thread y de la lista
                 info["players"].remove(member)
-                await info["thread"].send(f"{member.display_name} Leave")
+                await info["thread"].send(f"{member.display_name} Leaved")
                 await info["thread"].remove_user(member)
 
                 # 3b) Si la sala quedó vacía, archivarla y borrarla
