@@ -168,10 +168,6 @@ class Matchmaking(commands.Cog):
                         # Pasamos a la siguiente sala
                         continue
 
-    @monitor_inactivity.before_loop
-    async def before_monitor(self):
-        await self.bot.wait_until_ready()
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         # — Inicio: reset de inactividad en hilos privados —
@@ -186,24 +182,20 @@ class Matchmaking(commands.Cog):
             entry["warned_at"] = None
         # — Fin: reset de inactividad —
 
-        # — Bloqueo de cualquier mención en hilos —
+        # ───> BLOQUEO DE MENCIÓN A USUARIOS EN HILOS <───
         if isinstance(message.channel, discord.Thread) and not message.author.bot:
-            if message.mentions or message.role_mentions or message.mention_everyone:
+            if message.mentions:
                 try:
                     await message.delete()
                 except:
                     pass
-                try:
-                    await message.author.send(
-                        "You can`t mention in a room"
-                    )
-                except:
-                    pass
+        # ────────────────────────────────────────────────
 
-        # Tu lógica normal de on_message (si la tienes) o simplemente retorna si no la hay
+        # Si es mensaje del bot, no procesamos más
         if message.author.bot:
             return
-        # … resto de tu código de on_message si aplica …
+
+        # … resto de tu lógica on_message si la tienes …
 
 
     async def cog_load(self):
@@ -395,6 +387,14 @@ class Matchmaking(commands.Cog):
                     break
             # Emitimos evento para que el cog de rooms pueda reaccionar
             self.bot.dispatch('room_updated', best_rid)
+
+             # ───> BLOQUEO DE @everyone, @here y ROLES EN ESTE HILO <───
+        overwrite = discord.PermissionOverwrite()
+        overwrite.mention_everyone = False
+        await thread.edit(
+            overwrites={ interaction.guild.default_role: overwrite }
+        )
+        # ─────────────────────────────────────────────────────────
 
         # 5) Añadir al jugador a la sala seleccionada
         room = self.rooms[best_rid]
