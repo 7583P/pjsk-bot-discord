@@ -170,26 +170,33 @@ class Matchmaking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # — reset de inactividad —
+        # — Reset de inactividad en hilos privados —
         if isinstance(message.channel, Thread) and not message.author.bot:
             now = datetime.datetime.utcnow()
             data = self.inactivity.setdefault(message.channel.id, {})
-            entry = data.setdefault(message.author.id, {"last": now, "warned_at": None})
-            entry["last"], entry["warned_at"] = now, None
+            entry = data.setdefault(
+                message.author.id,
+                {"last": now, "warned_at": None}
+            )
+            entry["last"] = now
+            entry["warned_at"] = None
 
-        # ───> BLOQUEO DE MENCIÓN A USUARIOS EN HILOS <───
-        if isinstance(message.channel, Thread) and not message.author.bot:
-            if message.mentions:
+            # — BLOQUEO DE TODAS LAS MENCIÓNS EN HILOS —
+            # (usuarios, roles y everyone/here)
+            if message.mentions or message.role_mentions or message.mention_everyone:
                 try:
                     await message.delete()
                 except:
                     pass
-        # ────────────────────────────────────────────────
+                return
+        # — Fin de on_message —
 
+        # Si es mensaje del bot, ignorar
         if message.author.bot:
             return
 
-        # … resto de tu lógica …
+        # … tu lógica adicional de on_message …
+
 
 
     async def cog_load(self):
@@ -337,11 +344,10 @@ class Matchmaking(commands.Cog):
         ch = interaction.channel
         if not isinstance(ch, TextChannel):
             return await interaction.response.send_message(
-                "❌ Este comando solo funciona en un canal de texto.",
-                ephemeral=True
+                "❌ Este comando solo funciona en un canal de texto.", ephemeral=True
             )
 
-        # Determinar categoría del canal (o de su padre si es Thread)
+        # Determinar la categoría padre (si viene de Thread)
         parent_chan = ch
         if isinstance(parent_chan, Thread) and parent_chan.parent:
             parent_chan = parent_chan.parent
@@ -350,14 +356,14 @@ class Matchmaking(commands.Cog):
         member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
-        # Buscar sala libre en esta categoría
+        # Buscar sala con hueco en ESTA categoría
         best_rid = None
         for rid, info in self.rooms.items():
             if info["category_id"] == current_cat and len(info["players"]) < 5:
                 best_rid = rid
                 break
 
-        # Si no existe, creamos una nueva
+        # Si no hay, crear nueva sala/thread
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
             thread = await ch.create_thread(
@@ -372,21 +378,17 @@ class Matchmaking(commands.Cog):
             }
             best_rid = new_id
 
-            # Borrar mensaje automático de creación
+            # Borrar el aviso de thread creado
             async for msg in ch.history(limit=5):
                 if msg.type == MessageType.thread_created and msg.author == interaction.user:
                     await msg.delete()
                     break
 
-            # Avisamos al cog de rooms
+            # Notificamos al cog de rooms
             self.bot.dispatch('room_updated', best_rid)
 
-            # ───> BLOQUEAR @everyone, @here y ROLES EN ESTE HILO <───
-            await thread.set_permissions(
-                interaction.guild.default_role,
-                mention_everyone=False
-            )
-            # ─────────────────────────────────────────────────────────
+            # — NO HACEMOS set_permissions ni overwrites aquí —
+            # — Con on_message tendremos todo bloqueado de todos modos —
 
         # Añadir jugador a la sala
         room = self.rooms[best_rid]
@@ -403,7 +405,7 @@ class Matchmaking(commands.Cog):
         await ch.send(f"**{member.display_name}** se unió a sala-{best_rid} (MMR {mmr_val})")
         await room["thread"].add_user(member)
 
-        # Renombrar y lanzar votación
+        # Rename + votación
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
