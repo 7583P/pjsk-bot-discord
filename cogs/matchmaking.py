@@ -172,7 +172,6 @@ class Matchmaking(commands.Cog):
     async def before_monitor(self):
         await self.bot.wait_until_ready()
 
-
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         # — Inicio: reset de inactividad en hilos privados —
@@ -186,6 +185,20 @@ class Matchmaking(commands.Cog):
             entry["last"] = now
             entry["warned_at"] = None
         # — Fin: reset de inactividad —
+
+        # — Bloqueo de cualquier mención en hilos —
+        if isinstance(message.channel, discord.Thread) and not message.author.bot:
+            if message.mentions or message.role_mentions or message.mention_everyone:
+                try:
+                    await message.delete()
+                except:
+                    pass
+                try:
+                    await message.author.send(
+                        "You can`t mention in a room"
+                    )
+                except:
+                    pass
 
         # Tu lógica normal de on_message (si la tienes) o simplemente retorna si no la hay
         if message.author.bot:
@@ -363,7 +376,7 @@ class Matchmaking(commands.Cog):
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
             thread = await ch.create_thread(
-                name=f"sala-{new_id}",
+                name=f"room ({new_id})",
                 auto_archive_duration=60,
                 type=discord.ChannelType.private_thread,
                 invitable=False
@@ -393,10 +406,10 @@ class Matchmaking(commands.Cog):
 
         # 6) Confirmaciones al usuario y al canal
         await interaction.response.send_message(
-            f"✅ Te has unido a la sala {best_rid}.", ephemeral=True
+            f"Joined room {best_rid}.", ephemeral=True
         )
         await ch.send(
-            f"{member.mention} se unió a **sala-{best_rid}** (MMR **{mmr_val}**)"
+            f"{member.mention} Joined **room-{best_rid}** (MMR **{mmr_val}**)"
         )
         await room["thread"].add_user(member)
 
