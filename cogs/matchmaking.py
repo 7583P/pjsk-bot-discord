@@ -335,77 +335,72 @@ class Matchmaking(commands.Cog):
     @app_commands.command(name="c", description="Join a room")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
-        # 1) Validación de canal
+        # 1) Validación de que sea un canal de texto
         ch = interaction.channel
         if not isinstance(ch, TextChannel):
             return await interaction.response.send_message(
-                "❌ Este comando solo funciona en el canal de texto #join.",
+                "❌ Este comando solo funciona en un canal de texto.",
                 ephemeral=True
             )
+
+        # 2) Determinar la categoría del canal (o del padre, si invocado en Thread)
+        parent_chan = ch
+        if isinstance(parent_chan, Thread) and parent_chan.parent:
+            parent_chan = parent_chan.parent
+        current_cat = parent_chan.category_id or 0
 
         member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
-        # 2) Buscar la PRIMERA sala con menos de 5 jugadores
+        # 3) Buscar la PRIMERA sala en ESTA categoría con hueco (<5 jugadores)
         best_rid = None
         for rid, info in self.rooms.items():
-            if len(info["players"]) < 5:
+            if info["category_id"] == current_cat and len(info["players"]) < 5:
                 best_rid = rid
                 break
 
-        # 3) Si no hay sala disponible, crear nueva
+        # 4) Si no hay sala disponible en la categoría, crear una nueva
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
-
-            # Determinar canal padre si estamos en un Thread
-            chan = interaction.channel
-            if isinstance(chan, Thread) and chan.parent:
-                chan = chan.parent
-            cat_id = chan.category_id or 0
-
-            # Crear Thread privado
             thread = await ch.create_thread(
                 name=f"sala-{new_id}",
                 auto_archive_duration=60,
                 type=discord.ChannelType.private_thread,
                 invitable=False
             )
-
-            # Guardar la nueva sala con category_id
+            # Guardamos la sala asociada a su categoría
             self.rooms[new_id] = {
                 "players": [],
                 "thread": thread,
-                "category_id": cat_id,
+                "category_id": current_cat,
             }
             best_rid = new_id
-
-            # Borrar el mensaje automático de Thread creado
+            # (Opcional) borramos el mensaje automático de creación de Thread
             async for msg in ch.history(limit=5):
                 if msg.type == MessageType.thread_created and msg.author == interaction.user:
                     await msg.delete()
                     break
-
-            # Notificar a Rooms-Cog que hay una sala nueva
+            # Emitimos evento para que el cog de rooms pueda reaccionar
             self.bot.dispatch('room_updated', best_rid)
 
-        # 4) Añadir al jugador a la sala
+        # 5) Añadir al jugador a la sala seleccionada
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "Ya estás en una sala.", ephemeral=True
+                "❌ Ya estás en una sala de esta categoría.", ephemeral=True
             )
         room["players"].append(member)
 
-        # 5) Mensajes de confirmación
+        # 6) Confirmaciones al usuario y al canal
         await interaction.response.send_message(
-            f"Joined room ({best_rid})", ephemeral=True
+            f"✅ Te has unido a la sala {best_rid}.", ephemeral=True
         )
         await ch.send(
-            f"{member.mention} Joined Room **{best_rid}** (MMR **{mmr_val}**)"
+            f"{member.mention} se unió a **sala-{best_rid}** (MMR **{mmr_val}**)"
         )
         await room["thread"].add_user(member)
 
-        # 6) Renombrar salas y lanzar votación si la sala se llena
+        # 7) Reordenar nombres de salas y lanzar votación si se llena
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
@@ -416,37 +411,46 @@ class Matchmaking(commands.Cog):
     async def leave_room(self, interaction: discord.Interaction):
         member = interaction.user
 
-        # Recorremos copia de self.rooms para poder modificar el dict
+        # 1) Determinar la categoría actual (canal padre si estamos en Thread)
+        ch = interaction.channel
+        parent_chan = ch
+        if isinstance(parent_chan, Thread) and parent_chan.parent:
+            parent_chan = parent_chan.parent
+        current_cat = parent_chan.category_id or 0
+
+        # 2) Buscar al usuario sólo en salas de ESTA categoría
         for rid, info in list(self.rooms.items()):
+            if info["category_id"] != current_cat:
+                continue
+
             if member in info["players"]:
-                # 1) Quitar al jugador del thread y de la lista
+                # 3a) Quitar al jugador del thread y de la lista
                 info["players"].remove(member)
-                await info["thread"].send(f"{member.display_name} salió.")
+                await info["thread"].send(f"{member.display_name} Leave")
                 await info["thread"].remove_user(member)
 
-                # 2) Si la sala quedó vacía, archivarla y borrarla
+                # 3b) Si la sala quedó vacía, archivarla y borrarla
                 if not info["players"]:
                     try:
                         await info["thread"].edit(archived=True, locked=True)
                         await info["thread"].delete()
                     except:
                         pass
-
-                    # Estas dos líneas se ejecutan SIEMPRE tras borrar el thread
                     self.rooms.pop(rid)
                     self.bot.dispatch('room_finished', rid)
 
-                # 3) Confirmación al usuario y reordenamiento de nombres
+                # 4) Confirmación y reordenar salas
                 await interaction.response.send_message(
                     f"Leaved the room {rid}.", ephemeral=True
                 )
                 await self.sort_and_rename_rooms(interaction.guild)
                 return
 
-        # Si no encontró al usuario en ninguna sala:
+        # 5) Si no encontró al usuario en ninguna sala de esta categoría
         await interaction.response.send_message(
-            "You are not in a room", ephemeral=True
+            "Your are not in a room", ephemeral=True
         )
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
