@@ -413,7 +413,7 @@ class Matchmaking(commands.Cog):
         await interaction.response.send_message(
             f"Joined room{best_rid}.", ephemeral=True
         )
-        await ch.send(f"**{member.display_name}** se unió a sala-{best_rid} (MMR {mmr_val})")
+        await ch.send(f"**{member.display_name}** Joined room {best_rid} (MMR {mmr_val})")
         await room["thread"].add_user(member)
 
         await self.sort_and_rename_rooms(interaction.guild)
