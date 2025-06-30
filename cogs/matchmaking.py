@@ -323,15 +323,24 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-    @app_commands.command(name="start", description="Inicia la sala y genera el poll (temporal)")
-    async def start(self, ctx: commands.Context):
+    @app_commands.command(
+        name="start",
+        description="Inicia la sala y genera el poll (temporal)"
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def start(self, interaction: discord.Interaction):
         # 1) Recoge los jugadores humanos en #join
-        join_chan = discord.utils.get(ctx.guild.channels, name=JOIN_CHANNEL_NAME)
+        join_chan = discord.utils.get(
+            interaction.guild.channels, name=JOIN_CHANNEL_NAME
+        )
         players = [m for m in join_chan.members if not m.bot]
 
         # 2) Valida 2–5 jugadores
         if len(players) < 2 or len(players) > 5:
-            return await ctx.respond("🔸 La sala debe tener entre 2 y 5 jugadores.", ephemeral=True)
+            return await interaction.response.send_message(
+                "🔸 La sala debe tener entre 2 y 5 jugadores.",
+                ephemeral=True
+            )
 
         # 3) Construye el dict de rangos presentes
         counts = {r: False for r in BRACKET_RANGES}
@@ -350,7 +359,7 @@ class Matchmaking(commands.Cog):
         # 5) Obtiene 5 canciones y crea hilo
         songs = await self._get_9_songs(lo, hi)
         picks = songs[:5]
-        thread = await ctx.channel.create_thread(
+        thread = await interaction.channel.create_thread(
             name=f"Sala {len(players)} ({lo}–{hi}★)",
             auto_archive_duration=60,
             type=discord.ChannelType.public_thread
@@ -361,7 +370,7 @@ class Matchmaking(commands.Cog):
             text += f"{i}️⃣ {title} – {lvl}★ ({diff.capitalize()})\n"
 
         poll_msg = await thread.send(text)
-        for emoji in ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]:
+        for emoji in ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]:
             await poll_msg.add_reaction(emoji)
 
         # 6) Programa el cierre automático en 30 minutos
@@ -371,8 +380,10 @@ class Matchmaking(commands.Cog):
         asyncio.create_task(close_after(30 * 60, thread))
 
         # 7) Confirma al invocador
-        await ctx.respond(f"✅ Sala iniciada en {thread.mention}. ¡A votar!", ephemeral=True)
-
+        await interaction.response.send_message(
+            f"✅ Sala iniciada en {thread.mention}. ¡A votar!",
+            ephemeral=True
+        )
 
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
