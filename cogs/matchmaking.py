@@ -323,15 +323,12 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-    @app_commands.command(
-        name="start",
-        description="Inicia la votación de 5 canciones (Expert)"
-    )
+    @app_commands.command(name="start", description="Inicia la votación de 5 canciones (Expert)")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
-        # 1) Sólo en #join autorizados o en sus hilos
+        # — 1) Guard: solo #join o sus hilos —
         is_join_chan   = ch.id in ALLOWED_JOIN_CHANNELS
         is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
         if not (is_join_chan or is_join_thread):
@@ -340,31 +337,32 @@ class Matchmaking(commands.Cog):
                 ephemeral=True
             )
 
-        # 2) Determinar el canal padre y la lista de jugadores
+        # — 2) Determinar canal padre y jugadores —
         if is_join_thread:
             join_chan = ch.parent
-            room = next(
-                (info for info in self.rooms.values() if info["thread"].id == ch.id),
+            # Reutilizar sala registrada
+            room_entry = next(
+                (r for r in self.rooms.values() if r["thread"].id == ch.id),
                 None
             )
-            if not room:
+            if not room_entry:
                 return await interaction.response.send_message(
                     "⚠️ No encuentro la sala asociada a este hilo.",
                     ephemeral=True
                 )
-            players = room["players"]
+            players = room_entry["players"]
         else:
             join_chan = ch
             players = [m for m in join_chan.members if not m.bot]
 
-        # 3) Validar 2–5 jugadores
-        if len(players) < 2 or len(players) > 5:
+        # — 3) Validar 2–5 jugadores —
+        if not (2 <= len(players) <= 5):
             return await interaction.response.send_message(
                 "🔸 La sala debe tener entre 2 y 5 jugadores.",
                 ephemeral=True
             )
 
-        # 4) Calcular rango dinámico (sólo Expert en DIFFS)
+        # — 4) Calcular rango dinámico (DIFFS = ("expert",)) —
         counts = {r: False for r in BRACKET_RANGES}
         for m in players:
             for r in counts:
@@ -375,36 +373,39 @@ class Matchmaking(commands.Cog):
                 counts["Placement"] = True
         lo, hi = dynamic_range(counts)
 
-        # 5) Crear hilo nuevo si viene del canal
+        # — 5) Si venimos del canal: crear y registrar thread —
         if is_join_chan:
             thread = await join_chan.create_thread(
-                name=f"Sala {len(players)} ({lo}–{hi}★)",
+                name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
-            # registrar sala como llena
-            new_rid = max(self.rooms.keys(), default=0) + 1
-            self.rooms[new_rid] = {
+            # registrar como llena
+            new_id = max(self.rooms.keys(), default=0) + 1
+            self.rooms[new_id] = {
                 "players": players.copy(),
                 "thread": thread,
                 "category_id": join_chan.category_id or 0,
             }
-            self.bot.dispatch('room_updated', new_rid)
+            # desactivar monitoreo de inactividad
+            self.inactivity.pop(thread.id, None)
+            # disparar actualización de #rooms
+            self.bot.dispatch('room_updated', new_id)
         else:
-            thread = ch  # reutilizamos hilo existente
+            # en hilo ya existente
+            thread = ch
+            # desactivar monitoreo de inactividad
+            self.inactivity.pop(thread.id, None)
 
-        # 6) Obtener 5 canciones y lanzar el SongPollView
+        # — 6) Lanzar votación de 5 canciones con SongPollView —
         all_songs = await self._get_9_songs(lo, hi)
-        picks     = all_songs[:5]  # sólo las 5 primeras Expert
+        picks     = all_songs[:5]
         view      = SongPollView(picks, thread=thread, timeout=60)
-        prompt    = (
-            f"🎶 **Votación (Expert {lo}–{hi}★)**\n"
-            "Tienen **1 minuto** para elegir su canción:"
-        )
-        poll_msg  = await thread.send(prompt, view=view)
-        view.message = poll_msg
+        prompt    = f"🎶 **Votación (Expert {lo}–{hi}★)**\nTienen **1 minuto** para elegir su canción:"
+        msg       = await thread.send(prompt, view=view)
+        view.message = msg
 
-        # 7) Confirmación al invocador
+        # — 7) Confirmación efímera al invocador —
         await interaction.response.send_message(
             f"✅ Votación iniciada en {thread.mention}",
             ephemeral=True
