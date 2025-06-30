@@ -41,6 +41,27 @@ def country_flag(code: str) -> str:
         return ""
     return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
 
+BRACKET_RANGES = {
+    "Placement": (28, 30),
+    "Bronze":    (25, 27),
+    "Gold":      (28, 30),
+    "Diamond":   (31, 33),
+}
+
+def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
+    medias = []
+    for rank, pres in counts.items():
+        if pres:
+            lo, hi = BRACKET_RANGES[rank]
+            medias.append((lo + hi) / 2)
+    if not medias:
+        return BRACKET_RANGES["Placement"]
+    promedio = sum(medias) / len(medias)
+    centro   = round(promedio)
+    lo_dyn, hi_dyn = centro - 1, centro + 1
+    return max(25, lo_dyn), min(33, hi_dyn)
+
+
 
 class SongPollView(discord.ui.View):
     """Select de 9 canciones que abre votación de 1 minuto."""
@@ -115,14 +136,9 @@ class Matchmaking(commands.Cog):
     DIFFS = ("append", "master", "expert")  # prioridad de dificultad
 
     @staticmethod
-    def _range_for_counts(c):
-        if c["Diamond"]:
-            return (31, 33)
-        if c["Gold"]:
-            return (28, 30)
-        if c["Bronze"]:
-            return (25, 27)
-        return (28, 30)  # Placement o mixto
+    def _range_for_counts(counts: dict[str, bool]) -> tuple[int, int]:
+        # delegar en la función dinámica
+        return dynamic_range(counts)
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -306,6 +322,57 @@ class Matchmaking(commands.Cog):
             view=view
         )
         view.message = msg
+
+    @app_commands.command(name="start", description="Inicia la sala y genera el poll (temporal)")
+    async def start(self, ctx: commands.Context):
+        # 1) Recoge los jugadores humanos en #join
+        join_chan = discord.utils.get(ctx.guild.channels, name=JOIN_CHANNEL_NAME)
+        players = [m for m in join_chan.members if not m.bot]
+
+        # 2) Valida 2–5 jugadores
+        if len(players) < 2 or len(players) > 5:
+            return await ctx.respond("🔸 La sala debe tener entre 2 y 5 jugadores.", ephemeral=True)
+
+        # 3) Construye el dict de rangos presentes
+        counts = {r: False for r in BRACKET_RANGES}
+        for m in players:
+            roles = [role.name for role in m.roles]
+            for r in counts:
+                if r in roles:
+                    counts[r] = True
+                    break
+            else:
+                counts["Placement"] = True
+
+        # 4) Calcula el rango dinámico
+        lo, hi = self._range_for_counts(counts)
+
+        # 5) Obtiene 5 canciones y crea hilo
+        songs = await self._get_9_songs(lo, hi)
+        picks = songs[:5]
+        thread = await ctx.channel.create_thread(
+            name=f"Sala {len(players)} ({lo}–{hi}★)",
+            auto_archive_duration=60,
+            type=discord.ChannelType.public_thread
+        )
+
+        text = f"🎶 **Poll (Expert {lo}–{hi}★)**\n"
+        for i, (title, lvl, diff) in enumerate(picks, start=1):
+            text += f"{i}️⃣ {title} – {lvl}★ ({diff.capitalize()})\n"
+
+        poll_msg = await thread.send(text)
+        for emoji in ["1️⃣","2️⃣","3️⃣","4️⃣","5️⃣"]:
+            await poll_msg.add_reaction(emoji)
+
+        # 6) Programa el cierre automático en 30 minutos
+        async def close_after(delay, thr):
+            await asyncio.sleep(delay)
+            await thr.edit(archived=True)
+        asyncio.create_task(close_after(30 * 60, thread))
+
+        # 7) Confirma al invocador
+        await ctx.respond(f"✅ Sala iniciada en {thread.mention}. ¡A votar!", ephemeral=True)
+
 
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
