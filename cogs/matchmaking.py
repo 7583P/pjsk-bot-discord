@@ -329,18 +329,23 @@ class Matchmaking(commands.Cog):
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
-        # ————————————————
-        # 1) Sólo en canales #join autorizados
-        if interaction.channel.id not in ALLOWED_JOIN_CHANNELS:
+        ch = interaction.channel
+
+        # ————————————————————————
+        # 1) Sólo en canales #join autorizados o en sus hilos hijos
+        if not (
+            ch.id in ALLOWED_JOIN_CHANNELS
+            or (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS)
+        ):
             return await interaction.response.send_message(
-                "❌ Este comando solo funciona en los canales de **#join** autorizados.",
+                "❌ Este comando solo funciona en los canales de **#join** autorizados (o en sus hilos).",
                 ephemeral=True
             )
-        # ————————————————
+        # ————————————————————————
 
-        # 2) Recoge los jugadores humanos en ese #join
-        join_chan = interaction.guild.get_channel(interaction.channel.id)
-        players   = [m for m in join_chan.members if not m.bot]
+        # 2) Determina el canal #join real (si estamos en un hilo, usamos el padre)
+        parent_chan = ch.parent if isinstance(ch, Thread) and ch.parent else ch
+        players = [m for m in parent_chan.members if not m.bot]
 
         # 3) Valida 2–5 jugadores
         if len(players) < 2 or len(players) > 5:
@@ -360,25 +365,24 @@ class Matchmaking(commands.Cog):
                 counts["Placement"] = True
         lo, hi = dynamic_range(counts)
 
-        # 5) Prepara canciones y crea el hilo
+        # 5) Prepara canciones y crea el hilo (si estabas en un hilo, creamos uno nuevo en el mismo canal padre)
         songs = await self._get_9_songs(lo, hi)
         picks = songs[:5]
-        thread = await interaction.channel.create_thread(
+        target_chan = parent_chan  # siempre creamos el hilo sobre el canal padre
+        thread = await target_chan.create_thread(
             name=f"Sala {len(players)} ({lo}–{hi}★)",
             auto_archive_duration=60,
             type=discord.ChannelType.public_thread
         )
 
-        # ————————————————
         # 6) Registra esta sala en self.rooms COMO “LLENA”
         new_rid = max(self.rooms.keys(), default=0) + 1
         self.rooms[new_rid] = {
             "players": players.copy(),
             "thread": thread,
-            "category_id": interaction.channel.category_id or 0,
+            "category_id": target_chan.category_id or 0,
         }
         self.bot.dispatch('room_updated', new_rid)
-        # ————————————————
 
         # 7) Envía el poll al hilo
         text = f"🎶 **Poll (Expert {lo}–{hi}★)**\n"
@@ -399,6 +403,7 @@ class Matchmaking(commands.Cog):
             f"✅ Sala iniciada en {thread.mention}. ¡A votar!",
             ephemeral=True
         )
+
 
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
