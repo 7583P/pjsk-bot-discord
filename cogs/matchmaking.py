@@ -325,68 +325,64 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="start",
-        description="Inicia la sala y genera el poll (temporal)"
+        description="Inicia la votación de 5 canciones (Expert)"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
         # 1) Sólo en #join autorizados o en sus hilos
-        if not (
-            ch.id in ALLOWED_JOIN_CHANNELS
-            or (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS)
-        ):
+        is_join_chan   = ch.id in ALLOWED_JOIN_CHANNELS
+        is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
+        if not (is_join_chan or is_join_thread):
             return await interaction.response.send_message(
                 "❌ Este comando solo funciona en los canales de **#join** autorizados (o en sus hilos).",
                 ephemeral=True
             )
 
-        # 2) Distinción: invocado en hilo vs en canal
-        if isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS:
-            # — en hilo existente: reutilizamos la sala ya registrada —
-            thread = ch
-            room_entry = next(
-                (info for info in self.rooms.values() if info["thread"].id == thread.id),
+        # 2) Determinar el canal padre y la lista de jugadores
+        if is_join_thread:
+            join_chan = ch.parent
+            room = next(
+                (info for info in self.rooms.values() if info["thread"].id == ch.id),
                 None
             )
-            if not room_entry:
+            if not room:
                 return await interaction.response.send_message(
                     "⚠️ No encuentro la sala asociada a este hilo.",
                     ephemeral=True
                 )
-            players = room_entry["players"]
-
+            players = room["players"]
         else:
-            # — en canal #join: leemos los miembros y creamos nuevo hilo —
-            join_chan = ch  # TextChannel de #join
+            join_chan = ch
             players = [m for m in join_chan.members if not m.bot]
 
-            # validar antes de crear hilo
-            if len(players) < 2 or len(players) > 5:
-                return await interaction.response.send_message(
-                    "🔸 La sala debe tener entre 2 y 5 jugadores.",
-                    ephemeral=True
-                )
+        # 3) Validar 2–5 jugadores
+        if len(players) < 2 or len(players) > 5:
+            return await interaction.response.send_message(
+                "🔸 La sala debe tener entre 2 y 5 jugadores.",
+                ephemeral=True
+            )
 
-            # calcular rango dinámico
-            counts = {r: False for r in BRACKET_RANGES}
-            for m in players:
-                for r in counts:
-                    if discord.utils.get(m.roles, name=r):
-                        counts[r] = True
-                        break
-                else:
-                    counts["Placement"] = True
-            lo, hi = dynamic_range(counts)
+        # 4) Calcular rango dinámico (sólo Expert en DIFFS)
+        counts = {r: False for r in BRACKET_RANGES}
+        for m in players:
+            for r in counts:
+                if discord.utils.get(m.roles, name=r):
+                    counts[r] = True
+                    break
+            else:
+                counts["Placement"] = True
+        lo, hi = dynamic_range(counts)
 
-            # crear hilo nuevo
+        # 5) Crear hilo nuevo si viene del canal
+        if is_join_chan:
             thread = await join_chan.create_thread(
                 name=f"Sala {len(players)} ({lo}–{hi}★)",
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
-
-            # registrar la sala como “llena”
+            # registrar sala como llena
             new_rid = max(self.rooms.keys(), default=0) + 1
             self.rooms[new_rid] = {
                 "players": players.copy(),
@@ -394,33 +390,23 @@ class Matchmaking(commands.Cog):
                 "category_id": join_chan.category_id or 0,
             }
             self.bot.dispatch('room_updated', new_rid)
+        else:
+            thread = ch  # reutilizamos hilo existente
 
-        # 3) Si venimos de hilo, revisamos la validación de cantidad
-        if len(players) < 2 or len(players) > 5:
-            return await interaction.response.send_message(
-                "🔸 La sala debe tener entre 2 y 5 jugadores.",
-                ephemeral=True
-            )
+        # 6) Obtener 5 canciones y lanzar el SongPollView
+        all_songs = await self._get_9_songs(lo, hi)
+        picks     = all_songs[:5]  # sólo las 5 primeras Expert
+        view      = SongPollView(picks, thread=thread, timeout=60)
+        prompt    = (
+            f"🎶 **Votación (Expert {lo}–{hi}★)**\n"
+            "Tienen **1 minuto** para elegir su canción:"
+        )
+        poll_msg  = await thread.send(prompt, view=view)
+        view.message = poll_msg
 
-        # 4) Obtener 5 canciones y enviar el poll
-        picks = (await self._get_9_songs(lo, hi))[:5]
-        text = f"🎶 **Poll (Expert {lo}–{hi}★)**\n"
-        for i, (title, lvl, diff) in enumerate(picks, start=1):
-            text += f"{i}️⃣ {title} – {lvl}★ ({diff.capitalize()})\n"
-
-        poll_msg = await thread.send(text)
-        for emoji in ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]:
-            await poll_msg.add_reaction(emoji)
-
-        # 5) Cierre automático en 30 minutos
-        async def close_after(delay, thr):
-            await asyncio.sleep(delay)
-            await thr.edit(archived=True)
-        asyncio.create_task(close_after(30 * 60, thread))
-
-        # 6) Confirmación al invocador
+        # 7) Confirmación al invocador
         await interaction.response.send_message(
-            f"✅ Sala iniciada en {thread.mention}. ¡A votar!",
+            f"✅ Votación iniciada en {thread.mention}",
             ephemeral=True
         )
 
