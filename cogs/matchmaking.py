@@ -331,8 +331,7 @@ class Matchmaking(commands.Cog):
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
-        # ————————————————————————
-        # 1) Sólo en canales #join autorizados o en sus hilos hijos
+        # 1) Sólo en #join autorizados o en sus hilos
         if not (
             ch.id in ALLOWED_JOIN_CHANNELS
             or (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS)
@@ -341,64 +340,85 @@ class Matchmaking(commands.Cog):
                 "❌ Este comando solo funciona en los canales de **#join** autorizados (o en sus hilos).",
                 ephemeral=True
             )
-        # ————————————————————————
 
-        # 2) Determina el canal #join real (si estamos en un hilo, usamos el padre)
-        parent_chan = ch.parent if isinstance(ch, Thread) and ch.parent else ch
-        players = [m for m in parent_chan.members if not m.bot]
+        # 2) Distinción: invocado en hilo vs en canal
+        if isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS:
+            # — en hilo existente: reutilizamos la sala ya registrada —
+            thread = ch
+            room_entry = next(
+                (info for info in self.rooms.values() if info["thread"].id == thread.id),
+                None
+            )
+            if not room_entry:
+                return await interaction.response.send_message(
+                    "⚠️ No encuentro la sala asociada a este hilo.",
+                    ephemeral=True
+                )
+            players = room_entry["players"]
 
-        # 3) Valida 2–5 jugadores
+        else:
+            # — en canal #join: leemos los miembros y creamos nuevo hilo —
+            join_chan = ch  # TextChannel de #join
+            players = [m for m in join_chan.members if not m.bot]
+
+            # validar antes de crear hilo
+            if len(players) < 2 or len(players) > 5:
+                return await interaction.response.send_message(
+                    "🔸 La sala debe tener entre 2 y 5 jugadores.",
+                    ephemeral=True
+                )
+
+            # calcular rango dinámico
+            counts = {r: False for r in BRACKET_RANGES}
+            for m in players:
+                for r in counts:
+                    if discord.utils.get(m.roles, name=r):
+                        counts[r] = True
+                        break
+                else:
+                    counts["Placement"] = True
+            lo, hi = dynamic_range(counts)
+
+            # crear hilo nuevo
+            thread = await join_chan.create_thread(
+                name=f"Sala {len(players)} ({lo}–{hi}★)",
+                auto_archive_duration=60,
+                type=discord.ChannelType.public_thread
+            )
+
+            # registrar la sala como “llena”
+            new_rid = max(self.rooms.keys(), default=0) + 1
+            self.rooms[new_rid] = {
+                "players": players.copy(),
+                "thread": thread,
+                "category_id": join_chan.category_id or 0,
+            }
+            self.bot.dispatch('room_updated', new_rid)
+
+        # 3) Si venimos de hilo, revisamos la validación de cantidad
         if len(players) < 2 or len(players) > 5:
             return await interaction.response.send_message(
                 "🔸 La sala debe tener entre 2 y 5 jugadores.",
                 ephemeral=True
             )
 
-        # 4) Calcula el rango dinámico
-        counts = {r: False for r in BRACKET_RANGES}
-        for m in players:
-            for r in counts:
-                if discord.utils.get(m.roles, name=r):
-                    counts[r] = True
-                    break
-            else:
-                counts["Placement"] = True
-        lo, hi = dynamic_range(counts)
-
-        # 5) Prepara canciones y crea el hilo (si estabas en un hilo, creamos uno nuevo en el mismo canal padre)
-        songs = await self._get_9_songs(lo, hi)
-        picks = songs[:5]
-        target_chan = parent_chan  # siempre creamos el hilo sobre el canal padre
-        thread = await target_chan.create_thread(
-            name=f"Sala {len(players)} ({lo}–{hi}★)",
-            auto_archive_duration=60,
-            type=discord.ChannelType.public_thread
-        )
-
-        # 6) Registra esta sala en self.rooms COMO “LLENA”
-        new_rid = max(self.rooms.keys(), default=0) + 1
-        self.rooms[new_rid] = {
-            "players": players.copy(),
-            "thread": thread,
-            "category_id": target_chan.category_id or 0,
-        }
-        self.bot.dispatch('room_updated', new_rid)
-
-        # 7) Envía el poll al hilo
+        # 4) Obtener 5 canciones y enviar el poll
+        picks = (await self._get_9_songs(lo, hi))[:5]
         text = f"🎶 **Poll (Expert {lo}–{hi}★)**\n"
         for i, (title, lvl, diff) in enumerate(picks, start=1):
             text += f"{i}️⃣ {title} – {lvl}★ ({diff.capitalize()})\n"
+
         poll_msg = await thread.send(text)
         for emoji in ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]:
             await poll_msg.add_reaction(emoji)
 
-        # 8) Cierre automático en 30 minutos
+        # 5) Cierre automático en 30 minutos
         async def close_after(delay, thr):
             await asyncio.sleep(delay)
             await thr.edit(archived=True)
         asyncio.create_task(close_after(30 * 60, thread))
 
-        # 9) Confirma al invocador
+        # 6) Confirmación al invocador
         await interaction.response.send_message(
             f"✅ Sala iniciada en {thread.mention}. ¡A votar!",
             ephemeral=True
