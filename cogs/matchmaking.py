@@ -329,34 +329,38 @@ class Matchmaking(commands.Cog):
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
-        # 1) Recoge los jugadores humanos en #join
-        join_chan = discord.utils.get(
-            interaction.guild.channels, name=JOIN_CHANNEL_NAME
-        )
-        players = [m for m in join_chan.members if not m.bot]
+        # ————————————————
+        # 1) Sólo en canales #join autorizados
+        if interaction.channel.id not in ALLOWED_JOIN_CHANNELS:
+            return await interaction.response.send_message(
+                "❌ Este comando solo funciona en los canales de **#join** autorizados.",
+                ephemeral=True
+            )
+        # ————————————————
 
-        # 2) Valida 2–5 jugadores
+        # 2) Recoge los jugadores humanos en ese #join
+        join_chan = interaction.guild.get_channel(interaction.channel.id)
+        players   = [m for m in join_chan.members if not m.bot]
+
+        # 3) Valida 2–5 jugadores
         if len(players) < 2 or len(players) > 5:
             return await interaction.response.send_message(
                 "🔸 La sala debe tener entre 2 y 5 jugadores.",
                 ephemeral=True
             )
 
-        # 3) Construye el dict de rangos presentes
+        # 4) Calcula el rango dinámico
         counts = {r: False for r in BRACKET_RANGES}
         for m in players:
-            roles = [role.name for role in m.roles]
             for r in counts:
-                if r in roles:
+                if discord.utils.get(m.roles, name=r):
                     counts[r] = True
                     break
             else:
                 counts["Placement"] = True
+        lo, hi = dynamic_range(counts)
 
-        # 4) Calcula el rango dinámico
-        lo, hi = self._range_for_counts(counts)
-
-        # 5) Obtiene 5 canciones y crea hilo
+        # 5) Prepara canciones y crea el hilo
         songs = await self._get_9_songs(lo, hi)
         picks = songs[:5]
         thread = await interaction.channel.create_thread(
@@ -365,21 +369,32 @@ class Matchmaking(commands.Cog):
             type=discord.ChannelType.public_thread
         )
 
+        # ————————————————
+        # 6) Registra esta sala en self.rooms COMO “LLENA”
+        new_rid = max(self.rooms.keys(), default=0) + 1
+        self.rooms[new_rid] = {
+            "players": players.copy(),
+            "thread": thread,
+            "category_id": interaction.channel.category_id or 0,
+        }
+        self.bot.dispatch('room_updated', new_rid)
+        # ————————————————
+
+        # 7) Envía el poll al hilo
         text = f"🎶 **Poll (Expert {lo}–{hi}★)**\n"
         for i, (title, lvl, diff) in enumerate(picks, start=1):
             text += f"{i}️⃣ {title} – {lvl}★ ({diff.capitalize()})\n"
-
         poll_msg = await thread.send(text)
         for emoji in ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]:
             await poll_msg.add_reaction(emoji)
 
-        # 6) Programa el cierre automático en 30 minutos
+        # 8) Cierre automático en 30 minutos
         async def close_after(delay, thr):
             await asyncio.sleep(delay)
             await thr.edit(archived=True)
         asyncio.create_task(close_after(30 * 60, thread))
 
-        # 7) Confirma al invocador
+        # 9) Confirma al invocador
         await interaction.response.send_message(
             f"✅ Sala iniciada en {thread.mention}. ¡A votar!",
             ephemeral=True
