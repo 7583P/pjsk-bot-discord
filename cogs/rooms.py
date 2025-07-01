@@ -87,19 +87,19 @@ class Rooms(commands.Cog):
                 lines: list[str] = []
                 rooms_list = grouped.get(cat_id, [])
                 if not rooms_list:
-                    lines.append("**No hay salas activas**")
+                    lines.append("**No active rooms**")
                 else:
                     # orden ascendente por ID de sala
                     rooms_list.sort(key=lambda x: x[0])
                     for rid, pdata, avg in rooms_list:
                         count = len(pdata)
-                        lines.append(f"**Room {rid} · {count}/5 jugadores · MMR promedio: {avg}**")
+                        lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg}**")
                         for member, mmr in pdata:
                             lines.append(f"- {member.display_name} ({mmr})")
                         lines.append("")  # separación
 
                 # Pie con timestamp relativo
-                lines.append(f"Última actualización: <t:{now_ts}:R>")
+                lines.append(f"Last Update <t:{now_ts}:R>")
                 content = "\n".join(lines)
 
                 prev_msg = self.posted_messages.get(cat_id)

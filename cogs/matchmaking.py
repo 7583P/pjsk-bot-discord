@@ -10,10 +10,16 @@ from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord import app_commands
 # ———————————————————————————————————————————————
-# IDs de los canales #join válidos
+# — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
     1371307353437110282,  # pjsk-queue → #join
     1378215330979254402,  # jp-pjsk   → #join
+}
+
+# — Mapeo de canal #join → canal #results —
+JOIN_TO_RESULTS = {
+    1371307353437110282: 1371307931294892125,  # pjsk-queue → #results-pjsk
+    1378215330979254402: 1388515450534494389,  # jp-pjsk   → #results-jp-pjsk
 }
 
 def is_allowed_leave(ch: discord.abc.GuildChannel) -> bool:
@@ -303,25 +309,34 @@ class Matchmaking(commands.Cog):
     async def launch_song_poll(self, room_info):
         thread  = room_info["thread"]
         players = room_info["players"]
+
+        # 1) Calcula cuántos de cada rango había para definir low/high
         counts = {"Placement": 0, "Bronze": 0, "Gold": 0, "Diamond": 0}
         for m in players:
             for r in counts:
                 if discord.utils.get(m.roles, name=r):
                     counts[r] += 1
                     break
-        low, high = self._range_for_counts(counts)
-        songs = await self._get_9_songs(low, high)
+            else:
+                counts["Placement"] += 1
 
-        if not songs:
-            return await thread.send("⚠️ No hay canciones en ese rango.")
+        low, high = dynamic_range(counts)
 
-        view = SongPollView(songs, thread=thread, timeout=60)
-        msg  = await thread.send(
-            f"🎉 Sala completa · Niveles {high}-{low}\n"
+        # 2) Obtén el catálogo y selecciona solo 5 Expert
+        all_songs = await self._get_9_songs(low, high)
+        picks     = all_songs[:5]
+
+        # ← Marcamos la sala como iniciada
+        room_info["started"] = True
+
+        # 3) Lanza la vista con esas 5 canciones
+        view = SongPollView(picks, thread=thread, timeout=60)
+        await thread.send(
+            f"🎉 Sala completa · Niveles {high}★–{low}★ · Expert\n"
             "Tienen **1 minuto** para votar la canción:",
             view=view
         )
-        view.message = msg
+
 
     @app_commands.command(
         name="start",
@@ -336,7 +351,7 @@ class Matchmaking(commands.Cog):
         is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
         if not (is_join_chan or is_join_thread):
             return await interaction.response.send_message(
-                "❌ Este comando solo funciona en canales de **#join** (o sus hilos).",
+                "This command only works in rooms",
                 ephemeral=True
             )
 
@@ -361,7 +376,7 @@ class Matchmaking(commands.Cog):
         # — 3) Validar 2–5 jugadores —
         if not (2 <= len(players) <= 5):
             return await interaction.response.send_message(
-                "🔸 La sala debe tener entre 2 y 5 jugadores.",
+                "🔸 Room must have betweem 2-5 players",
                 ephemeral=True
             )
 
@@ -655,111 +670,124 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-    @commands.command(name="submit5")
-    async def submit5(self, ctx: commands.Context, *, block: str):
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        if len(lines) != 5:
-            return await ctx.send(
-                "⚠️ Debes enviar 5 líneas: @user [CC] p,g,gd,b,m"
-            )
-        room = next(
-            (r for r in self.rooms.values() if r["thread"].id == ctx.channel.id),
-            None,
-        )
+    @commands.command(name="submit")
+    async def submit(self, ctx: commands.Context, *, block: str):
+        # 1) Recuperar la sala y comprobar que la poll ya arrancó
+        mm   = self.bot.get_cog("Matchmaking")
+        room = next((r for r in mm.rooms.values() if r["thread"].id == ctx.channel.id), None)
         if not room:
-            return await ctx.send("Use this command into a room thread")
+            return await ctx.send("Only works into a room thread")
+        if not room.get("started", False):
+            return await ctx.send("Wait until poll song is launched")
 
+        # 2) Validar número de jugadores y líneas
+        players = room["players"]
+        n       = len(players)
+        if not (2 <= n <= 5):
+            return await ctx.send("Room must have between 2-5 players")
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        if len(lines) != n:
+            return await ctx.send(f"You should send {n} lines")
+
+        # 3) Publicar bloque crudo + reacciones en el mismo hilo
+        prompt   = "✅ React ✅ to validate, ❎ to decline"
+        intro    = prompt + "\n```\n" + "\n".join(lines) + "\n```"
+        vote_msg = await ctx.send(intro)
+        for emo in ("✅", "❎"):
+            await vote_msg.add_reaction(emo)
+
+        # 4) Esperar mayoría simple o timeout
+        threshold = n // 2 + 1
+        def check(reaction, user):
+            return (
+                reaction.message.id == vote_msg.id
+                and not user.bot
+                and str(reaction.emoji) in ("✅", "❎")
+            )
+        ganador = None
+        try:
+            while True:
+                reaction, user = await self.bot.wait_for(
+                    "reaction_add", timeout=60.0, check=check
+                )
+                counts = {
+                    emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
+                    for emo in ("✅", "❎")
+                }
+                if counts["✅"] >= threshold:
+                    ganador = "✅"; break
+                if counts["❎"] >= threshold:
+                    ganador = "❎"; break
+        except asyncio.TimeoutError:
+            counts = {
+                emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
+                for emo in ("✅", "❎")
+            }
+            if counts["✅"] > counts["❎"]:
+                ganador = "✅"
+            elif counts["❎"] > counts["✅"]:
+                ganador = "❎"
+            else:
+                ganador = "Doubt"
+
+        if ganador != "✅":
+            return await ctx.send(
+                "There might be an error, try doing it again"
+            )
+
+
+        # 5) Parseo y cálculo definitivo de MMR
         players_list = []
-        for ln in lines:
-            m = ENTRY_RE.match(ln)
-            if not m:
-                return await ctx.send(f"❌ Formato incorrecto: {ln}")
-            uid = int(m.group("id"))
-            cc = m.group("cc")
-            stats = list(map(int, m.group("stats").split(",")))
-            member = ctx.guild.get_member(uid) or await ctx.guild.fetch_member(uid)
+        for member, ln in zip(players, lines):
+            m      = ENTRY_RE.match(ln)
+            uid    = int(m.group("id")); cc = m.group("cc")
+            stats  = list(map(int, m.group("stats").split(",")))
+            old, _ = await self.fetch_player(uid)
+            total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
+            players_list.append({"member":member, "cc":cc, "total":total, "old":old})
 
-            weights = [5, 3, 2, 1, 0]
-            total = sum(s * w for s, w in zip(stats, weights))
-            old, db_role = await self.fetch_player(uid)
-
-            placement_bonus = None
-            bonus = old
-            async with self.db_pool.acquire() as conn:
-                if old == 0 and db_role == "Placement":
-                    non_perfect = sum(stats[1:])
-                    if non_perfect <= 15:
-                        bonus = 2000
-                        placement_bonus = "(+2000 Placement Diamond)"
-                    elif non_perfect <= 50:
-                        bonus = 1000
-                        placement_bonus = "(+1000 Placement Gold)"
-                    else:
-                        bonus = 0
-                        placement_bonus = "(+0 Placement Bronze)"
-                    await conn.execute(
-                        "UPDATE players SET mmr=$1 WHERE user_id=$2", bonus, uid
-                    )
-
-            players_list.append(
-                {
-                    "member": member,
-                    "country": cc,
-                    "total": total,
-                    "old": bonus,
-                    "placement_bonus": placement_bonus,
-                }
-            )
-
+        # Ordenar por total, calcular delta y new MMR
         players_list.sort(key=lambda x: x["total"], reverse=True)
-        avg = sum(p["old"] for p in players_list) / 5
-        unit = max(1, int(avg // 10))
+        avg  = sum(p["old"] for p in players_list)/n
+        unit = max(1, int(avg//10))
 
-        results = []
-        for idx, p in enumerate(players_list, 1):
-            mu = {1: 3, 2: 2, 3: 0.5, 4: -1, 5: -2}[idx]
-            delta = int(mu * unit)
-            new = p["old"] + delta
-            role_name = (
-                "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
+        summary = []
+        medals  = {1:"🥇",2:"🥈",3:"🥉"}
+        for idx,p in enumerate(players_list,1):
+            mu    = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
+            delta = int(mu*unit)
+            new   = p["old"]+delta
+            summary.append((
+                medals.get(idx,""),
+                p["member"].display_name,
+                p["total"],
+                f"{p['old']}{'+' if delta>=0 else ''}{delta}"
+            ))
+            # Actualizar DB y roles...
+            role_name = "Bronze" if new<1000 else "Gold" if new<2000 else "Diamond"
+            await self.db_pool.execute(
+                "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
+                new, role_name, p["member"].id
             )
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
-                    new, role_name, p["member"].id,
-                )
-            role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
+            role_obj = discord.utils.get(ctx.guild.roles,name=role_name)
             if role_obj:
-                await p["member"].remove_roles(
-                    *[r for r in p["member"].roles if r.name in {"Bronze", "Gold", "Diamond"}]
-                )
-                await p["member"].add_roles(role_obj)
+                await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze","Gold","Diamond"}]+[role_obj])
 
-            results.append(
-                {
-                    "idx": idx,
-                    "member": p["member"],
-                    "country": p["country"],
-                    "total": p["total"],
-                    "old": p["old"],
-                    "delta": delta,
-                    "new": new,
-                    "bonus": p["placement_bonus"],
-                }
-            )
+        # 6) Publicar tabla resumen en #results
+        join_parent     = ctx.channel.parent
+        result_chan_id  = JOIN_TO_RESULTS.get(join_parent.id)
+        result_chan     = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
-        lines_out = ["🏆 Resultados de ¡submit5! 🏆\n"]
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        for r in results:
-            if r["bonus"]:
-                lines_out.append(r["bonus"])
-            med = medals.get(r["idx"], "")
-            flag = country_flag(r["country"])
-            sign = "+" if r["delta"] >= 0 else ""
-            lines_out.append(f"{med} {flag} {r['member'].mention}")
-            lines_out.append(f"• Puntos Totales: {r['total']}")
-            lines_out.append(f"• MMR: {r['old']}{sign}{r['delta']} = {r['new']}\n")
-        await ctx.send("\n".join(lines_out))
+        table = "**🏆 Posiciones finales 🏆**\n"
+        table += "Pos · Player · Points · MMR Δ\n"
+        for med, name, pts, mmr_delta in summary:
+            table += f"{med} · **{name}** · {pts} · {mmr_delta}\n"
+
+        await result_chan.send(table)
+        await result_chan.send("MMR Updated")
+
+        # 7) Confirmación en el hilo original
+        await ctx.send(f"Results published on {result_chan.mention}", delete_after=115)
 
 
 async def setup(bot: commands.Bot):
