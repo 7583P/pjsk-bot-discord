@@ -153,6 +153,22 @@ class Matchmaking(commands.Cog):
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
 
+    async def _remind_start(self, thread: discord.Thread):
+        # espera 5 minutos
+        await asyncio.sleep(300)
+
+        # si nadie hizo /start en esos 5m, avisamos con mención
+        room = next(
+            (r for r in self.rooms.values() if r["thread"].id == thread.id),
+            None
+        )
+        if room and not room.get("started", False):
+            mentions = " ".join(
+                m.mention for m in thread.members if not m.bot
+            )
+            await thread.send(
+                f"{mentions}\n¡Recuerden usar `/start` para iniciar la votación!"
+            )
 
     @tasks.loop(minutes=1)
     async def monitor_inactivity(self):
@@ -403,7 +419,8 @@ class Matchmaking(commands.Cog):
                 "players": players.copy(),
                 "thread": thread,
                 "category_id": join_chan.category_id or 0,
-                "closed": True,              # ← marcamos la sala como cerrada
+                "closed": True,   
+                "started": True,           # ← marcamos la sala como cerrada
             }
             self.bot.dispatch('room_updated', new_rid)
             # desactivar inactividad
@@ -413,7 +430,8 @@ class Matchmaking(commands.Cog):
             thread = ch
             # marcamos esa sala como cerrada también
             rid = next(r for r,info in self.rooms.items() if info["thread"].id == thread.id)
-            self.rooms[rid]["closed"] = True    # ← closed aquí también
+            self.rooms[rid]["closed"] = True
+            self.rooms[rid]["started"] = True    # ← closed aquí también
             self.inactivity.pop(thread.id, None)
 
         # — 6) Lanzar SongPollView con 5 canciones —
@@ -518,10 +536,15 @@ class Matchmaking(commands.Cog):
                 invitable=False
             )
             self.rooms[new_id] = {
-                "players": [], "thread": thread,
+                "players": [],
+                "thread": thread,
                 "category_id": current_cat,
+                "started": False,    # AÚN no han hecho /start
             }
-            best_rid = new_id
+            # programamos el recordatorio a T+5min
+            self.bot.loop.create_task(self._remind_start(thread))
+
+
 
             # Borrar aviso automático
             async for msg in ch.history(limit=5):
@@ -792,5 +815,3 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
-    # p
