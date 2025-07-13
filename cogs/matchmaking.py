@@ -70,10 +70,10 @@ def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
 
 
 class SongPollView(discord.ui.View):
-    def __init__(self, songs, *, thread, cog, timeout=60):
+    """Select de 9 canciones que abre votación de 1 minuto."""
+    def __init__(self, songs, *, thread, timeout=60):
         super().__init__(timeout=timeout)
         self.thread = thread
-        self.cog    = cog
         self.message: discord.Message
         self.vote_map: dict[int,str] = {}
         self.votes:    dict[str,int] = {}
@@ -110,28 +110,29 @@ class SongPollView(discord.ui.View):
         self.add_item(select)
 
     async def on_timeout(self):
-        # 1) Deshabilita el select y actualiza el mensaje
         for child in self.children:
             child.disabled = True
-        await self.message.edit(view=self)
+        try:
+            await self.message.edit(view=self)
+        except:
+            pass
 
-        # 2) Calcula y envía el resultado
         if not self.votes:
-            await self.thread.send("⚠️ No se registraron votos en el tiempo establecido.")
-        else:
-            max_votes = max(self.votes.values())
-            winners   = [opt for opt,c in self.votes.items() if c == max_votes]
-            title,lvl,diff = (random.choice(winners) if len(winners)>1 else winners[0]).split("|")
-            await self.thread.send(
-                f"🏆 **Resultado**: **{title}** (Lv {lvl}, {diff}) con {max_votes} votos."
+            return await self.thread.send(
+                "⚠️ No se registraron votos en el tiempo establecido."
             )
 
-        # 3) Marca la sala como “poll expirado”
-        info = next(i for i in self.cog.rooms.values() if i["thread"].id == self.thread.id)
-        info["launched"] = True
+        max_votes = max(self.votes.values())
+        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
+        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
+        title, lvl, diff = chosen.split("|")
 
-        # 4) Cierra la vista para desbloquear !submit
+        await self.thread.send(
+            f"🏆 **Resultado de la votación** 🏆\n"
+            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
+        )
         self.stop()
+
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
@@ -152,42 +153,66 @@ class Matchmaking(commands.Cog):
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
 
-    async def _remind_start(self, thread: discord.Thread):
-        # espera 5 minutos
-        await asyncio.sleep(300)
 
-        # busca la sala
-        room = next(
-            (r for r in self.rooms.values() if r["thread"].id == thread.id),
-            None
-        )
-        # si no existe, ya arrancó o está llena, salimos
-        if not room or room.get("started", False) or len(room["players"]) >= 5:
-            return
+@tasks.loop(minutes=1)
+async def monitor_inactivity(self):
+    now = datetime.datetime.utcnow()
+    for rid, info in list(self.rooms.items()):
+        thread  = info["thread"]
+        players = info["players"]
+        # NUEVO BLOQUE AQUÍ:
+        if info.get("started", False):
+            self.inactivity.pop(thread.id, None)
+            continue
 
-        # si sigue sin /start y < 5 players, hacemos ping
-        mentions = " ".join(m.mention for m in thread.members if not m.bot)
-        await thread.send(
-           f"{mentions}\n¡Recuerden usar `/start` para iniciar la votación!"
-        )
+        # Si la sala está llena, desactivar monitoreo
+        if len(players) >= 5:
+            self.inactivity.pop(thread.id, None)
+            continue
 
+        data = self.inactivity.setdefault(thread.id, {})
+        for member in list(players):
+            entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
+            last, warned = entry["last"], entry["warned_at"]
 
-    @tasks.loop(minutes=1)
-    async def monitor_inactivity(self):
-        now = datetime.datetime.utcnow()
-        for rid, info in list(self.rooms.items()):
-            thread  = info["thread"]
-            players = info["players"]
+            # 5 min sin escribir → avisar
+            if warned is None and now - last > datetime.timedelta(minutes=5):
+                await thread.send(
+                    f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
+                )
+                entry["warned_at"] = now
 
-            # ◀─ SALTAR si ya arrancó la votación
-            if info.get("started", False):
-                
-                continue
+            # 2 min después del aviso y sigue inactivo → expulsar
+            elif warned and now - warned > datetime.timedelta(minutes=2) \
+                 and now - last > datetime.timedelta(minutes=7):
+                # SOLO si la sala NO ha iniciado
+                if info.get("started", False):
+                    continue
+                try:
+                    await thread.remove_user(member)
+                except:
+                    pass
+                players.remove(member)
+                data.pop(member.id, None)
+                await thread.send(
+                    f"{member.mention} have been kicked due to inactivity"
+                )
 
-            # Si la sala está llena, desactivar monitoreo
-            if len(players) >= 5:
-                self.inactivity.pop(thread.id, None)
-                continue
+                # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
+                if not players:
+                    try:
+                        # Archivamos y bloqueamos el hilo
+                        await thread.edit(archived=True, locked=True)
+                        # Lo borramos del servidor
+                        await thread.delete()
+                    except:
+                        pass
+                    # Limpiamos las estructuras internas
+                    self.rooms.pop(rid, None)
+                    self.inactivity.pop(thread.id, None)
+                    # Pasamos a la siguiente sala
+                    continue
+
 
             data = self.inactivity.setdefault(thread.id, {})
             for member in list(players):
@@ -203,7 +228,10 @@ class Matchmaking(commands.Cog):
 
                 # 2 min después del aviso y sigue inactivo → expulsar
                 elif warned and now - warned > datetime.timedelta(minutes=2) \
-                     and now - last > datetime.timedelta(minutes=7):
+                    and now - last > datetime.timedelta(minutes=7):
+                    # SOLO si la sala NO ha iniciado
+                    if info.get("started", False):
+                        continue
                     try:
                         await thread.remove_user(member)
                     except:
@@ -213,6 +241,7 @@ class Matchmaking(commands.Cog):
                     await thread.send(
                         f"{member.mention} have been kicked due to inactivity"
                     )
+                    # ... resto igual
 
                     # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
                     if not players:
@@ -349,8 +378,11 @@ class Matchmaking(commands.Cog):
         all_songs = await self._get_9_songs(low, high)
         picks     = all_songs[:5]
 
+        # ← Marcamos la sala como iniciada
+        room_info["started"] = True
+
         # 3) Lanza la vista con esas 5 canciones
-        view = SongPollView(picks, thread=thread, cog=self, timeout=60)
+        view = SongPollView(picks, thread=thread, timeout=60)
         await thread.send(
             f"🎉 Sala completa · Niveles {high}★–{low}★ · Expert\n"
             "Tienen **1 minuto** para votar la canción:",
@@ -420,14 +452,11 @@ class Matchmaking(commands.Cog):
             )
             new_rid = max(self.rooms.keys(), default=0) + 1
             self.rooms[new_rid] = {
-                "players":   players.copy(),
-                "thread":    thread,
+                "players": players.copy(),
+                "thread": thread,
                 "category_id": join_chan.category_id or 0,
-                "closed":    True,
-                "started":   True,    # ✅ acabamos de ejecutar /start
-                "launched":  False,
+                "closed": True,              # ← marcamos la sala como cerrada
             }
-
             self.bot.dispatch('room_updated', new_rid)
             # desactivar inactividad
             self.inactivity.pop(thread.id, None)
@@ -436,14 +465,13 @@ class Matchmaking(commands.Cog):
             thread = ch
             # marcamos esa sala como cerrada también
             rid = next(r for r,info in self.rooms.items() if info["thread"].id == thread.id)
-            self.rooms[rid]["closed"] = True
-            self.rooms[rid]["started"] = True
+            self.rooms[rid]["closed"] = True    # ← closed aquí también
             self.inactivity.pop(thread.id, None)
 
         # — 6) Lanzar SongPollView con 5 canciones —
         all_songs = await self._get_9_songs(lo, hi)
         picks     = all_songs[:5]
-        view      = view = SongPollView(picks, thread=thread, cog=self, timeout=60)
+        view      = SongPollView(picks, thread=thread, timeout=60)
         prompt    = f"🎶 **Votación (Expert {lo}–{hi}★)**\nTienen **1 minuto** para elegir su canción:"
         msg       = await thread.send(prompt, view=view)
         view.message = msg
@@ -542,16 +570,10 @@ class Matchmaking(commands.Cog):
                 invitable=False
             )
             self.rooms[new_id] = {
-                "players": [],
-                "thread": thread,
+                "players": [], "thread": thread,
                 "category_id": current_cat,
-                "started": False,
-                "launched": False,
             }
-            # programamos el recordatorio a T+5min
-            self.bot.loop.create_task(self._remind_start(thread))
-
-
+            best_rid = new_id
 
             # Borrar aviso automático
             async for msg in ch.history(limit=5):
@@ -562,21 +584,12 @@ class Matchmaking(commands.Cog):
             self.bot.dispatch('room_updated', best_rid)
 
         # Añadir jugador
-        thread = room["thread"]
+        room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
                 "You are already in a room", ephemeral=True
             )
         room["players"].append(member)
-
-        # ── Reset de inactividad al unirse o reentrar ──
-        now = datetime.datetime.utcnow()
-        self.inactivity.setdefault(thread.id, {})[member.id] = {
-            "last":     now,
-            "warned_at": None
-        }
-
-
 
         await interaction.response.send_message(
             f"Joined room{best_rid}.", ephemeral=True
@@ -702,7 +715,7 @@ class Matchmaking(commands.Cog):
         await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones", ephemeral=True)
         if not songs:
             return await ctx.send("⚠️ No hay canciones en debug_poll.", ephemeral=True)
-        view = SongPollView(songs, thread=ctx.channel, cog=self, timeout=60)
+        view = SongPollView(songs, thread=ctx.channel, timeout=60)
         msg  = await ctx.send(
             "🎵 Poll de prueba (60s para votar):",
             view=view
@@ -716,10 +729,9 @@ class Matchmaking(commands.Cog):
         room = next((r for r in mm.rooms.values() if r["thread"].id == ctx.channel.id), None)
         if not room:
             return await ctx.send("Only works into a room thread")
-        if not room.get("launched", False):
-            return await ctx.send("Wait until poll song is launched")
-
-
+        # NUEVO BLOQUE:
+        if room.get("finished", False):
+            return await ctx.send("The room has already been finished, cannot submit again.")
 
         # 2) Validar número de jugadores y líneas
         players = room["players"]
@@ -827,9 +839,30 @@ class Matchmaking(commands.Cog):
         await result_chan.send(table)
         await result_chan.send("MMR Updated")
 
+    await result_chan.send(table)
+    await result_chan.send("MMR Updated")
+
+
+        room["finished"] = True  # ← Bloquea futuros !submit
+
+        # Agendar cierre de hilo 2 minutos después
+        async def close_thread_later(thread, rooms, rid):
+            await asyncio.sleep(120)
+            try:
+                await thread.edit(archived=True, locked=True)
+                await thread.delete()
+            except:
+                pass
+            rooms.pop(rid, None)
+
+        rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
+        asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
+
         # 7) Confirmación en el hilo original
         await ctx.send(f"Results published on {result_chan.mention}", delete_after=115)
 
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
+    # p
