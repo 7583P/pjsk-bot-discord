@@ -814,6 +814,65 @@ class Matchmaking(commands.Cog):
         rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
 
+    @commands.command(name="update")
+    async def update(self, ctx: commands.Context, *, block: str):
+        # Solo tú puedes usarlo
+        if ctx.author.id != 878310498720940102:
+            return await ctx.send("❌ Solo el administrador puede usar este comando.")
+
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
+        summary = []
+        medals  = {1:"🥇",2:"🥈",3:"🥉"}
+
+        players_list = []
+        for idx, ln in enumerate(lines):
+            m = ENTRY_RE.match(ln)
+            if not m:
+                summary.append(f"❌ Línea inválida: `{ln}`")
+                continue
+            uid    = int(m.group("id"))
+            cc     = m.group("cc")
+            stats  = list(map(int, m.group("stats").split(",")))
+            # Usar lógica idéntica a submit
+            old, _ = await self.fetch_player(uid)
+            total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
+            players_list.append({"member": ctx.guild.get_member(uid), "cc": cc, "total": total, "old": old, "uid": uid})
+
+        # Ordenar y calcular deltas igual que en submit
+        players_list.sort(key=lambda x: x["total"], reverse=True)
+        n = len(players_list)
+        avg  = sum(p["old"] for p in players_list) / n if n > 0 else 0
+        unit = max(1, int(avg // 10)) if n > 0 else 1
+
+        for idx, p in enumerate(players_list, 1):
+            mu = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
+            delta = int(mu * unit)
+            new = p["old"] + delta
+            role_name = "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
+            try:
+                await self.db_pool.execute(
+                    "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
+                    new, role_name, p["uid"]
+                )
+            except Exception as e:
+                summary.append(f"❌ Error DB <@{p['uid']}>: {e}")
+
+            # Actualiza rol en Discord
+            try:
+                member = p["member"]
+                if member:
+                    role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
+                    if role_obj:
+                        await member.edit(roles=[r for r in member.roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
+                    await member.edit(nick=f"{member.display_name} [{role_name}]")
+            except Exception as e:
+                summary.append(f"❌ Error Discord <@{p['uid']}>: {e}")
+
+            summary.append(f"{medals.get(idx,'')} <@{p['uid']}> → {new} MMR, rango {role_name}")
+
+        await ctx.send("\n".join(summary))
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
