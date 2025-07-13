@@ -839,27 +839,11 @@ async def monitor_inactivity(self):
         await result_chan.send(table)
         await result_chan.send("MMR Updated")
 
-    await result_chan.send(table)
-    await result_chan.send("MMR Updated")
-
-
         room["finished"] = True  # ← Bloquea futuros !submit
 
         # Agendar cierre de hilo 2 minutos después
-        async def close_thread_later(thread, rooms, rid):
-            await asyncio.sleep(120)
-            try:
-                await thread.edit(archived=True, locked=True)
-                await thread.delete()
-            except:
-                pass
-            rooms.pop(rid, None)
-
         rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
-
-        # 7) Confirmación en el hilo original
-        await ctx.send(f"Results published on {result_chan.mention}", delete_after=115)
 
 
 async def setup(bot: commands.Bot):
