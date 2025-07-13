@@ -154,32 +154,32 @@ class Matchmaking(commands.Cog):
         self.monitor_inactivity.start()
 
 
-@tasks.loop(minutes=1)
-async def monitor_inactivity(self):
-    now = datetime.datetime.utcnow()
-    for rid, info in list(self.rooms.items()):
-        thread  = info["thread"]
-        players = info["players"]
-        # NUEVO BLOQUE AQUÍ:
-        if info.get("started", False):
-            self.inactivity.pop(thread.id, None)
-            continue
+    @tasks.loop(minutes=1)
+    async def monitor_inactivity(self):
+        now = datetime.datetime.utcnow()
+        for rid, info in list(self.rooms.items()):
+            thread  = info["thread"]
+            players = info["players"]
+            # NUEVO BLOQUE AQUÍ:
+            if info.get("started", False):
+                self.inactivity.pop(thread.id, None)
+                continue
 
-        # Si la sala está llena, desactivar monitoreo
-        if len(players) >= 5:
-            self.inactivity.pop(thread.id, None)
-            continue
+            # Si la sala está llena, desactivar monitoreo
+            if len(players) >= 5:
+                self.inactivity.pop(thread.id, None)
+                continue
 
-        data = self.inactivity.setdefault(thread.id, {})
-        for member in list(players):
-            entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
-            last, warned = entry["last"], entry["warned_at"]
+            data = self.inactivity.setdefault(thread.id, {})
+            for member in list(players):
+                entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
+                last, warned = entry["last"], entry["warned_at"]
 
-            # 5 min sin escribir → avisar
-            if warned is None and now - last > datetime.timedelta(minutes=5):
-                await thread.send(
-                    f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
-                )
+                # 5 min sin escribir → avisar
+                if warned is None and now - last > datetime.timedelta(minutes=5):
+                    await thread.send(
+                        f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
+                    )
                 entry["warned_at"] = now
 
             # 2 min después del aviso y sigue inactivo → expulsar
