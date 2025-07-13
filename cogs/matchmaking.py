@@ -143,7 +143,6 @@ class Matchmaking(commands.Cog):
 
     @staticmethod
     def _range_for_counts(counts: dict[str, bool]) -> tuple[int, int]:
-        # delegar en la función dinámica
         return dynamic_range(counts)
 
     def __init__(self, bot: commands.Bot):
@@ -153,66 +152,60 @@ class Matchmaking(commands.Cog):
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
 
+    @tasks.loop(minutes=1)
+    async def monitor_inactivity(self):
+        now = datetime.datetime.utcnow()
+        for rid, info in list(self.rooms.items()):
+            thread  = info["thread"]
+            players = info["players"]
+            # NUEVO BLOQUE AQUÍ:
+            if info.get("started", False):
+                self.inactivity.pop(thread.id, None)
+                continue
 
-@tasks.loop(minutes=1)
-async def monitor_inactivity(self):
-    now = datetime.datetime.utcnow()
-    for rid, info in list(self.rooms.items()):
-        thread  = info["thread"]
-        players = info["players"]
-        # NUEVO BLOQUE AQUÍ:
-        if info.get("started", False):
-            self.inactivity.pop(thread.id, None)
-            continue
+            # Si la sala está llena, desactivar monitoreo
+            if len(players) >= 5:
+                self.inactivity.pop(thread.id, None)
+                continue
 
-        # Si la sala está llena, desactivar monitoreo
-        if len(players) >= 5:
-            self.inactivity.pop(thread.id, None)
-            continue
+            data = self.inactivity.setdefault(thread.id, {})
+            for member in list(players):
+                entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
+                last, warned = entry["last"], entry["warned_at"]
 
-        data = self.inactivity.setdefault(thread.id, {})
-        for member in list(players):
-            entry  = data.setdefault(member.id, {"last": now, "warned_at": None})
-            last, warned = entry["last"], entry["warned_at"]
+                # 5 min sin escribir → avisar
+                if warned is None and now - last > datetime.timedelta(minutes=5):
+                    await thread.send(
+                        f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
+                    )
+                    entry["warned_at"] = now
 
-            # 5 min sin escribir → avisar
-            if warned is None and now - last > datetime.timedelta(minutes=5):
-                await thread.send(
-                    f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
-                )
-                entry["warned_at"] = now
-
-            # 2 min después del aviso y sigue inactivo → expulsar
-            elif warned and now - warned > datetime.timedelta(minutes=2) \
-                 and now - last > datetime.timedelta(minutes=7):
-                # SOLO si la sala NO ha iniciado
-                if info.get("started", False):
-                    continue
-                try:
-                    await thread.remove_user(member)
-                except:
-                    pass
-                players.remove(member)
-                data.pop(member.id, None)
-                await thread.send(
-                    f"{member.mention} have been kicked due to inactivity"
-                )
-
-                # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
-                if not players:
+                # 2 min después del aviso y sigue inactivo → expulsar
+                elif warned and now - warned > datetime.timedelta(minutes=2) \
+                        and now - last > datetime.timedelta(minutes=7):
+                    # SOLO si la sala NO ha iniciado
+                    if info.get("started", False):
+                        continue
                     try:
-                        # Archivamos y bloqueamos el hilo
-                        await thread.edit(archived=True, locked=True)
-                        # Lo borramos del servidor
-                        await thread.delete()
+                        await thread.remove_user(member)
                     except:
                         pass
-                    # Limpiamos las estructuras internas
-                    self.rooms.pop(rid, None)
-                    self.inactivity.pop(thread.id, None)
-                    # Pasamos a la siguiente sala
-                    continue
+                    players.remove(member)
+                    data.pop(member.id, None)
+                    await thread.send(
+                        f"{member.mention} have been kicked due to inactivity"
+                    )
 
+                    # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
+                    if not players:
+                        try:
+                            await thread.edit(archived=True, locked=True)
+                            await thread.delete()
+                        except:
+                            pass
+                        self.rooms.pop(rid, None)
+                        self.inactivity.pop(thread.id, None)
+                        continue
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
