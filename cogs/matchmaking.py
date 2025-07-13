@@ -754,26 +754,47 @@ class Matchmaking(commands.Cog):
         unit = max(1, int(avg//10))
 
         summary = []
-        medals  = {1:"🥇",2:"🥈",3:"🥉"}
-        for idx,p in enumerate(players_list,1):
-            mu    = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
-            delta = int(mu*unit)
-            new   = p["old"]+delta
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        for idx, p in enumerate(players_list, 1):
+            mu = {1: 3, 2: 2, 3: 0.5, 4: -1, 5: -2}[idx]
+            delta = int(mu * unit)
+            new = p["old"] + delta
             summary.append((
-                medals.get(idx,""),
+                medals.get(idx, ""),
                 p["member"].display_name,
                 p["total"],
-                f"{p['old']}{'+' if delta>=0 else ''}{delta}"
+                f"{p['old']}{'+' if delta >= 0 else ''}{delta}"
             ))
-            # Actualizar DB y roles...
-            role_name = "Bronze" if new<1000 else "Gold" if new<2000 else "Diamond"
-            await self.db_pool.execute(
-                "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
-                new, role_name, p["member"].id
-            )
-            role_obj = discord.utils.get(ctx.guild.roles,name=role_name)
+            # 1) Actualizar MMR y rol en la base de datos
+            role_name = "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
+            try:
+                await self.db_pool.execute(
+                    "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
+                    new, role_name, p["member"].id
+                )
+                print(f"[DB] MMR de {p['member'].display_name} actualizado a {new}, rol: {role_name}")
+            except Exception as e:
+                print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
+
+            # 2) Actualizar rol en Discord
+            role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
             if role_obj:
-                await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze","Gold","Diamond"}]+[role_obj])
+                try:
+                    await p["member"].edit(roles=[
+                        r for r in p["member"].roles if r.name not in {"Bronze", "Gold", "Diamond"}
+                    ] + [role_obj])
+                    print(f"[DISCORD] Rol de {p['member'].display_name} actualizado a {role_name}")
+                except Exception as e:
+                    print(f"[DISCORD ERROR] Al asignar rol: {e}")
+            else:
+                print(f"[DISCORD ERROR] Rol '{role_name}' no encontrado en el servidor.")
+
+            # 3) (Opcional) Actualiza el nick con el rango
+            try:
+                await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
+                print(f"[DISCORD] Nick de {p['member'].display_name} actualizado.")
+            except Exception as e:
+                print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
 
         # 6) Publicar tabla resumen en #results
         join_parent     = ctx.channel.parent
