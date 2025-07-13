@@ -671,154 +671,148 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-@commands.command(name="submit")
-async def submit(self, ctx: commands.Context, *, block: str):
-    # 1) Recuperar la sala y comprobar que la poll ya arrancó
-    mm   = self.bot.get_cog("Matchmaking")
-    room = next((r for r in mm.rooms.values() if r["thread"].id == ctx.channel.id), None)
-    if not room:
-        return await ctx.send("Only works into a room thread")
-    # NUEVO BLOQUE:
-    if room.get("finished", False):
-        return await ctx.send("The room has already been finished, cannot submit again.")
+    @commands.command(name="submit")
+    async def submit(self, ctx: commands.Context, *, block: str):
+        # 1) Buscar la sala/hilo activo
+        mm = self.bot.get_cog("Matchmaking")
+        room = next((r for r in mm.rooms.values() if r["thread"].id == ctx.channel.id), None)
+        if not room:
+            return await ctx.send("Only works inside a room thread")
 
-    # 2) Validar número de jugadores y líneas
-    players = room["players"]
-    n       = len(players)
-    if not (2 <= n <= 5):
-        return await ctx.send("Room must have between 2-5 players")
-    lines = [l.strip() for l in block.split("\n") if l.strip()]
-    if len(lines) != n:
-        return await ctx.send(f"You should send {n} lines")
+        if room.get("finished", False):
+            return await ctx.send("The room has already been finished, cannot submit again.")
 
-    # 3) Publicar bloque crudo + reacciones en el mismo hilo
-    prompt   = "✅ React ✅ to validate, ❎ to decline"
-    intro    = prompt + "\n```\n" + "\n".join(lines) + "\n```"
-    vote_msg = await ctx.send(intro)
-    for emo in ("✅", "❎"):
-        await vote_msg.add_reaction(emo)
+        players = room["players"]
+        n = len(players)
+        if not (2 <= n <= 5):
+            return await ctx.send("Room must have between 2-5 players")
 
-    # 4) Esperar mayoría simple o timeout (ahora SIEMPRE procesa al final)
-    threshold = n // 2 + 1
-    def check(reaction, user):
-        return (
-            reaction.message.id == vote_msg.id
-            and not user.bot
-            and str(reaction.emoji) in ("✅", "❎")
-        )
-    ganador = None
-    try:
-        while True:
-            reaction, user = await self.bot.wait_for(
-                "reaction_add", timeout=60.0, check=check
+        lines = [l.strip() for l in block.split("\n") if l.strip()]
+        if len(lines) != n:
+            return await ctx.send(f"You should send {n} lines")
+
+        # 2) Tabla cruda para validar con reacciones
+        intro = "✅ React ✅ to validate, ❎ to decline\n```\n" + "\n".join(lines) + "\n```"
+        vote_msg = await ctx.send(intro)
+        for emo in ("✅", "❎"):
+            await vote_msg.add_reaction(emo)
+
+        # 3) Espera de mayoría simple o timeout
+        threshold = n // 2 + 1
+        def check(reaction, user):
+            return (
+                reaction.message.id == vote_msg.id
+                and not user.bot
+                and str(reaction.emoji) in ("✅", "❎")
             )
+        ganador = None
+        try:
+            while True:
+                reaction, user = await self.bot.wait_for(
+                    "reaction_add", timeout=60.0, check=check
+                )
+                counts = {
+                    emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
+                    for emo in ("✅", "❎")
+                }
+                if counts["✅"] >= threshold:
+                    ganador = "✅"
+                    break
+                if counts["❎"] >= threshold:
+                    ganador = "❎"
+                    break
+        except asyncio.TimeoutError:
             counts = {
                 emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
                 for emo in ("✅", "❎")
             }
-            print("Counts:", counts, "Threshold:", threshold)
-            if counts["✅"] >= threshold:
+            if counts["✅"] > counts["❎"]:
                 ganador = "✅"
-                print("Ganador por mayoría: ✅")
-                break
-            if counts["❎"] >= threshold:
+            elif counts["❎"] > counts["✅"]:
                 ganador = "❎"
-                print("Ganador por mayoría: ❎")
-                break
-    except asyncio.TimeoutError:
-        counts = {
-            emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
-            for emo in ("✅", "❎")
-        }
-        print("Timeout! Counts:", counts)
-        if counts["✅"] > counts["❎"]:
-            ganador = "✅"
-        elif counts["❎"] > counts["✅"]:
-            ganador = "❎"
-        else:
-            ganador = "Doubt"
+            else:
+                ganador = "Doubt"
 
-    print("Ganador final:", ganador)
-    if ganador != "✅":
-        await ctx.send(
-            f"No hubo mayoría de ✅, intenta de nuevo. (Ganador: {ganador})"
-        )
-        return  # no procesa el submit
+        if ganador != "✅":
+            return await ctx.send("There might be an error, try doing it again.")
 
-    # 5) Parseo y cálculo definitivo de MMR
-    players_list = []
-    for member, ln in zip(players, lines):
-        m      = ENTRY_RE.match(ln)
-        if not m:
-            await ctx.send(f"Error en la línea: {ln}")
-            return
-        uid    = int(m.group("id")); cc = m.group("cc")
-        stats  = list(map(int, m.group("stats").split(",")))
-        old, _ = await self.fetch_player(uid)
-        total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
-        players_list.append({"member":member, "cc":cc, "total":total, "old":old})
+        # 4) Calcular y actualizar MMR/rango/página
+        summary = []
+        medals  = {1:"🥇",2:"🥈",3:"🥉"}
+        ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
+        players_list = []
+        for member, ln in zip(players, lines):
+            m = ENTRY_RE.match(ln)
+            if not m:
+                return await ctx.send(f"Formato incorrecto para: {ln}")
+            uid    = int(m.group("id"))
+            cc     = m.group("cc")
+            stats  = list(map(int, m.group("stats").split(",")))
+            old, _ = await self.fetch_player(uid)
+            total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
+            players_list.append({"member": member, "cc": cc, "total": total, "old": old})
 
-    # Ordenar por total, calcular delta y new MMR
-    players_list.sort(key=lambda x: x["total"], reverse=True)
-    avg  = sum(p["old"] for p in players_list)/n
-    unit = max(1, int(avg//10))
+        players_list.sort(key=lambda x: x["total"], reverse=True)
+        avg  = sum(p["old"] for p in players_list) / n
+        unit = max(1, int(avg // 10))
 
-    summary = []
-    medals  = {1:"🥇",2:"🥈",3:"🥉"}
-    mu_map = {1:3,2:2,3:0.5,4:-1,5:-2}
-    for idx,p in enumerate(players_list,1):
-        mu    = mu_map.get(idx, -2)
-        delta = int(mu*unit)
-        new   = p["old"]+delta
-        summary.append((
-            medals.get(idx,""),
-            p["member"].display_name,
-            p["total"],
-            f"{p['old']}{'+' if delta>=0 else ''}{delta}"
-        ))
-        # Actualizar DB y roles...
-        role_name = "Bronze" if new<1000 else "Gold" if new<2000 else "Diamond"
-        try:
-            await self.db_pool.execute(
-                "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
-                new, role_name, p["member"].id
-            )
-            print(f"[DB] MMR y rol actualizado: {p['member'].display_name} -> {new}, {role_name}")
-        except Exception as e:
-            print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
-        # Actualizar rol en Discord
-        role_obj = discord.utils.get(ctx.guild.roles,name=role_name)
-        if role_obj:
+        for idx, p in enumerate(players_list, 1):
+            mu = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
+            delta = int(mu * unit)
+            new = p["old"] + delta
+            summary.append((
+                medals.get(idx, ""),
+                p["member"].display_name,
+                p["total"],
+                f"{p['old']}{'+' if delta >= 0 else ''}{delta}"
+            ))
+            # DB y rol Discord
+            role_name = "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
             try:
-                await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze","Gold","Diamond"}]+[role_obj])
-                print(f"[DISCORD] Rol actualizado {p['member'].display_name} -> {role_name}")
+                await self.db_pool.execute(
+                    "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
+                    new, role_name, p["member"].id
+                )
             except Exception as e:
-                print(f"[DISCORD ERROR] Al asignar rol: {e}")
+                print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
+            # Rol Discord
+            try:
+                role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
+                if role_obj:
+                    await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
+            except Exception as e:
+                print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
+            # (Opcional) Nick
+            try:
+                await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
+            except Exception as e:
+                print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
 
-        # (Opcional) Actualiza el nick con el rango (puedes comentar si no quieres)
-        try:
-            await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
-        except Exception as e:
-            print(f"[DISCORD ERROR] Al actualizar nick: {e}")
+        # 5) Publicar resultados en #results
+        join_parent    = ctx.channel.parent
+        result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
+        result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
-    # 6) Publicar tabla resumen en #results
-    join_parent     = ctx.channel.parent
-    result_chan_id  = JOIN_TO_RESULTS.get(join_parent.id)
-    result_chan     = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
+        table = "**🏆 Posiciones finales 🏆**\n"
+        table += "Pos · Player · Points · MMR Δ\n"
+        for med, name, pts, mmr_delta in summary:
+            table += f"{med} · **{name}** · {pts} · {mmr_delta}\n"
+        await result_chan.send(table)
+        await result_chan.send("MMR Updated")
 
-    table = "**🏆 Posiciones finales 🏆**\n"
-    table += "Pos · Player · Points · MMR Δ\n"
-    for med, name, pts, mmr_delta in summary:
-        table += f"{med} · **{name}** · {pts} · {mmr_delta}\n"
+        room["finished"] = True
 
-    await result_chan.send(table)
-    await result_chan.send("MMR Updated")
-
-    room["finished"] = True  # ← Bloquea futuros !submit
-
-    # Agendar cierre de hilo 2 minutos después
-    rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
-    asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
+        # 6) Agendar cierre de hilo 2 minutos después
+        async def close_thread_later(thread, rooms, rid):
+            await asyncio.sleep(120)
+            try:
+                await thread.edit(archived=True, locked=True)
+                await thread.delete()
+            except Exception:
+                pass
+            rooms.pop(rid, None)
+        rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
+        asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
 
 
 async def setup(bot: commands.Bot):
