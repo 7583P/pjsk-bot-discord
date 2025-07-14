@@ -765,14 +765,16 @@ for member, ln in zip(players, lines):
     uid       = int(m.group("id"))
     cc        = m.group("cc")
     stats     = list(map(int, m.group("stats").split(",")))
-    stats_str = m.group("stats")                # ← nueva línea
-    old, current_role = await self.fetch_player(uid)    # <-- capturamos también el rol
+    stats_str = m.group("stats")  # ← nueva línea
+    old, current_role = await self.fetch_player(uid)  # <-- capturamos también el rol
+    # FALTA calcular "total"
+    total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))  # ← añade esta línea
     players_list.append({
         "member":    member,
         "cc":        cc,
         "total":     total,
         "old":       old,
-        "role":      current_role,                      # <-- lo guardamos
+        "role":      current_role,
         "stats":     stats,
         "stats_str": stats_str
     })
