@@ -765,9 +765,9 @@ def get_role_from_mmr(mmr):
             uid       = int(m.group("id"))
             cc        = m.group("cc")
             stats     = list(map(int, m.group("stats").split(",")))
-            stats_str = m.group("stats")
+            stats_str = m.group("stats")                # ← nueva línea
             old, current_role = await self.fetch_player(uid)
-            total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
+            total  = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
             players_list.append({
                 "member":    member,
                 "cc":        cc,
@@ -777,7 +777,6 @@ def get_role_from_mmr(mmr):
                 "stats":     stats,
                 "stats_str": stats_str
             })
-
 
         players_list.sort(key=lambda x: x["total"], reverse=True)
         avg  = sum(p["old"] for p in players_list) / n
@@ -802,12 +801,8 @@ def get_role_from_mmr(mmr):
             if current_role == "Placement":
                 # PROMUEVE en 1 partida, usando suma de notas
                 role_name = get_role_from_notes(total_notes)
-                # Si quieres asignar un MMR base por rango, puedes descomentar esto:
-                # mmr_bases = {"Diamond": 550, "Gold": 150, "Bronze": 50}
-                # new = mmr_bases[role_name]
-                new = current_mmr  # o deja el MMR que ya tiene
+                new = current_mmr
             else:
-                # AJUSTA MMR según posición
                 raw_delta = int(mu_map.get(idx, 0) * unit)
                 delta     = max(-39, min(39, raw_delta))
                 new       = p["old"] + delta
@@ -839,7 +834,6 @@ def get_role_from_mmr(mmr):
             except Exception as e:
                 print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
 
-
         # 5) Publicar resultados en #results
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
@@ -865,6 +859,7 @@ def get_role_from_mmr(mmr):
             rooms.pop(rid, None)
         rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
+
 
     @commands.command(name="update")
     async def update(self, ctx: commands.Context, *, block: str):
