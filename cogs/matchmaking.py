@@ -742,51 +742,127 @@ class Matchmaking(commands.Cog):
         ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
         players_list = []
         for member, ln in zip(players, lines):
-            m = ENTRY_RE.match(ln)
-            if not m:
-                return await ctx.send(f"Formato incorrecto para: {ln}")
-            uid    = int(m.group("id"))
-            cc     = m.group("cc")
-            stats  = list(map(int, m.group("stats").split(",")))
-            old, _ = await self.fetch_player(uid)
-            total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
-            players_list.append({"member": member, "cc": cc, "total": total, "old": old})
+        m = ENTRY_RE.match(ln)
+        if not m:
+            return await ctx.send(f"Formato incorrecto para: {ln}")
+        uid       = int(m.group("id"))
+        cc        = m.group("cc")
+        stats     = list(map(int, m.group("stats").split(",")))
+        stats_str = m.group("stats")                # ← nueva línea
+        old, current_role = await self.fetch_player(uid)    # <-- capturamos también el rol
+        players_list.append({
+            "member":    member,
+            "cc":        cc,
+            "total":     total,
+            "old":       old,
+            "role":      current_role,                      # <-- lo guardamos
+            "stats":     stats,
+            "stats_str": stats_str
+        })
+
+# —–––– BONUS solo a Placement, según greats ––––
+for p in players_list:
+    if p["role"] == "Placement":
+        greats = p["stats"][1]              # número de “greats”
+        if   0  <= greats <= 15:
+            bonus = 550    # Diamond-placement
+        elif 16 <= greats <= 50:
+            bonus = 150    # Gold-placement
+        else:
+            bonus = 50     # Bronze-placement
+    else:
+        bonus = 0
+
+    p["old"]  += bonus      # actualiza el MMR base con el bonus
+    p["bonus"] = bonus      # guárdalo si lo quieres mostrar luego
+# —–––– fin de bonus ––––
+
 
         players_list.sort(key=lambda x: x["total"], reverse=True)
         avg  = sum(p["old"] for p in players_list) / n
         unit = max(1, int(avg // 10))
 
-        for idx, p in enumerate(players_list, 1):
-            mu = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
-            delta = int(mu * unit)
-            new = p["old"] + delta
-            summary.append((
-                medals.get(idx, ""),
-                p["member"].display_name,
-                p["total"],
-                f"{p['old']}{'+' if delta >= 0 else ''}{delta}"
-            ))
-            # DB y rol Discord
-            role_name = "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
-            try:
-                await self.db_pool.execute(
-                    "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
-                    new, role_name, p["member"].id
-                )
-            except Exception as e:
-                print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
-            # Rol Discord
-            try:
-                role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
-                if role_obj:
-                    await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
-            except Exception as e:
-                print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
-            # (Opcional) Nick
-            try:
-                await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
-            except Exception as e:
-                print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
+       # — Calcular mu_map según el tamaño de sala —
+       n    = len(players_list)
+       avg  = sum(p["old"] for p in players_list) / n
+       unit = max(1, int(avg // 10))
+
+       if n == 5:
+           mu_map = {1: 3,   2: 2,    3: 0.5, 4: -1,   5: -2}
+       elif n == 4:
+           mu_map = {1: 2.5, 2: 1,    3: -0.5,4: -3}
+       elif n == 3:
+           mu_map = {1: 2,   2: 0,    3: -2}
+       elif n == 2:
+           mu_map = {1: 1.5, 2: -1.5}
+       else:
+           mu_map = {1: 1,   2: -1}
+
+       # — Bucle principal con Δ capado a ±39 —
+       for idx, p in enumerate(players_list, 1):
+           raw_delta = int(mu_map.get(idx, 0) * unit)
+           delta     = max(-39, min(39, raw_delta))
+           new       = p["old"] + delta
+
+    # --- Lógica de rol según Placement y MMReatorio con demotes/promos controlados ---
+    current_mmr, current_role = await self.fetch_player(p["member"].id)
+    greats = p["stats"][1]
+
+    if current_role == "Placement":
+        # salida de Placement basada en greats
+        if   0 <= greats <= 15:
+            role_name = "Diamond"
+        elif 16 <= greats <= 50:
+            role_name = "Gold"
+        else:
+            role_name = "Bronze"
+    else:
+        # mmr thresholds
+        if new <= 100:
+            target = "Bronze"
+        elif new <= 500:
+            target = "Gold"
+        else:
+            target = "Diamond"
+
+        # solo demotear si el nuevo rango está por debajo del actual
+        order = ["Bronze","Gold","Diamond"]
+        if order.index(target) < order.index(current_role):
+            role_name = target     # perdemos el rol
+        elif order.index(target) > order.index(current_role):
+            role_name = target     # ganamos promo
+        else:
+            role_name = current_role  # mantenemos rol
+
+    # --- Fin de la nueva lógica ---
+
+       summary.append((
+           medals.get(idx, ""),
+           p["member"].display_name,
+           p["stats_str"],                       # ← PGGBM
+           p["total"],
+           f"{p['old']}{'+' if delta >= 0 else ''}{delta}"
+       ))
+
+    # Actualizar en base de datos y rol en Discord (esto ya lo tienes)
+    try:
+        await self.db_pool.execute(
+            "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
+            new, role_name, p["member"].id
+        )
+    except Exception as e:
+        print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
+    try:
+        role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
+        if role_obj:
+            await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
+    except Exception as e:
+        print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
+    try:
+        await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
+    except Exception as e:
+        print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
+
 
         # 5) Publicar resultados en #results
         join_parent    = ctx.channel.parent
