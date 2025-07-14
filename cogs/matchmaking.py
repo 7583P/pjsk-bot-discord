@@ -690,7 +690,6 @@ def get_role_from_mmr(mmr):
 
     @commands.command(name="submit")
     async def submit(self, ctx: commands.Context, *, block: str):
-        # 1) Buscar la sala/hilo activo
         mm = self.bot.get_cog("Matchmaking")
         room = next((r for r in mm.rooms.values() if r["thread"].id == ctx.channel.id), None)
         if not room:
@@ -708,13 +707,11 @@ def get_role_from_mmr(mmr):
         if len(lines) != n:
             return await ctx.send(f"You should send {n} lines")
 
-        # 2) Tabla cruda para validar con reacciones
         intro = "✅ React ✅ to validate, ❎ to decline\n```\n" + "\n".join(lines) + "\n```"
         vote_msg = await ctx.send(intro)
         for emo in ("✅", "❎"):
             await vote_msg.add_reaction(emo)
 
-        # 3) Espera de mayoría simple o timeout
         threshold = n // 2 + 1
         def check(reaction, user):
             return (
@@ -753,7 +750,6 @@ def get_role_from_mmr(mmr):
         if ganador != "✅":
             return await ctx.send("There might be an error, try doing it again.")
 
-        # 4) Calcular y actualizar MMR/rango/página
         summary = []
         medals  = {1:"🥇",2:"🥈",3:"🥉"}
         ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
@@ -765,7 +761,7 @@ def get_role_from_mmr(mmr):
             uid       = int(m.group("id"))
             cc        = m.group("cc")
             stats     = list(map(int, m.group("stats").split(",")))
-            stats_str = m.group("stats")                # ← nueva línea
+            stats_str = m.group("stats")
             old, current_role = await self.fetch_player(uid)
             total  = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
             players_list.append({
@@ -796,10 +792,8 @@ def get_role_from_mmr(mmr):
         summary = []
         for idx, p in enumerate(players_list, 1):
             current_mmr, current_role = await self.fetch_player(p["member"].id)
-            total_notes = sum(p["stats"][1:])  # suma greats, goods, bads, miss
-
+            total_notes = sum(p["stats"][1:])
             if current_role == "Placement":
-                # PROMUEVE en 1 partida, usando suma de notas
                 role_name = get_role_from_notes(total_notes)
                 new = current_mmr
             else:
@@ -834,7 +828,6 @@ def get_role_from_mmr(mmr):
             except Exception as e:
                 print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
 
-        # 5) Publicar resultados en #results
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
         result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
@@ -848,7 +841,6 @@ def get_role_from_mmr(mmr):
 
         room["finished"] = True
 
-        # 6) Agendar cierre de hilo 2 minutos después
         async def close_thread_later(thread, rooms, rid):
             await asyncio.sleep(120)
             try:
@@ -863,7 +855,6 @@ def get_role_from_mmr(mmr):
 
     @commands.command(name="update")
     async def update(self, ctx: commands.Context, *, block: str):
-        # Solo tú puedes usarlo
         if ctx.author.id != 878310498720940102:
             return await ctx.send("❌ Solo el administrador puede usar este comando.")
 
@@ -881,12 +872,10 @@ def get_role_from_mmr(mmr):
             uid    = int(m.group("id"))
             cc     = m.group("cc")
             stats  = list(map(int, m.group("stats").split(",")))
-            # Usar lógica idéntica a submit
             old, _ = await self.fetch_player(uid)
             total  = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
             players_list.append({"member": ctx.guild.get_member(uid), "cc": cc, "total": total, "old": old, "uid": uid})
 
-        # Ordenar y calcular deltas igual que en submit
         players_list.sort(key=lambda x: x["total"], reverse=True)
         n = len(players_list)
         avg  = sum(p["old"] for p in players_list) / n if n > 0 else 0
@@ -905,7 +894,6 @@ def get_role_from_mmr(mmr):
             except Exception as e:
                 summary.append(f"❌ Error DB <@{p['uid']}>: {e}")
 
-            # Actualiza rol en Discord
             try:
                 member = p["member"]
                 if member:
