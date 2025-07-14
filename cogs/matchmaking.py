@@ -758,26 +758,25 @@ def get_role_from_mmr(mmr):
         medals  = {1:"🥇",2:"🥈",3:"🥉"}
         ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
         players_list = []
-for member, ln in zip(players, lines):
-    m = ENTRY_RE.match(ln)
-    if not m:
-        return await ctx.send(f"Formato incorrecto para: {ln}")
-    uid       = int(m.group("id"))
-    cc        = m.group("cc")
-    stats     = list(map(int, m.group("stats").split(",")))
-    stats_str = m.group("stats")  # ← nueva línea
-    old, current_role = await self.fetch_player(uid)  # <-- capturamos también el rol
-    # FALTA calcular "total"
-    total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))  # ← añade esta línea
-    players_list.append({
-        "member":    member,
-        "cc":        cc,
-        "total":     total,
-        "old":       old,
-        "role":      current_role,
-        "stats":     stats,
-        "stats_str": stats_str
-    })
+        for member, ln in zip(players, lines):
+            m = ENTRY_RE.match(ln)
+            if not m:
+                return await ctx.send(f"Formato incorrecto para: {ln}")
+            uid       = int(m.group("id"))
+            cc        = m.group("cc")
+            stats     = list(map(int, m.group("stats").split(",")))
+            stats_str = m.group("stats")
+            old, current_role = await self.fetch_player(uid)
+            total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
+            players_list.append({
+                "member":    member,
+                "cc":        cc,
+                "total":     total,
+                "old":       old,
+                "role":      current_role,
+                "stats":     stats,
+                "stats_str": stats_str
+            })
 
 
         players_list.sort(key=lambda x: x["total"], reverse=True)
