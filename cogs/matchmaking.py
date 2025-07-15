@@ -69,34 +69,37 @@ def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
 
 def get_rank_from_mmr(mmr: int) -> str:
     if mmr <= 100:
-        return "Bronze"
+        return "Iron"
     elif mmr <= 200:
-        return "Silver"
+        return "Bronze"
     elif mmr <= 300:
-        return "Gold"
+        return "Silver"
     elif mmr <= 400:
-        return "Platinum"
+        return "Gold"
     elif mmr <= 500:
-        return "Sapphire"
+        return "Platinum"
     elif mmr <= 600:
         return "Diamond"
     elif mmr <= 700:
         return "Crystal"
     elif mmr <= 800:
-        return "Champion"
+        return "Master"
     elif mmr <= 900:
+        return "Champion"
+    elif mmr <= 999:
         return "Grand Champion"
     else:
         return "Legend"
 
         RANK_ROLE_IDS = {
+    "Iron":        1394444407536881845,        
     "Bronze":        1371324225838645339,
     "Silver":        1389343997100560514,
     "Gold":          1371324328708149328,
     "Platinum":      1389343805521789098,
-    "Sapphire":      1394444407536881845,
-    "Diamond":       1371324561542484108,
+    "Diamond":      1371324561542484108,
     "Crystal":       1394445724703527012,
+    "Master":       1394635883466199110,
     "Champion":      1371323543501144115,
     "Grand Champion": 1394444744892874832,
     "Legend":        1371323380510363749,
