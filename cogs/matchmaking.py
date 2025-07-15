@@ -67,6 +67,42 @@ def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
     lo_dyn, hi_dyn = centro - 1, centro + 1
     return max(25, lo_dyn), min(33, hi_dyn)
 
+def get_rank_from_mmr(mmr: int) -> str:
+    if mmr <= 100:
+        return "Bronze"
+    elif mmr <= 200:
+        return "Silver"
+    elif mmr <= 300:
+        return "Gold"
+    elif mmr <= 400:
+        return "Platinum"
+    elif mmr <= 500:
+        return "Sapphire"
+    elif mmr <= 600:
+        return "Diamond"
+    elif mmr <= 700:
+        return "Crystal"
+    elif mmr <= 800:
+        return "Champion"
+    elif mmr <= 900:
+        return "Grand Champion"
+    else:
+        return "Legend"
+
+        RANK_ROLE_IDS = {
+    "Bronze":        1371324225838645339,
+    "Silver":        1389343997100560514,
+    "Gold":          1371324328708149328,
+    "Platinum":      1389343805521789098,
+    "Sapphire":      1394444407536881845,
+    "Diamond":       1371324561542484108,
+    "Crystal":       1394445724703527012,
+    "Champion":      1371323543501144115,
+    "Grand Champion": 1394444744892874832,
+    "Legend":        1371323380510363749,
+}
+
+
 
 
 class SongPollView(discord.ui.View):
@@ -800,7 +836,8 @@ def get_role_from_mmr(mmr):
                 raw_delta = int(mu_map.get(idx, 0) * unit)
                 delta     = max(-39, min(39, raw_delta))
                 new       = p["old"] + delta
-                role_name = get_role_from_mmr(new)
+                role_name = get_rank_from_mmr(new)
+
 
             summary.append((
                 medals.get(idx, ""),
@@ -818,11 +855,16 @@ def get_role_from_mmr(mmr):
             except Exception as e:
                 print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
             try:
-                role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
-                if role_obj:
-                    await p["member"].edit(roles=[r for r in p["member"].roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
+                role_id = RANK_ROLE_IDS.get(role_name)
+                if role_id:
+                    role_obj = ctx.guild.get_role(role_id)
+                    if role_obj:
+                        old_ranks = set(RANK_ROLE_IDS.values())
+                        roles_to_keep = [r for r in p["member"].roles if r.id not in old_ranks]
+                        await p["member"].edit(roles=roles_to_keep + [role_obj])
             except Exception as e:
                 print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
+
             try:
                 await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
             except Exception as e:
@@ -885,7 +927,7 @@ def get_role_from_mmr(mmr):
             mu = {1:3,2:2,3:0.5,4:-1,5:-2}[idx]
             delta = int(mu * unit)
             new = p["old"] + delta
-            role_name = "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
+            role_name = get_rank_from_mmr(new)
             try:
                 await self.db_pool.execute(
                     "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
@@ -893,13 +935,16 @@ def get_role_from_mmr(mmr):
                 )
             except Exception as e:
                 summary.append(f"❌ Error DB <@{p['uid']}>: {e}")
-
             try:
                 member = p["member"]
                 if member:
-                    role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
-                    if role_obj:
-                        await member.edit(roles=[r for r in member.roles if r.name not in {"Bronze", "Gold", "Diamond"}] + [role_obj])
+                    role_id = RANK_ROLE_IDS.get(role_name)
+                    if role_id:
+                        role_obj = ctx.guild.get_role(role_id)
+                        if role_obj:
+                            old_ranks = set(RANK_ROLE_IDS.values())
+                            roles_to_keep = [r for r in member.roles if r.id not in old_ranks]
+                            await member.edit(roles=roles_to_keep + [role_obj])
                     await member.edit(nick=f"{member.display_name} [{role_name}]")
             except Exception as e:
                 summary.append(f"❌ Error Discord <@{p['uid']}>: {e}")
