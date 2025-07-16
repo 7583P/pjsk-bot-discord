@@ -711,31 +711,21 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-def get_role_from_notes(stats):
-    # stats: [perfect, great, good, bad, miss]
-    total_notes = stats[1] + stats[2] + stats[3] + stats[4]  # Suma solo desde great en adelante
-    if 0 <= total_notes <= 5:
-        return "Diamond"
-    elif 6 <= total_notes <= 15:
-        return "Platinum"
-    elif 16 <= total_notes <= 50:
-        return "Gold"
-    elif 51 <= total_notes <= 100:
-        return "Silver"
-    elif 101 <= total_notes <= 250:
-        return "Bronze"
-    else:
-        return "Iron"
-
-
-
-def get_role_from_mmr(mmr):
-    if mmr <= 100:
-        return "Bronze"
-    elif mmr <= 500:
-        return "Gold"
-    else:
-        return "Diamond"
+    def get_role_from_notes(stats):
+        # stats: [perfect, great, good, bad, miss]
+        total_notes = stats[1] + stats[2] + stats[3] + stats[4]  # Suma solo desde great en adelante
+        if 0 <= total_notes <= 5:
+            return "Diamond"
+        elif 6 <= total_notes <= 15:
+            return "Platinum"
+        elif 16 <= total_notes <= 50:
+            return "Gold"
+        elif 51 <= total_notes <= 100:
+            return "Silver"
+        elif 101 <= total_notes <= 250:
+            return "Bronze"
+        else:
+            return "Iron"
 
 
     @commands.command(name="submit")
