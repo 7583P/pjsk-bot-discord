@@ -68,6 +68,7 @@ def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
     return max(25, lo_dyn), min(33, hi_dyn)
 
 def get_rank_from_mmr(mmr: int) -> str:
+
     if mmr <= 100:
         return "Iron"
     elif mmr <= 200:
@@ -91,7 +92,7 @@ def get_rank_from_mmr(mmr: int) -> str:
     else:
         return "Legend"
 
-        RANK_ROLE_IDS = {
+RANK_ROLE_IDS = {
     "Iron":        1394444407536881845,        
     "Bronze":        1371324225838645339,
     "Silver":        1389343997100560514,
@@ -710,13 +711,23 @@ class Matchmaking(commands.Cog):
         )
         view.message = msg
 
-def get_role_from_notes(total_notes):
-    if total_notes <= 15:
+def get_role_from_notes(stats):
+    # stats: [perfect, great, good, bad, miss]
+    total_notes = stats[1] + stats[2] + stats[3] + stats[4]  # Suma solo desde great en adelante
+    if 0 <= total_notes <= 5:
         return "Diamond"
-    elif total_notes <= 50:
+    elif 6 <= total_notes <= 15:
+        return "Platinum"
+    elif 16 <= total_notes <= 50:
         return "Gold"
-    else:
+    elif 51 <= total_notes <= 100:
+        return "Silver"
+    elif 101 <= total_notes <= 250:
         return "Bronze"
+    else:
+        return "Iron"
+
+
 
 def get_role_from_mmr(mmr):
     if mmr <= 100:
@@ -829,49 +840,52 @@ def get_role_from_mmr(mmr):
             mu_map = {1: 1,   2: -1}
 
         summary = []
-        for idx, p in enumerate(players_list, 1):
-            current_mmr, current_role = await self.fetch_player(p["member"].id)
-            total_notes = sum(p["stats"][1:])
-            if current_role == "Placement":
-                role_name = get_role_from_notes(total_notes)
-                new = current_mmr
-            else:
-                raw_delta = int(mu_map.get(idx, 0) * unit)
-                delta     = max(-39, min(39, raw_delta))
-                new       = p["old"] + delta
-                role_name = get_rank_from_mmr(new)
+    PLACEMENT_ROLE_ID = 1371321594068336811
+    PLACEMENT_MMR_BONUS = {
+        "Iron": 10,
+        "Bronze": 101,
+        "Silver": 201,
+        "Gold": 301,
+        "Platinum": 401,
+        "Diamond": 501,
+    }
 
+    for idx, p in enumerate(players_list, 1):
+        current_mmr, current_role = await self.fetch_player(p["member"].id)
+        if current_role == "Placement":
+            role_name = get_role_from_notes(p["stats"])
+            new = PLACEMENT_MMR_BONUS[role_name]
+        else:
+            raw_delta = int(mu_map.get(idx, 0) * unit)
+            delta     = max(-39, min(39, raw_delta))
+            new       = p["old"] + delta
+            role_name = get_rank_from_mmr(new)
 
-            summary.append((
-                medals.get(idx, ""),
-                p["member"].display_name,
-                p["stats_str"],
-                p["total"],
-                f"{p['old']}{'+' if new-p['old'] >= 0 else ''}{new-p['old']}"
-            ))
+        try:
+            role_id = RANK_ROLE_IDS.get(role_name)
+            if role_id:
+                role_obj = ctx.guild.get_role(role_id)
+                # Borra placement y roles viejos
+                old_ranks = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
+                roles_to_keep = [r for r in p["member"].roles if r.id not in old_ranks]
+                await p["member"].edit(roles=roles_to_keep + [role_obj])
+        except Exception as e:
+            print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
 
-            try:
-                await self.db_pool.execute(
-                    "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
-                    new, role_name, p["member"].id
-                )
-            except Exception as e:
-                print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
-            try:
-                role_id = RANK_ROLE_IDS.get(role_name)
-                if role_id:
-                    role_obj = ctx.guild.get_role(role_id)
-                    if role_obj:
-                        old_ranks = set(RANK_ROLE_IDS.values())
-                        roles_to_keep = [r for r in p["member"].roles if r.id not in old_ranks]
-                        await p["member"].edit(roles=roles_to_keep + [role_obj])
-            except Exception as e:
-                print(f"[DISCORD ERROR] Rol de {p['member'].display_name}: {e}")
+        try:
+            await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
+        except Exception as e:
+            print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
 
-            try:
-                await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
-            except Exception as e:
-                print(f"[DISCORD ERROR] Al actualizar el nick: {e}")
+        try:
+            await self.db_pool.execute(
+                "UPDATE players SET mmr=$1,role=$2 WHERE user_id=$3",
+                new, role_name, p["member"].id
+            )
+        except Exception as e:
+            print(f"[DB ERROR] Al actualizar MMR/rol: {e}")
+    # ... tu summary, etc ...
+
 
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
