@@ -47,25 +47,47 @@ def country_flag(code: str) -> str:
         return ""
     return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
 
+# — Nuevos intervalos de nivel para cada rango —
 BRACKET_RANGES = {
-    "Placement": (28, 30),
-    "Bronze":    (25, 27),
-    "Gold":      (28, 30),
-    "Diamond":   (31, 33),
+    "Placement":     (26, 29),
+    "Iron":          (17, 20),
+    "Bronze":        (18, 21),
+    "Silver":        (20, 23),
+    "Gold":          (22, 25),
+    "Platinum":      (23, 26),
+    "Diamond":       (25, 28),
+    "Crystal":       (27, 30),
+    "Master":        (28, 31),
+    "Champion":      (30, 33),
+    "GrandChampion": (32, 35),
+    "Legend":        (34, 37),
 }
 
-def dynamic_range(counts: dict[str, bool]) -> tuple[int, int]:
-    medias = []
-    for rank, pres in counts.items():
-        if pres:
-            lo, hi = BRACKET_RANGES[rank]
-            medias.append((lo + hi) / 2)
-    if not medias:
+
+def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
+    # 1) Construye lista de centros según cuántos jugadores de cada rango
+    centers: list[int] = []
+    for rank, num in counts.items():
+        lo, hi = BRACKET_RANGES[rank]
+        center = round((lo + hi) / 2)
+        centers.extend([center] * num)
+
+    # 2) Si no hay jugadores, devolvemos Placement (26–29)
+    if not centers:
         return BRACKET_RANGES["Placement"]
-    promedio = sum(medias) / len(medias)
-    centro   = round(promedio)
-    lo_dyn, hi_dyn = centro - 1, centro + 1
-    return max(25, lo_dyn), min(33, hi_dyn)
+
+    # 3) Calcula la media redondeada de esos centros
+    avg = round(sum(centers) / len(centers))
+
+    # 4) Busca el primer rango que contenga ese avg y devuelve su intervalo
+    for bracket, (lo, hi) in BRACKET_RANGES.items():
+        if lo <= avg <= hi:
+            return lo, hi
+
+    # 5) Fallback (no debería ocurrir): Placement
+    return BRACKET_RANGES["Placement"]
+
+
 
 def get_rank_from_mmr(mmr: int) -> str:
 
@@ -351,37 +373,38 @@ class Matchmaking(commands.Cog):
         thread  = room_info["thread"]
         players = room_info["players"]
 
-        # 1) Calcula cuántos de cada rango había para definir low/high
-        counts = {"Placement": 0, "Bronze": 0, "Gold": 0, "Diamond": 0}
+        # — 1) Cuenta cuántos jugadores hay de cada rango —
+        counts = { rank: 0 for rank in BRACKET_RANGES }
         for m in players:
-            for r in counts:
-                if discord.utils.get(m.roles, name=r):
-                    counts[r] += 1
-                    break
-            else:
-                counts["Placement"] += 1
+            user_rank = next(
+                (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
+                "Placement"
+            )
+            counts[user_rank] += 1
 
+        # — 2) Elige low/high según media de centros —
         low, high = dynamic_range(counts)
 
-        # 2) Obtén el catálogo y selecciona solo 5 Expert
+        # — 3) Obtén el pool de canciones y saca las primeras 5 —
         all_songs = await self._get_9_songs(low, high)
         picks     = all_songs[:5]
 
-        # ← Marcamos la sala como iniciada
-        room_info["started"] = True
-
-        # 3) Lanza la vista con esas 5 canciones
-        view = SongPollView(picks, thread=thread, timeout=60)
-        await thread.send(
-            f"🎉 Sala completa · Niveles {high}★–{low}★ · Expert\n"
-            "Tienen **1 minuto** para votar la canción:",
-            view=view
+        # — 4) Construye el bloque de texto con formato —
+        song_lines = "\n".join(
+            f"{i+1}. **{title}** (Lv {level} {diff.capitalize()})"
+            for i, (title, level, diff) in enumerate(picks)
         )
+
+        # — 5) Lanza la vista y el mensaje —
+        view = SongPollView(picks, thread=thread, timeout=60)
+        await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
+
+        room_info["started"] = True
 
 
     @app_commands.command(
         name="start",
-        description="Inicia la votación de 5 canciones (Expert)"
+        description="Inicia la votación de 5 canciones"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
@@ -399,7 +422,6 @@ class Matchmaking(commands.Cog):
         # — 2) Determinar canal padre y lista de players —
         if is_join_thread:
             join_chan = ch.parent
-            # reutilizar sala existente
             room_entry = next(
                 (r for r in self.rooms.values() if r["thread"].id == ch.id),
                 None
@@ -417,58 +439,55 @@ class Matchmaking(commands.Cog):
         # — 3) Validar 2–5 jugadores —
         if not (2 <= len(players) <= 5):
             return await interaction.response.send_message(
-                "🔸 Room must have betweem 2-5 players",
+                "🔸 Room must have between 2-5 players",
                 ephemeral=True
             )
 
-        # — 4) Calcular rango dinámico —
-        counts = {r: False for r in BRACKET_RANGES}
+        # — 4) Cuenta cuántos jugadores hay de cada rango —
+        counts = { rank: 0 for rank in BRACKET_RANGES }
         for m in players:
-            for r in counts:
-                if discord.utils.get(m.roles, name=r):
-                    counts[r] = True
-                    break
-            else:
-                counts["Placement"] = True
+            user_rank = next(
+                (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
+                "Placement"
+            )
+            counts[user_rank] += 1
+
+        # — 5) Elige low/high según media de centros —
         lo, hi = dynamic_range(counts)
 
-        # — 5) Crear y registrar hilo sólo si venimos de canal —
-        if is_join_chan:
+        # — 6) Obtén y recorta a 5 canciones —
+        all_songs = await self._get_9_songs(lo, hi)
+        picks     = all_songs[:5]
+
+        # — 7) Construye el mensaje con formato —
+        song_lines = "\n".join(
+            f"{i+1}. **{title}** (Lv {level} {diff.capitalize()})"
+            for i, (title, level, diff) in enumerate(picks)
+        )
+
+        # — 8) Envía la vista en el hilo correspondiente —
+        if is_join_thread:
+            thread = ch
+        else:
             thread = await join_chan.create_thread(
                 name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
-            new_rid = max(self.rooms.keys(), default=0) + 1
-            self.rooms[new_rid] = {
+            self.rooms[max(self.rooms.keys(), default=0)+1] = {
                 "players": players.copy(),
                 "thread": thread,
                 "category_id": join_chan.category_id or 0,
-                "closed": True,              # ← marcamos la sala como cerrada
+                "closed": True,
             }
-            self.bot.dispatch('room_updated', new_rid)
-            # desactivar inactividad
-            self.inactivity.pop(thread.id, None)
-        else:
-            # ya estaba en hilo: lo reutilizamos
-            thread = ch
-            # marcamos esa sala como cerrada también
-            rid = next(r for r,info in self.rooms.items() if info["thread"].id == thread.id)
-            self.rooms[rid]["closed"] = True    # ← closed aquí también
-            self.inactivity.pop(thread.id, None)
 
-        # — 6) Lanzar SongPollView con 5 canciones —
-        all_songs = await self._get_9_songs(lo, hi)
-        picks     = all_songs[:5]
-        view      = SongPollView(picks, thread=thread, timeout=60)
-        prompt    = f"🎶 **Votación (Expert {lo}–{hi}★)**\nTienen **1 minuto** para elegir su canción:"
-        msg       = await thread.send(prompt, view=view)
+        view = SongPollView(picks, thread=thread, timeout=60)
+        msg  = await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
         view.message = msg
 
-        # — 7) Confirmación efímera —
+        # — 9) Confirmación efímera al invocador —
         await interaction.response.send_message(
-            f"✅ Votación iniciada en {thread.mention}",
-            ephemeral=True
+            f"✅ Votación iniciada en {thread.mention}", ephemeral=True
         )
 
 
