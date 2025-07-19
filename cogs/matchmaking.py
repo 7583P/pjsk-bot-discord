@@ -854,8 +854,11 @@ class Matchmaking(commands.Cog):
                 p["mmr_actual"] = p["old"]
 
         # ——————————————————————————————
-        # FASE 2: delta posicional escalado con underdog/favourite adjustment
+        # FASE 2: delta posicional escalado con underdog/favourite adjustment
         # ——————————————————————————————
+        # Ordenar por puntos (total), mayor a menor
+        players_list.sort(key=lambda x: x["total"], reverse=True)
+
         avg  = sum(p["mmr_actual"] for p in players_list) / n
         unit = max(1, int(avg // 20))
 
@@ -868,16 +871,15 @@ class Matchmaking(commands.Cog):
         elif n == 2:
             mu_map = {1:0.75, 2:-0.75}
         else:
-            # Nunca debería pasar, porque ya validas 2 ≤ n ≤ 5
             raise RuntimeError(f"Sala inválida: espera 2–5 jugadores, no {n}")
 
         summary = []
         for idx, p in enumerate(players_list, start=1):
-            mmr_act  = p["mmr_actual"]
+            mmr_prev = p["mmr_actual"]
             base_raw = mu_map[idx] * unit
             base     = max(-39, min(39, int(base_raw)))
 
-            rel = (mmr_act - avg) / avg
+            rel = (mmr_prev - avg) / avg
 
             if idx == 1:
                 # Ganador: underdog bonus / favorito nerf
@@ -891,14 +893,14 @@ class Matchmaking(commands.Cog):
                 # Intermedios: comportamiento neutro
                 scale = 1 - min(abs(rel), 0.5)
 
-            delta   = int(base * scale)
-            new_mmr = mmr_act + delta
-            role_name = get_rank_from_mmr(new_mmr)
+            mmr_delta = int(base * scale)
+            mmr_final = mmr_prev + mmr_delta
+            role_name = get_rank_from_mmr(mmr_final)
 
             # Actualiza en BD
             await self.db_pool.execute(
                 "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
-                new_mmr, role_name, p["member"].id
+                mmr_final, role_name, p["member"].id
             )
             # Actualiza roles en Discord
             role_id = RANK_ROLE_IDS.get(role_name)
@@ -910,15 +912,27 @@ class Matchmaking(commands.Cog):
             # Actualiza nickname
             await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
 
+            # Añade a summary para la tabla
+            med = medals.get(idx, str(idx))
+            summary.append((
+                med,
+                p["member"].display_name,
+                p["total"],
+                p["stats"],
+                mmr_prev,
+                mmr_delta,
+                mmr_final
+            ))
 
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
         result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
         table = "**🏆 Posiciones finales 🏆**\n"
-        table += "Pos · Player · Points · MMR Δ\n"
-        for med, name, pts, mmr_delta in summary:
-            table += f"{med} · **{name}** · {pts} · {mmr_delta}\n"
+        table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
+        for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
+            pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+            table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
         await result_chan.send(table)
         await result_chan.send("MMR Updated")
 
@@ -936,62 +950,126 @@ class Matchmaking(commands.Cog):
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
 
 
-    @commands.command(name="update")
-    async def update(self, ctx: commands.Context, *, block: str):
-        if ctx.author.id != 878310498720940102:
-            return await ctx.send("❌ Solo el administrador puede usar este comando.")
 
-        # Parseo de líneas y cálculo de 'total' idéntico a lo que ya tenías
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        ENTRY_RE = re.compile(
-            r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
+@commands.command(name="update")
+async def update(self, ctx: commands.Context, *, block: str):
+    if ctx.author.id != 878310498720940102:
+        return await ctx.send("❌ Solo el administrador puede usar este comando.")
+
+    # Parseo de líneas y cálculo de 'total'
+    lines = [l.strip() for l in block.split("\n") if l.strip()]
+    ENTRY_RE = re.compile(
+        r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
+    )
+    players_list = []
+    for ln in lines:
+        m = ENTRY_RE.match(ln)
+        if not m:
+            return await ctx.send(f"❌ Línea inválida: `{ln}`")
+        uid   = int(m.group("id"))
+        cc    = m.group("cc")
+        stats = list(map(int, m.group("stats").split(",")))
+        old, role = await self.fetch_player(uid)
+        total = sum(s*w for s, w in zip(stats, [5,3,2,1,0]))
+        players_list.append({
+            "uid":   uid,
+            "cc":    cc,
+            "stats": stats,
+            "old":   old,
+            "role":  role,
+            "total": total
+        })
+
+    n = len(players_list)
+    if not (2 <= n <= 5):
+        return await ctx.send("Room must have between 2-5 players")
+
+    # Ordenar por total (descendente)
+    players_list.sort(key=lambda x: x["total"], reverse=True)
+
+    # ——————————————————————————————
+    # FASE 1: bonus fijo para Placement
+    # ——————————————————————————————
+    for p in players_list:
+        if p["role"] == "Placement":
+            bonus_role      = get_role_from_notes(p["stats"])
+            p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
+        else:
+            p["mmr_actual"] = p["old"]
+
+    # ——————————————————————————————
+    # FASE 2: delta posicional escalado con underdog/favourite adjustment
+    # ——————————————————————————————
+    avg  = sum(p["mmr_actual"] for p in players_list) / n
+    unit = max(1, int(avg // 20))
+
+    if   n == 5:
+        mu_map = {1:1.5, 2:1.0, 3:0.5, 4:-1.0, 5:-1.5}
+    elif n == 4:
+        mu_map = {1:1.5, 2:0.75, 3:-0.5, 4:-1.5}
+    elif n == 3:
+        mu_map = {1:1.0, 2:0.0, 3:-1.0}
+    elif n == 2:
+        mu_map = {1:0.75, 2:-0.75}
+    else:
+        raise RuntimeError(f"Sala inválida: espera 2–5 jugadores, no {n}")
+
+    summary = []
+    medals = {1:"🥇", 2:"🥈", 3:"🥉"}
+    old_ranks = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
+    for idx, p in enumerate(players_list, start=1):
+        mmr_prev = p["mmr_actual"]
+        base_raw = mu_map[idx] * unit
+        base     = max(-39, min(39, int(base_raw)))
+
+        rel = (mmr_prev - avg) / avg
+
+        if idx == 1:
+            adj   = max(-0.5, min(0.5, -rel))
+            scale = 1 + adj
+        elif idx == n:
+            adj   = max(-0.5, min(0.5, rel))
+            scale = 1 + adj
+        else:
+            scale = 1 - min(abs(rel), 0.5)
+
+        mmr_delta = int(base * scale)
+        mmr_final = mmr_prev + mmr_delta
+        role_name = get_rank_from_mmr(mmr_final)
+
+        # BD
+        await self.db_pool.execute(
+            "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
+            mmr_final, role_name, p["uid"]
         )
-        players_list = []
-        for ln in lines:
-            m = ENTRY_RE.match(ln)
-            if not m:
-                return await ctx.send(f"❌ Línea inválida: `{ln}`")
-            uid   = int(m.group("id"))
-            stats = list(map(int, m.group("stats").split(",")))
-            old, role = await self.fetch_player(uid)
-            total = sum(s*w for s,w in zip(stats, [5,3,2,1,0]))
-            players_list.append({
-                "uid":   uid,
-                "stats": stats,
-                "old":   old,
-                "role":  role,
-                "total": total
-            })
+        # Discord: rol y nickname
+        member = ctx.guild.get_member(p["uid"])
+        if member:
+            if role_id := RANK_ROLE_IDS.get(role_name):
+                keep = [r for r in member.roles if r.id not in old_ranks]
+                await member.edit(roles=keep + [ctx.guild.get_role(role_id)])
+            await member.edit(nick=f"{member.display_name} [{role_name}]")
 
-        # Orden descendente por 'total'
-        players_list.sort(key=lambda x: x["total"], reverse=True)
+        # Resumen para tabla
+        med = medals.get(idx, str(idx))
+        summary.append((
+            med,
+            member.display_name if member else f"<@{p['uid']}>",
+            p["total"],
+            p["stats"],
+            mmr_prev,
+            mmr_delta,
+            mmr_final
+        ))
 
-        # Ahora reutilizamos la misma lógica de submit
-        deltas = await self._compute_match_deltas(players_list)
+    # Tabla resultado
+    table = "**🏆 Posiciones finales (admin update) 🏆**\n"
+    table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
+    for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
+        pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+        table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
+    await ctx.send(table)
 
-        # Aplicamos cambios y preparamos el resumen
-        summary = []
-        old_ranks = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
-        medals = {1:"🥇",2:"🥈",3:"🥉"}
-        for pos, (uid, new_mmr, role_name, delta) in enumerate(deltas, start=1):
-            # 1) BD
-            await self.db_pool.execute(
-                "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
-                new_mmr, role_name, uid
-            )
-            # 2) Discord: rol y nickname
-            member = ctx.guild.get_member(uid)
-            if member:
-                if role_id := RANK_ROLE_IDS.get(role_name):
-                    keep = [r for r in member.roles if r.id not in old_ranks]
-                    await member.edit(roles=keep + [ctx.guild.get_role(role_id)])
-                await member.edit(nick=f"{member.display_name} [{role_name}]")
-
-            # 3) Resumen
-            med = medals.get(pos, str(pos))
-            summary.append(f"{med} <@{uid}> → {new_mmr} MMR ({delta:+d}), rango {role_name}")
-
-        await ctx.send("\n".join(summary))
 
 
 async def setup(bot: commands.Bot):
