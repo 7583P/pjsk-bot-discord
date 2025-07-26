@@ -9,7 +9,6 @@ import discord
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord import app_commands
-from math import floor, ceil
 # ———————————————————————————————————————————————
 # — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
@@ -50,48 +49,43 @@ def country_flag(code: str) -> str:
 
 # — Nuevos intervalos de nivel para cada rango —
 BRACKET_RANGES = {
-    "Placement":     (23, 28),
-    "Iron":          (17, 22),
-    "Bronze":        (19, 24),
-    "Silver":        (20, 25),
-    "Gold":          (22, 27),
-    "Platinum":      (23, 28),
-    "Diamond":       (27, 30),
-    "Crystal":       (28, 31),
-    "Master":        (29, 33),
-    "Champion":      (30, 34),
-    "GrandChampion": (31, 35),
-    "Legend":        (32, 37),
+    "Placement":     (26, 29),
+    "Iron":          (17, 20),
+    "Bronze":        (18, 21),
+    "Silver":        (20, 23),
+    "Gold":          (22, 25),
+    "Platinum":      (23, 26),
+    "Diamond":       (25, 28),
+    "Crystal":       (27, 30),
+    "Master":        (28, 31),
+    "Champion":      (30, 33),
+    "GrandChampion": (32, 35),
+    "Legend":        (34, 37),
 }
 
 
-from math import floor, ceil
-
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
+    # 1) Construye lista de centros según cuántos jugadores de cada rango
     centers: list[int] = []
-    gaps:    set[int] = set()
-
-    # 1) Recolectar centros y gaps de cada rango
     for rank, num in counts.items():
-        if num <= 0: continue
-        lo_r, hi_r = BRACKET_RANGES[rank]
-        gaps.add(hi_r - lo_r)
-        centers.extend([round((lo_r + hi_r) / 2)] * num)
+        lo, hi = BRACKET_RANGES[rank]
+        center = round((lo + hi) / 2)
+        centers.extend([center] * num)
 
-    # 2) Fallback a Placement si no hay jugadores
+    # 2) Si no hay jugadores, devolvemos Placement (26–29)
     if not centers:
         return BRACKET_RANGES["Placement"]
 
-    # 3) Centro promedio redondeado
-    avg_center = round(sum(centers) / len(centers))
+    # 3) Calcula la media redondeada de esos centros
+    avg = round(sum(centers) / len(centers))
 
-    # 4) Elegir gap: si todos iguales (3 o 4), lo usamos; si mezclados → 5
-    gap = gaps.pop() if len(gaps) == 1 else 5
+    # 4) Busca el primer rango que contenga ese avg y devuelve su intervalo
+    for bracket, (lo, hi) in BRACKET_RANGES.items():
+        if lo <= avg <= hi:
+            return lo, hi
 
-    # 5) Construir intervalo centrado en avg_center con ese gap
-    lo = avg_center - floor(gap / 2)
-    hi = avg_center + ceil(gap / 2)
-    return lo, hi
+    # 5) Fallback (no debería ocurrir): Placement
+    return BRACKET_RANGES["Placement"]
 
 
 
@@ -147,6 +141,69 @@ PLACEMENT_MMR_BONUS = {
     "Diamond":  501,
 }
 
+class SongPollView(discord.ui.View):
+    """Select de 9 canciones que abre votación de 1 minuto."""
+    def __init__(self, songs, *, thread, timeout=60):
+        super().__init__(timeout=timeout)
+        self.thread = thread
+        self.message: discord.Message
+        self.vote_map: dict[int,str] = {}
+        self.votes:    dict[str,int] = {}
+
+        options = [
+            discord.SelectOption(
+                label=f"{title} (Lv {level} {diff})",
+                value=f"{title}|{level}|{diff}"
+            )
+            for title, level, diff in songs
+        ]
+
+        select = discord.ui.Select(
+            placeholder="👆 Tu voto (puedes cambiar antes de 1 min)",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+
+        async def select_callback(inter: discord.Interaction):
+            uid    = inter.user.id
+            choice = select.values[0]
+            if uid in self.vote_map:
+                prev = self.vote_map[uid]
+                self.votes[prev] -= 1
+            self.vote_map[uid] = choice
+            self.votes[choice] = self.votes.get(choice, 0) + 1
+            await inter.response.send_message(
+                f"✅ Tu voto por **{choice.split('|')[0]}** ha sido registrado.",
+                ephemeral=True
+            )
+
+        select.callback = select_callback
+        self.add_item(select)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        try:
+            await self.message.edit(view=self)
+        except:
+            pass
+
+        if not self.votes:
+            return await self.thread.send(
+                "⚠️ No se registraron votos en el tiempo establecido."
+            )
+
+        max_votes = max(self.votes.values())
+        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
+        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
+        title, lvl, diff = chosen.split("|")
+
+        await self.thread.send(
+            f"🏆 **Resultado de la votación** 🏆\n"
+            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
+        )
+        self.stop()
 
 
 class Matchmaking(commands.Cog):
@@ -322,29 +379,48 @@ class Matchmaking(commands.Cog):
             picks.extend(by_lvl[lvl][:3])
         return picks[:9]
 
-    async def mostrar_canciones_aleatorias(self, thread, low: int, high: int):
-        """
-        Envía 5 canciones al hilo, con gap low–high, en orden aleatorio.
-        """
-        canciones = await self._get_9_songs(low, high)
-        random.shuffle(canciones)
-        lineas = [
-            f"{i+1}. {titulo} (Lv {nivel}) ({diff.capitalize()})"
-            for i, (titulo, nivel, diff) in enumerate(canciones[:5], start=1)
-        ]
-        texto = "🎶 Canciones sugeridas 🎶\n" + "\n".join(lineas)
-        await thread.send(texto)
+    async def launch_song_poll(self, room_info):
+        thread  = room_info["thread"]
+        players = room_info["players"]
+
+        # — 1) Cuenta cuántos jugadores hay de cada rango —
+        counts = { rank: 0 for rank in BRACKET_RANGES }
+        for m in players:
+            user_rank = next(
+                (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
+                "Placement"
+            )
+            counts[user_rank] += 1
+
+        # — 2) Elige low/high según media de centros —
+        low, high = dynamic_range(counts)
+
+        # — 3) Obtén el pool de canciones y saca las primeras 5 —
+        all_songs = await self._get_9_songs(low, high)
+        picks     = all_songs[:5]
+
+        # — 4) Construye el bloque de texto con formato —
+        song_lines = "\n".join(
+            f"{i+1}. **{title}** (Lv {level} {diff.capitalize()})"
+            for i, (title, level, diff) in enumerate(picks)
+        )
+
+        # — 5) Lanza la vista y el mensaje —
+        view = SongPollView(picks, thread=thread, timeout=60)
+        await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
+
+        room_info["started"] = True
 
 
     @app_commands.command(
         name="start",
-        description="Inicia la sugerencia de 5 canciones según el rango de los jugadores"
+        description="Inicia la votación de 5 canciones"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
-        # 1) Solo en #join o sus hilos
+        # — 1) Guardia: sólo #join o sus hilos —
         is_join_chan   = ch.id in ALLOWED_JOIN_CHANNELS
         is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
         if not (is_join_chan or is_join_thread):
@@ -353,9 +429,9 @@ class Matchmaking(commands.Cog):
                 ephemeral=True
             )
 
-        # 2) Canal padre y lista de players
+        # — 2) Determinar canal padre y lista de players —
         if is_join_thread:
-            join_chan  = ch.parent
+            join_chan = ch.parent
             room_entry = next(
                 (r for r in self.rooms.values() if r["thread"].id == ch.id),
                 None
@@ -370,14 +446,14 @@ class Matchmaking(commands.Cog):
             join_chan = ch
             players   = [m for m in join_chan.members if not m.bot]
 
-        # 3) Validar 2–5 jugadores
+        # — 3) Validar 2–5 jugadores —
         if not (2 <= len(players) <= 5):
             return await interaction.response.send_message(
                 "🔸 Room must have between 2-5 players",
                 ephemeral=True
             )
 
-        # 4) Contar rangos
+        # — 4) Cuenta cuántos jugadores hay de cada rango —
         counts = { rank: 0 for rank in BRACKET_RANGES }
         for m in players:
             user_rank = next(
@@ -386,33 +462,42 @@ class Matchmaking(commands.Cog):
             )
             counts[user_rank] += 1
 
-        # 5) Calcular intervalo low/high
+        # — 5) Elige low/high según media de centros —
         lo, hi = dynamic_range(counts)
 
-        # 6) Crear o reutilizar hilo
+        # — 6) Obtén y recorta a 5 canciones —
+        all_songs = await self._get_9_songs(lo, hi)
+        picks     = all_songs[:5]
+
+        # — 7) Construye el mensaje con formato —
+        song_lines = "\n".join(
+            f"{i+1}. **{title}** (Lv {level} {diff.capitalize()})"
+            for i, (title, level, diff) in enumerate(picks)
+        )
+
+        # — 8) Envía la vista en el hilo correspondiente —
         if is_join_thread:
             thread = ch
         else:
-            new_id = max(self.rooms.keys(), default=0) + 1
             thread = await join_chan.create_thread(
-                name=f"Sala {new_id} ({lo}–{hi}★)",
+                name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
-            self.rooms[new_id] = {
+            self.rooms[max(self.rooms.keys(), default=0)+1] = {
                 "players": players.copy(),
                 "thread": thread,
                 "category_id": join_chan.category_id or 0,
                 "closed": True,
             }
 
-        # 7) Enviar 5 canciones aleatorias
-        await self.mostrar_canciones_aleatorias(thread, lo, hi)
+        view = SongPollView(picks, thread=thread, timeout=60)
+        msg  = await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
+        view.message = msg
 
-        # 8) Confirmación
+        # — 9) Confirmación efímera al invocador —
         await interaction.response.send_message(
-            f"✅ Sugerencias enviadas en {thread.mention}",
-            ephemeral=True
+            f"✅ Votación iniciada en {thread.mention}", ephemeral=True
         )
 
 
@@ -532,14 +617,7 @@ class Matchmaking(commands.Cog):
 
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
-            # Calcula low/hi y manda 5 canciones de una
-            counts = {r:0 for r in BRACKET_RANGES}
-            for m in room["players"]:
-                ru = next((r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)), "Placement")
-                counts[ru] += 1
-            lo, hi = dynamic_range(counts)
-            await self.mostrar_canciones_aleatorias(room["thread"], lo, hi)
-
+            asyncio.create_task(self.launch_song_poll(room))
 
 
     @app_commands.command(name="d", description="Salir de la sala")
