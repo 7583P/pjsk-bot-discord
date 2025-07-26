@@ -313,9 +313,10 @@ class Matchmaking(commands.Cog):
 
         picks = []
         for lvl in range(high, low - 1, -1):  # 30→29→28
-            random.shuffle(by_lvl[lvl])
+            # 🔹 Ya no mezclamos aquí
             picks.extend(by_lvl[lvl][:3])
         return picks[:9]
+
 
     async def launch_song_poll(self, room_info):
         thread  = room_info["thread"]
@@ -346,8 +347,6 @@ class Matchmaking(commands.Cog):
 
         # — 5) Manda el mensaje —
         await thread.send(f"🎶 Canciones seleccionadas (Lv {low}–{high}) 🎶\n{song_lines}")
-
-
 
 
         room_info["started"] = True
@@ -409,7 +408,7 @@ class Matchmaking(commands.Cog):
         # — 6) Obtén y recorta a 5 canciones y mezcla —
         all_songs = await self._get_9_songs(lo, hi)
         picks     = all_songs[:5]
-        random.shuffle(picks)
+        random.shuffle(picks)  # Solo este
 
         # — 7) Construye el mensaje con formato —
         song_lines = "\n".join(
@@ -433,8 +432,8 @@ class Matchmaking(commands.Cog):
                 "closed": True,
             }
 
-        random.shuffle(picks)  # Mezclar canciones
         await thread.send(f"🎶 Canciones seleccionadas (Lv {lo}–{hi}) 🎶\n{song_lines}")
+
 
 
         # — 9) Confirmación efímera al invocador —
