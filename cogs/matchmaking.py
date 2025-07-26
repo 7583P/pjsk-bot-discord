@@ -49,43 +49,45 @@ def country_flag(code: str) -> str:
 
 # — Nuevos intervalos de nivel para cada rango —
 BRACKET_RANGES = {
-    "Placement":     (26, 29),
-    "Iron":          (17, 20),
-    "Bronze":        (18, 21),
-    "Silver":        (20, 23),
-    "Gold":          (22, 25),
-    "Platinum":      (23, 26),
-    "Diamond":       (25, 28),
-    "Crystal":       (27, 30),
-    "Master":        (28, 31),
-    "Champion":      (30, 33),
-    "GrandChampion": (32, 35),
-    "Legend":        (34, 37),
+    "Placement":     (23, 28),
+    "Iron":          (17, 22),
+    "Bronze":        (19, 24),
+    "Silver":        (20, 25),
+    "Gold":          (22, 27),
+    "Platinum":      (23, 28),
+    "Diamond":       (27, 30),
+    "Crystal":       (28, 31),
+    "Master":        (29, 33),
+    "Champion":      (30, 34),
+    "GrandChampion": (31, 35),
+    "Legend":        (32, 37),
 }
 
 
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
-    # 1) Construye lista de centros según cuántos jugadores de cada rango
-    centers: list[int] = []
+    # Calcula el centro y el gap de cada rango
+    centers = []
+    gaps = []
     for rank, num in counts.items():
-        lo, hi = BRACKET_RANGES[rank]
-        center = round((lo + hi) / 2)
-        centers.extend([center] * num)
-
-    # 2) Si no hay jugadores, devolvemos Placement (26–29)
+        if num > 0:
+            lo, hi = BRACKET_RANGES[rank]
+            center = round((lo + hi) / 2)
+            gap = hi - lo
+            centers.extend([center] * num)
+            gaps.extend([gap] * num)
+    # Si no hay jugadores, usa Placement
     if not centers:
         return BRACKET_RANGES["Placement"]
 
-    # 3) Calcula la media redondeada de esos centros
-    avg = round(sum(centers) / len(centers))
+    # Promedio de centros y de gaps
+    avg_center = round(sum(centers) / len(centers))
+    avg_gap = round(sum(gaps) / len(gaps))
 
-    # 4) Busca el primer rango que contenga ese avg y devuelve su intervalo
-    for bracket, (lo, hi) in BRACKET_RANGES.items():
-        if lo <= avg <= hi:
-            return lo, hi
+    # Calcula nuevo low-high usando el gap promedio
+    low = max(1, avg_center - avg_gap // 2)
+    high = low + avg_gap
+    return low, high
 
-    # 5) Fallback (no debería ocurrir): Placement
-    return BRACKET_RANGES["Placement"]
 
 
 
@@ -140,70 +142,6 @@ PLACEMENT_MMR_BONUS = {
     "Platinum": 401,
     "Diamond":  501,
 }
-
-class SongPollView(discord.ui.View):
-    """Select de 9 canciones que abre votación de 1 minuto."""
-    def __init__(self, songs, *, thread, timeout=60):
-        super().__init__(timeout=timeout)
-        self.thread = thread
-        self.message: discord.Message
-        self.vote_map: dict[int,str] = {}
-        self.votes:    dict[str,int] = {}
-
-        options = [
-            discord.SelectOption(
-                label=f"{title} (Lv {level} {diff})",
-                value=f"{title}|{level}|{diff}"
-            )
-            for title, level, diff in songs
-        ]
-
-        select = discord.ui.Select(
-            placeholder="👆 Tu voto (puedes cambiar antes de 1 min)",
-            options=options,
-            min_values=1,
-            max_values=1
-        )
-
-        async def select_callback(inter: discord.Interaction):
-            uid    = inter.user.id
-            choice = select.values[0]
-            if uid in self.vote_map:
-                prev = self.vote_map[uid]
-                self.votes[prev] -= 1
-            self.vote_map[uid] = choice
-            self.votes[choice] = self.votes.get(choice, 0) + 1
-            await inter.response.send_message(
-                f"✅ Tu voto por **{choice.split('|')[0]}** ha sido registrado.",
-                ephemeral=True
-            )
-
-        select.callback = select_callback
-        self.add_item(select)
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        try:
-            await self.message.edit(view=self)
-        except:
-            pass
-
-        if not self.votes:
-            return await self.thread.send(
-                "⚠️ No se registraron votos en el tiempo establecido."
-            )
-
-        max_votes = max(self.votes.values())
-        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
-        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
-        title, lvl, diff = chosen.split("|")
-
-        await self.thread.send(
-            f"🏆 **Resultado de la votación** 🏆\n"
-            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
-        )
-        self.stop()
 
 
 class Matchmaking(commands.Cog):
@@ -395,9 +333,10 @@ class Matchmaking(commands.Cog):
         # — 2) Elige low/high según media de centros —
         low, high = dynamic_range(counts)
 
-        # — 3) Obtén el pool de canciones y saca las primeras 5 —
+        # — 3) Obtén el pool de canciones y mezcla las primeras 5 —
         all_songs = await self._get_9_songs(low, high)
         picks     = all_songs[:5]
+        random.shuffle(picks)  # Mezclamos ANTES de armar el mensaje
 
         # — 4) Construye el bloque de texto con formato —
         song_lines = "\n".join(
@@ -405,9 +344,11 @@ class Matchmaking(commands.Cog):
             for i, (title, level, diff) in enumerate(picks)
         )
 
-        # — 5) Lanza la vista y el mensaje —
-        view = SongPollView(picks, thread=thread, timeout=60)
-        await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
+        # — 5) Manda el mensaje —
+        await thread.send(f"🎶 Canciones seleccionadas (Lv {low}–{high}) 🎶\n{song_lines}")
+
+
+
 
         room_info["started"] = True
 
@@ -465,9 +406,10 @@ class Matchmaking(commands.Cog):
         # — 5) Elige low/high según media de centros —
         lo, hi = dynamic_range(counts)
 
-        # — 6) Obtén y recorta a 5 canciones —
+        # — 6) Obtén y recorta a 5 canciones y mezcla —
         all_songs = await self._get_9_songs(lo, hi)
         picks     = all_songs[:5]
+        random.shuffle(picks)
 
         # — 7) Construye el mensaje con formato —
         song_lines = "\n".join(
@@ -491,9 +433,9 @@ class Matchmaking(commands.Cog):
                 "closed": True,
             }
 
-        view = SongPollView(picks, thread=thread, timeout=60)
-        msg  = await thread.send(f"🎶 Songs 🎶\n{song_lines}", view=view)
-        view.message = msg
+        random.shuffle(picks)  # Mezclar canciones
+        await thread.send(f"🎶 Canciones seleccionadas (Lv {lo}–{hi}) 🎶\n{song_lines}")
+
 
         # — 9) Confirmación efímera al invocador —
         await interaction.response.send_message(
@@ -733,12 +675,13 @@ class Matchmaking(commands.Cog):
         await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones", ephemeral=True)
         if not songs:
             return await ctx.send("⚠️ No hay canciones en debug_poll.", ephemeral=True)
-        view = SongPollView(songs, thread=ctx.channel, timeout=60)
-        msg  = await ctx.send(
-            "🎵 Poll de prueba (60s para votar):",
-            view=view
+        random.shuffle(songs)
+        await ctx.send(
+            "🎵 Canciones aleatorias:\n" + "\n".join(
+                f"{i+1}. **{title}** (Lv {level} {diff})"
+                for i, (title, level, diff) in enumerate(songs[:5])
+            )
         )
-        view.message = msg
 
     def get_role_from_notes(stats):
         # stats: [perfect, great, good, bad, miss]
