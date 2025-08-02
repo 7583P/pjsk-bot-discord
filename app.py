@@ -50,6 +50,7 @@ async def get_players():
              country,
              role AS rank
         FROM players
+       WHERE season = $1 or season = 'beta'
        ORDER BY mmr DESC
     """
     try:
