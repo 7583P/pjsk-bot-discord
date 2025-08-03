@@ -303,11 +303,12 @@ class Matchmaking(commands.Cog):
             title = {m["id"]: m["title"] for m in musics}
             rows = [
                 (
-                d["musicId"],
-                title[d["musicId"]],
-                d["musicDifficulty"],
-                d["playLevel"],
-                d["noteCount"]             # <— total de notas
+                    d["musicId"],
+                    title[d["musicId"]],
+                    d["musicDifficulty"],
+                    d["playLevel"],
+                    # Usamos notesCount (JSON) o, si existiera, noteCount
+                    d.get("notesCount", d.get("noteCount", 0))
                 )
                 for d in diffs
                 if d["musicDifficulty"] in DIFFICULTY_PRIORITY
