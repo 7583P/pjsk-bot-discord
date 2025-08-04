@@ -6,6 +6,7 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
+from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord import app_commands
@@ -282,6 +283,10 @@ class Matchmaking(commands.Cog):
                 );
                 """
             )
+            # --- AÑADIDO: columna para almacenar país (2 letras) ---
+            await conn.execute(
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
+            )
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
         await self.refresh_songs()
@@ -394,8 +399,8 @@ class Matchmaking(commands.Cog):
 
         # 4) Construye el mensaje con notas individuales y total
         song_lines = "\n".join(
-            f"{i+1}. **{title}** (Lv {level} {diff}) [{notes} notas]"
-            for i, (title, level, diff, notes) in enumerate(picks)
+            f"{i+1}. **{title}** (Lv {random.randint(low, high)} {diff}) [{notes} notas]"
+            for i, (title, _, diff, notes) in enumerate(picks)
         )
 
         await thread.send(
@@ -492,10 +497,12 @@ class Matchmaking(commands.Cog):
         room_entry["total_notes"] = total_notes
 
         # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas
+        # … dentro de start()
         song_lines = "\n".join(
-            f"{i+1}. **{t}** (Lv {lvl} {df}) [{nts} notas]"
-            for i,(t,lvl,df,nts) in enumerate(picks)
+            f"{i+1}. **{t}** (Lv {random.randint(lo, hi)} {df}) [{nts} notas]"
+            for i,(t,_,df,nts) in enumerate(picks)
         )
+
         await thread.send(
             f"🎶 Canciones seleccionadas (Lv {lo}–{hi}) "
             f"(Total {total_notes} notas) 🎶\n{song_lines}"
@@ -709,23 +716,61 @@ class Matchmaking(commands.Cog):
             )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="top10", description="Top 10 jugadores por MMR")
-    async def top10_slash(self, interaction: discord.Interaction):
-        async with self.db_pool.acquire() as conn:
-            top = await conn.fetch(
-                "SELECT user_id, mmr FROM players ORDER BY mmr DESC LIMIT 10"
-            )
-        if not top:
-            return await interaction.response.send_message(
-                "Aún no hay jugadores con MMR definido."
-            )
+    @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
+    async def top100(self, interaction: discord.Interaction):
+        """Muestra el top 100 en páginas de 20, con flechas para navegar."""
+        class Top100View(ui.View):
+            def __init__(self, pool):
+                super().__init__(timeout=None)
+                self.pool = pool
+                self.page = 0  # de 0 a 4
+
+            async def update(self, interaction: discord.Interaction):
+                offset = self.page * 20
+                rows = await self.pool.fetch(
+                    "SELECT user_id, country, mmr FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+                    offset
+                )
+                header = "**TITULO PJSK LOUNGE T100**\n"
+                header += "```TOP | PA | NAME               | MMR\n"
+                lines = []
+                for i, row in enumerate(rows, start=offset+1):
+                    uid, country, mmr_val = row["user_id"], row["country"], row["mmr"]
+                    mem = interaction.guild.get_member(uid)
+                    name = mem.display_name if mem else f"ID {uid}"
+                    lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
+                content = header + "\n".join(lines) + "```"
+                await interaction.response.edit_message(content=content, view=self)
+
+            @ui.button(label="⬅️", style=ButtonStyle.secondary)
+            async def prev(self, button: ui.Button, interaction: discord.Interaction):
+                if self.page > 0:
+                    self.page -= 1
+                    await self.update(interaction)
+
+            @ui.button(label="➡️", style=ButtonStyle.secondary)
+            async def next(self, button: ui.Button, interaction: discord.Interaction):
+                if self.page < 4:
+                    self.page += 1
+                    await self.update(interaction)
+
+        # Enviar página 1
+        view = Top100View(self.db_pool)
+        # Generar contenido inicial
+        rows = await self.db_pool.fetch(
+            "SELECT user_id, country, mmr FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+            0
+        )
+        header = "**TITULO PJSK LOUNGE T100**\n"
+        header += "```TOP | PA | NAME               | MMR\n"
         lines = []
-        for i, row in enumerate(top, 1):
-            uid, mmr_val = row["user_id"], row["mmr"]
+        for i, row in enumerate(rows, start=1):
+            uid, country, mmr_val = row["user_id"], row["country"], row["mmr"]
             mem = interaction.guild.get_member(uid)
-            nm = mem.display_name if mem else f"ID {uid}"
-            lines.append(f"{i}. {nm} — {mmr_val} MMR")
-        await interaction.response.send_message("\n".join(lines))
+            name = mem.display_name if mem else f"ID {uid}"
+            lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
+        content = header + "\n".join(lines) + "```"
+        await interaction.response.send_message(content=content, view=view)
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
@@ -940,10 +985,10 @@ class Matchmaking(commands.Cog):
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
 
-            # Actualiza en BD
+            # … dentro de for p in players_list: …
             await self.db_pool.execute(
-                "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
-                mmr_final, role_name, p["member"].id
+                "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
+                mmr_final, role_name, p["cc"], p["member"].id
             )
             # Actualiza roles en Discord
             role_id = RANK_ROLE_IDS.get(role_name)
