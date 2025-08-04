@@ -718,68 +718,64 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        """Muestra el top 100 en páginas de 20, con flechas para navegar."""
+        # 1) Sacamos los primeros 20 (página 0)
+        rows = await self.db_pool.fetch(
+            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+            0
+        )
+
+        # 2) Construimos el contenido inicial
+        header = "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
+        header += "```Pos | Name                 |   MMR | Rank          \n"
+        lines = []
+        for i, row in enumerate(rows, start=1):
+            member = interaction.guild.get_member(row["user_id"])
+            name = member.display_name if member else f"ID {row['user_id']}"
+            mmr_val = row["mmr"]
+            role = row["role"]
+            # Pos:3, Name:20, MMR:6, Rank:13
+            lines.append(f"{i:>3} | {name:<20} | {mmr_val:>6} | {role:<13}")
+        content = header + "\n".join(lines) + "```"
+
+        # 3) Definimos la vista con botones
         class Top100View(ui.View):
             def __init__(self, pool):
                 super().__init__(timeout=None)
                 self.pool = pool
-                self.page = 0  # de 0 a 4
+                self.page = 0  # páginas 0..4
 
-            async def update(self, interaction: discord.Interaction):
+            async def update_message(self, interaction: discord.Interaction):
                 offset = self.page * 20
-                # Ahora seleccionamos también el rol (role)
                 rows = await self.pool.fetch(
-                    "SELECT user_id, country, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+                    "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
                     offset
                 )
-                # Encabezado con anchos fijos:
-                header = "**🎖 TITULO PJSK LOUNGE T100 🎖**\n"
-                header += "```Pos | PA | Name               |   MMR │ Rango           \n"
+                header = "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
+                header += "```Pos | Name                 |   MMR | Rank          \n"
                 lines = []
-                for i, row in enumerate(rows, start=offset+1):
-                    uid     = row["user_id"]
-                    country = row["country"] or "  "
-                    mmr_val = row["mmr"]
-                    role    = row["role"]
-                    # Resolvemos el nombre (o ID si el miembro no está cargado)
-                    mem = interaction.guild.get_member(uid)
-                    name = mem.display_name if mem else f"ID {uid}"
-                    # Formateamos cada línea con anchos:
-                    # Pos: 3, PA: 2, Name: 18, MMR: 6, Rango: 15
-                    lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val:>6} │ {role:<15}")
-                content = header + "\n".join(lines) + "```"
-                await interaction.response.edit_message(content=content, view=self)
+                for idx, r in enumerate(rows, start=offset+1):
+                    member = interaction.guild.get_member(r["user_id"])
+                    name = member.display_name if member else f"ID {r['user_id']}"
+                    mmr_val = r["mmr"]
+                    role = r["role"]
+                    lines.append(f"{idx:>3} | {name:<20} | {mmr_val:>6} | {role:<13}")
+                new_content = header + "\n".join(lines) + "```"
+                await interaction.response.edit_message(content=new_content, view=self)
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
+                # Siempre reconocemos la interacción
                 if self.page > 0:
                     self.page -= 1
-                    await self.update(interaction)
+                await self.update_message(interaction)
 
             @ui.button(label="➡️", style=ButtonStyle.secondary)
             async def next(self, button: ui.Button, interaction: discord.Interaction):
                 if self.page < 4:
                     self.page += 1
-                    await self.update(interaction)
+                await self.update_message(interaction)
 
-        # — Envío de la primera página —
-        rows = await self.db_pool.fetch(
-            "SELECT user_id, country, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
-            0
-        )
-        header = "**🎖 TITULO PJSK LOUNGE T100 🎖**\n"
-        header += "```Pos | PA | Name               |   MMR │ Rango           \n"
-        lines = []
-        for i, row in enumerate(rows, start=1):
-            uid     = row["user_id"]
-            country = row["country"] or "  "
-            mmr_val = row["mmr"]
-            role    = row["role"]
-            mem = interaction.guild.get_member(uid)
-            name = mem.display_name if mem else f"ID {uid}"
-            lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val:>6} │ {role:<15}")
-        content = header + "\n".join(lines) + "```"
-
+        # 4) Mandamos el mensaje con la vista
         view = Top100View(self.db_pool)
         await interaction.response.send_message(content=content, view=view)
 
