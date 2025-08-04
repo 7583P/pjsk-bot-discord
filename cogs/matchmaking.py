@@ -735,12 +735,15 @@ class Matchmaking(commands.Cog):
                 header += "```TOP | PA | NAME               | MMR\n"
                 lines = []
                 for i, row in enumerate(rows, start=offset+1):
-                    uid, country, mmr_val = row["user_id"], row["country"], row["mmr"]
-                    mem = interaction.guild.get_member(uid)
-                    name = mem.display_name if mem else f"ID {uid}"
+                    uid      = row["user_id"]
+                    country  = row["country"] or ""    # <-- fallback a ""
+                    mmr_val  = row["mmr"]
+                    mem      = interaction.guild.get_member(uid)
+                    name     = mem.display_name if mem else f"ID {uid}"
                     lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
                 content = header + "\n".join(lines) + "```"
                 await interaction.response.edit_message(content=content, view=self)
+
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
@@ -761,16 +764,20 @@ class Matchmaking(commands.Cog):
             "SELECT user_id, country, mmr FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
             0
         )
+        # … dentro de tu comando top100, tras hacer fetch de rows …
         header = "**TITULO PJSK LOUNGE T100**\n"
         header += "```TOP | PA | NAME               | MMR\n"
         lines = []
         for i, row in enumerate(rows, start=1):
-            uid, country, mmr_val = row["user_id"], row["country"], row["mmr"]
-            mem = interaction.guild.get_member(uid)
-            name = mem.display_name if mem else f"ID {uid}"
+            uid      = row["user_id"]
+            country  = row["country"] or ""    # <-- si es None, queda cadena vacía
+            mmr_val  = row["mmr"]
+            mem      = interaction.guild.get_member(uid)
+            name     = mem.display_name if mem else f"ID {uid}"
             lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
         content = header + "\n".join(lines) + "```"
         await interaction.response.send_message(content=content, view=view)
+
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
