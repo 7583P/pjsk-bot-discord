@@ -727,23 +727,28 @@ class Matchmaking(commands.Cog):
 
             async def update(self, interaction: discord.Interaction):
                 offset = self.page * 20
+                # Ahora seleccionamos también el rol (role)
                 rows = await self.pool.fetch(
-                    "SELECT user_id, country, mmr FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+                    "SELECT user_id, country, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
                     offset
                 )
-                header = "**TITULO PJSK LOUNGE T100**\n"
-                header += "```TOP | PA | NAME               | MMR\n"
+                # Encabezado con anchos fijos:
+                header = "**🎖 TITULO PJSK LOUNGE T100 🎖**\n"
+                header += "```Pos | PA | Name               |   MMR │ Rango           \n"
                 lines = []
                 for i, row in enumerate(rows, start=offset+1):
-                    uid      = row["user_id"]
-                    country  = row["country"] or ""    # <-- fallback a ""
-                    mmr_val  = row["mmr"]
-                    mem      = interaction.guild.get_member(uid)
-                    name     = mem.display_name if mem else f"ID {uid}"
-                    lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
+                    uid     = row["user_id"]
+                    country = row["country"] or "  "
+                    mmr_val = row["mmr"]
+                    role    = row["role"]
+                    # Resolvemos el nombre (o ID si el miembro no está cargado)
+                    mem = interaction.guild.get_member(uid)
+                    name = mem.display_name if mem else f"ID {uid}"
+                    # Formateamos cada línea con anchos:
+                    # Pos: 3, PA: 2, Name: 18, MMR: 6, Rango: 15
+                    lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val:>6} │ {role:<15}")
                 content = header + "\n".join(lines) + "```"
                 await interaction.response.edit_message(content=content, view=self)
-
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
@@ -757,25 +762,25 @@ class Matchmaking(commands.Cog):
                     self.page += 1
                     await self.update(interaction)
 
-        # Enviar página 1
-        view = Top100View(self.db_pool)
-        # Generar contenido inicial
+        # — Envío de la primera página —
         rows = await self.db_pool.fetch(
-            "SELECT user_id, country, mmr FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+            "SELECT user_id, country, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
             0
         )
-        # … dentro de tu comando top100, tras hacer fetch de rows …
-        header = "**TITULO PJSK LOUNGE T100**\n"
-        header += "```TOP | PA | NAME               | MMR\n"
+        header = "**🎖 TITULO PJSK LOUNGE T100 🎖**\n"
+        header += "```Pos | PA | Name               |   MMR │ Rango           \n"
         lines = []
         for i, row in enumerate(rows, start=1):
-            uid      = row["user_id"]
-            country  = row["country"] or ""    # <-- si es None, queda cadena vacía
-            mmr_val  = row["mmr"]
-            mem      = interaction.guild.get_member(uid)
-            name     = mem.display_name if mem else f"ID {uid}"
-            lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val}")
+            uid     = row["user_id"]
+            country = row["country"] or "  "
+            mmr_val = row["mmr"]
+            role    = row["role"]
+            mem = interaction.guild.get_member(uid)
+            name = mem.display_name if mem else f"ID {uid}"
+            lines.append(f"{i:>3} | {country:2} | {name:<18} | {mmr_val:>6} │ {role:<15}")
         content = header + "\n".join(lines) + "```"
+
+        view = Top100View(self.db_pool)
         await interaction.response.send_message(content=content, view=view)
 
 
