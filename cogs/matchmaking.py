@@ -718,53 +718,41 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        # 1) Sacamos los primeros 20 (página 0)
-        rows = await self.db_pool.fetch(
-            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
-            0
-        )
+        async def build_page(offset: int):
+            rows = await self.db_pool.fetch(
+                "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
+                offset
+            )
+            header = (
+                "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
+                "```"
+                "Pos | Name                     |  MMR | Rank         \n"
+                "---+--------------------------+------+--------------\n"
+            )
+            lines = []
+            for idx, r in enumerate(rows, start=offset+1):
+                member = interaction.guild.get_member(r["user_id"])
+                name   = member.display_name if member else f"ID {r['user_id']}"
+                mmr    = r["mmr"]
+                role   = r["role"]
+                # Pos:3 | Name:25 | MMR:4 | Rank:12
+                lines.append(f"{idx:>3} | {name:<25.25} | {mmr:>4} | {role:<12}")
+            return header + "\n".join(lines) + "```"
 
-        # 2) Construimos el contenido inicial
-        header = "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
-        header += "```Pos | Name                 |   MMR | Rank          \n"
-        lines = []
-        for i, row in enumerate(rows, start=1):
-            member = interaction.guild.get_member(row["user_id"])
-            name = member.display_name if member else f"ID {row['user_id']}"
-            mmr_val = row["mmr"]
-            role = row["role"]
-            # Pos:3, Name:20, MMR:6, Rank:13
-            lines.append(f"{i:>3} | {name:<20} | {mmr_val:>6} | {role:<13}")
-        content = header + "\n".join(lines) + "```"
-
-        # 3) Definimos la vista con botones
+        # Vista con botones
         class Top100View(ui.View):
             def __init__(self, pool):
                 super().__init__(timeout=None)
                 self.pool = pool
-                self.page = 0  # páginas 0..4
+                self.page = 0  # de 0 a 4
 
             async def update_message(self, interaction: discord.Interaction):
                 offset = self.page * 20
-                rows = await self.pool.fetch(
-                    "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
-                    offset
-                )
-                header = "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
-                header += "```Pos | Name                 |   MMR | Rank          \n"
-                lines = []
-                for idx, r in enumerate(rows, start=offset+1):
-                    member = interaction.guild.get_member(r["user_id"])
-                    name = member.display_name if member else f"ID {r['user_id']}"
-                    mmr_val = r["mmr"]
-                    role = r["role"]
-                    lines.append(f"{idx:>3} | {name:<20} | {mmr_val:>6} | {role:<13}")
-                new_content = header + "\n".join(lines) + "```"
-                await interaction.response.edit_message(content=new_content, view=self)
+                content = await build_page(offset)
+                await interaction.response.edit_message(content=content, view=self)
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
-                # Siempre reconocemos la interacción
                 if self.page > 0:
                     self.page -= 1
                 await self.update_message(interaction)
@@ -775,9 +763,10 @@ class Matchmaking(commands.Cog):
                     self.page += 1
                 await self.update_message(interaction)
 
-        # 4) Mandamos el mensaje con la vista
+        # Envío inicial
+        first_page = await build_page(0)
         view = Top100View(self.db_pool)
-        await interaction.response.send_message(content=content, view=view)
+        await interaction.response.send_message(content=first_page, view=view)
 
 
     @commands.command(name="debug_diffs")
