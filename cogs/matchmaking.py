@@ -723,7 +723,10 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        # Función interna para construir el embed de cada página
+        # 1) Defer para darle tiempo a fetchear datos
+        await interaction.response.defer()
+
+        # Función para construir el embed de cada página
         async def build_embed(page: int) -> Embed:
             offset = page * 20
             rows = await self.db_pool.fetch(
@@ -752,7 +755,7 @@ class Matchmaking(commands.Cog):
             em.set_footer(text=f"Página {page+1}/5")
             return em
 
-        # View con los botones de paginación
+        # View con botones que editan el mensaje
         class Top100View(ui.View):
             def __init__(self):
                 super().__init__(timeout=None)
@@ -772,16 +775,11 @@ class Matchmaking(commands.Cog):
                 new_em = await build_embed(self.page)
                 await interaction.response.edit_message(embed=new_em, view=self)
 
-        # Envío inicial
-        view = Top100View()
+        # 2) Envía la respuesta final vía followup (tras defer)
         first_em = await build_embed(0)
-        await interaction.response.send_message(embed=first_em, view=view)
+        view     = Top100View()
+        await interaction.followup.send(embed=first_em, view=view)
 
-
-        # Envío inicial
-        view = Top100View()
-        first_em = await build_embed(0)
-        await interaction.response.send_message(embed=first_em, view=view)
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
