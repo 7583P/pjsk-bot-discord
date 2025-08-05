@@ -244,7 +244,7 @@ class Matchmaking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # — Reset de inactividad en hilos privados —
+        # 1) Reset de inactividad en hilos privados
         if isinstance(message.channel, Thread) and not message.author.bot:
             now = datetime.datetime.utcnow()
             data = self.inactivity.setdefault(message.channel.id, {})
@@ -255,7 +255,7 @@ class Matchmaking(commands.Cog):
             entry["last"] = now
             entry["warned_at"] = None
 
-            # — Borra TODO mensaje con mención (usuarios, roles, everyone) —
+            # 2) Borrar TODO mensaje con mención
             if message.mentions or message.role_mentions or message.mention_everyone:
                 try:
                     await message.delete()
@@ -263,11 +263,15 @@ class Matchmaking(commands.Cog):
                     pass
                 return
 
-        # Ignorar mensajes del bot
+        # 3) Ignorar mensajes del bot
         if message.author.bot:
             return
 
-        # … el resto de tu lógica on_message …
+        # — Aquí iría cualquier otra cosa que quieras ejecutar por mensaje —
+
+        # 4) ¡Procesar comandos!
+        await self.bot.process_commands(message)
+
 
 
     async def cog_load(self):
