@@ -722,11 +722,14 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        async def build_page(offset: int):
+        # --- Función interna para generar la página ---
+        async def build_page(page: int) -> str:
+            offset = page * 20
             rows = await self.db_pool.fetch(
                 "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
                 offset
             )
+            # Cabecera y separador adaptados a 4 columnas
             header = (
                 "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
                 "```"
@@ -734,42 +737,44 @@ class Matchmaking(commands.Cog):
                 "---+--------------------------+------+--------------\n"
             )
             lines = []
-            for idx, r in enumerate(rows, start=offset+1):
+            for idx, r in enumerate(rows, start=offset + 1):
                 member = interaction.guild.get_member(r["user_id"])
                 name   = member.display_name if member else f"ID {r['user_id']}"
                 mmr    = r["mmr"]
                 role   = r["role"]
-                # Pos:3 | Name:25 | MMR:4 | Rank:12
+                # Alineo fijo: Pos:>3, Name:<25, MMR:>4, Rank:<12
                 lines.append(f"{idx:>3} | {name:<25.25} | {mmr:>4} | {role:<12}")
-            return header + "\n".join(lines) + "```"
+            return header + "\n".join(lines) + "\n```"
 
-        # Vista con botones
+        # --- Vista con botones para navegar páginas ---
         class Top100View(ui.View):
-            def __init__(self, pool):
+            def __init__(self):
                 super().__init__(timeout=None)
-                self.pool = pool
-                self.page = 0  # de 0 a 4
-
-            async def update_message(self, interaction: discord.Interaction):
-                offset = self.page * 20
-                content = await build_page(offset)
-                await interaction.response.edit_message(content=content, view=self)
+                self.page = 0
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
+                # si no estamos en la primera página, retrocede
                 if self.page > 0:
                     self.page -= 1
-                await self.update_message(interaction)
+                # ack rápido para no superar timeout de 3s
+                await interaction.response.defer()
+                content = await build_page(self.page)
+                # edita el mismo mensaje
+                await interaction.edit_original_response(content=content, view=self)
 
             @ui.button(label="➡️", style=ButtonStyle.secondary)
             async def next(self, button: ui.Button, interaction: discord.Interaction):
+                # hasta un máximo de 5 páginas (0–4)
                 if self.page < 4:
                     self.page += 1
-                await self.update_message(interaction)
+                await interaction.response.defer()
+                content = await build_page(self.page)
+                await interaction.edit_original_response(content=content, view=self)
 
-        # Envío inicial
+        # --- Envío inicial de la primera página ---
+        view = Top100View()
         first_page = await build_page(0)
-        view = Top100View(self.db_pool)
         await interaction.response.send_message(content=first_page, view=view)
 
 
