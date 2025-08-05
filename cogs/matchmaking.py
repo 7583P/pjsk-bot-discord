@@ -720,10 +720,9 @@ class Matchmaking(commands.Cog):
                 f"{name} has {mmr_val} MMR and rank {role}."
             )
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        # Construye el embed de la página indicada
+        # Función interna para construir el embed de cada página
         async def build_embed(page: int) -> Embed:
             offset = page * 20
             rows = await self.db_pool.fetch(
@@ -752,7 +751,7 @@ class Matchmaking(commands.Cog):
             em.set_footer(text=f"Página {page+1}/5")
             return em
 
-        # View con los botones
+        # View con los botones de paginación
         class Top100View(ui.View):
             def __init__(self):
                 super().__init__(timeout=None)
@@ -760,28 +759,23 @@ class Matchmaking(commands.Cog):
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
-                # 1) ACK inmediato indicando que vamos a actualizar
-                await interaction.response.defer(update=True)
-                # 2) Cambiamos página
                 if self.page > 0:
                     self.page -= 1
-                # 3) Generamos el embed (puede tardar)
                 new_em = await build_embed(self.page)
-                # 4) Editamos el mensaje original
-                await interaction.edit_original_response(embed=new_em, view=self)
+                await interaction.response.edit_message(embed=new_em, view=self)
 
             @ui.button(label="➡️", style=ButtonStyle.secondary)
             async def next(self, button: ui.Button, interaction: discord.Interaction):
-                await interaction.response.defer(update=True)
                 if self.page < 4:
                     self.page += 1
                 new_em = await build_embed(self.page)
-                await interaction.edit_original_response(embed=new_em, view=self)
+                await interaction.response.edit_message(embed=new_em, view=self)
 
         # Envío inicial
         view = Top100View()
         first_em = await build_embed(0)
         await interaction.response.send_message(embed=first_em, view=view)
+
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
