@@ -6,6 +6,7 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
+from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
@@ -722,7 +723,7 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        # Función interna para generar el Embed de cada página
+        # Función que construye el Embed de cada página
         async def build_embed(page: int) -> Embed:
             offset = page * 20
             rows = await self.db_pool.fetch(
@@ -730,7 +731,6 @@ class Matchmaking(commands.Cog):
                 offset
             )
 
-            # Construye la tabla monospace
             header = (
                 " T | Name                     |     MMR    | Rank      \n"
                 "---+--------------------------+------------+-----------\n"
@@ -752,7 +752,7 @@ class Matchmaking(commands.Cog):
             em.set_footer(text=f"Página {page+1}/5")
             return em
 
-        # Vista con botones para navegar
+        # La View con los botones
         class Top100View(ui.View):
             def __init__(self):
                 super().__init__(timeout=None)
@@ -763,7 +763,7 @@ class Matchmaking(commands.Cog):
                 if self.page > 0:
                     self.page -= 1
                 new_em = await build_embed(self.page)
-                # ACK + edición en un solo paso
+                # Ack + editar en un solo paso
                 await interaction.response.edit_message(embed=new_em, view=self)
 
             @ui.button(label="➡️", style=ButtonStyle.secondary)
@@ -773,7 +773,7 @@ class Matchmaking(commands.Cog):
                 new_em = await build_embed(self.page)
                 await interaction.response.edit_message(embed=new_em, view=self)
 
-        # Envío inicial de la primera página
+        # Envío inicial
         view = Top100View()
         first_em = await build_embed(0)
         await interaction.response.send_message(embed=first_em, view=view)
