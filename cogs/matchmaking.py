@@ -720,6 +720,7 @@ class Matchmaking(commands.Cog):
                 f"{name} has {mmr_val} MMR and rank {role}."
             )
 
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
         # Función interna para construir el embed de cada página
@@ -776,6 +777,11 @@ class Matchmaking(commands.Cog):
         first_em = await build_embed(0)
         await interaction.response.send_message(embed=first_em, view=view)
 
+
+        # Envío inicial
+        view = Top100View()
+        first_em = await build_embed(0)
+        await interaction.response.send_message(embed=first_em, view=view)
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
