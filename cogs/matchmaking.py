@@ -722,17 +722,17 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     async def top100(self, interaction: discord.Interaction):
-        async def build_page(page: int) -> str:
+        # Función interna para generar el Embed de cada página
+        async def build_embed(page: int) -> Embed:
             offset = page * 20
             rows = await self.db_pool.fetch(
                 "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
                 offset
             )
+
+            # Construye la tabla monospace
             header = (
-                "**🏆 TOP 100 Jugadores por MMR 🎉**\n"
-                f"Página {page+1}/5\n"
-                "```"
-                " T |          Name            |     MMR    | Rank      \n"
+                " T | Name                     |     MMR    | Rank      \n"
                 "---+--------------------------+------------+-----------\n"
             )
             lines = []
@@ -742,8 +742,17 @@ class Matchmaking(commands.Cog):
                 mmr    = f"{r['mmr']:,}"
                 role   = r["role"][:10]
                 lines.append(f"{idx:>2}| {name:<25} | {mmr:>10} | {role:<10}")
-            return header + "\n".join(lines) + "\n```"
 
+            table = "```" + header + "\n".join(lines) + "```"
+            em = Embed(
+                title="🏆 TOP 100 Jugadores por MMR 🎉",
+                description=table,
+                color=0xFFD700
+            )
+            em.set_footer(text=f"Página {page+1}/5")
+            return em
+
+        # Vista con botones para navegar
         class Top100View(ui.View):
             def __init__(self):
                 super().__init__(timeout=None)
@@ -751,24 +760,23 @@ class Matchmaking(commands.Cog):
 
             @ui.button(label="⬅️", style=ButtonStyle.secondary)
             async def prev(self, button: ui.Button, interaction: discord.Interaction):
-                # <-- defer indicando update -->
-                await interaction.response.defer(update=True)
                 if self.page > 0:
                     self.page -= 1
-                content = await build_page(self.page)
-                await interaction.edit_original_response(content=content, view=self)
+                new_em = await build_embed(self.page)
+                # ACK + edición en un solo paso
+                await interaction.response.edit_message(embed=new_em, view=self)
 
             @ui.button(label="➡️", style=ButtonStyle.secondary)
             async def next(self, button: ui.Button, interaction: discord.Interaction):
-                await interaction.response.defer(update=True)
                 if self.page < 4:
                     self.page += 1
-                content = await build_page(self.page)
-                await interaction.edit_original_response(content=content, view=self)
+                new_em = await build_embed(self.page)
+                await interaction.response.edit_message(embed=new_em, view=self)
 
+        # Envío inicial de la primera página
         view = Top100View()
-        first = await build_page(0)
-        await interaction.response.send_message(content=first, view=view)
+        first_em = await build_embed(0)
+        await interaction.response.send_message(embed=first_em, view=view)
 
     @commands.command(name="debug_diffs")
     async def debug_diffs(self, ctx: commands.Context):
