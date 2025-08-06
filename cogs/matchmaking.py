@@ -217,37 +217,42 @@ class Top100View(View):
         )
         return embed
 
-    @button(emoji="◀️", style=ButtonStyle.blurple)
-    async def prev_page(self, _, interaction: discord.Interaction):
-        await interaction.response.defer_update()
+    @button(emoji="◀️", style=ButtonStyle.secondary)
+    async def prev_page(self, button, interaction: discord.Interaction):
+        # baja página si puede
         if self.page > 0:
             self.page -= 1
 
-        # Recalcula límites con el tope de 100
+        # recalcula el tope de 100
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
         total     = min(total_all, 100)
         max_page  = (total - 1) // self.per_page
+
+        # actualiza estado de botones
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
         embed = await self.build_embed()
-        await interaction.edit_original_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=self)
 
-    @button(emoji="▶️", style=ButtonStyle.blurple)
-    async def next_page(self, _, interaction: discord.Interaction):
-        await interaction.response.defer_update()
 
+    @button(emoji="▶️", style=ButtonStyle.secondary)
+    async def next_page(self, button, interaction: discord.Interaction):
+        # sube página si puede
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
         total     = min(total_all, 100)
         max_page  = (total - 1) // self.per_page
+
         if self.page < max_page:
             self.page += 1
 
+        # actualiza estado de botones
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
         embed = await self.build_embed()
-        await interaction.edit_original_message(embed=embed, view=self)
+        await interaction.response.edit_message(embed=embed, view=self)
+
 
 
 class Matchmaking(commands.Cog):
