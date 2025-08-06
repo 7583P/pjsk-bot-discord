@@ -180,42 +180,30 @@ class Top100View(View):
         return embed
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
-    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 1) Acknowledge para que no caduque
+    async def prev_page(self, interaction, button):
         await interaction.response.defer_update()
-
-        # 2) Bajar página si puede
         if self.page > 0:
             self.page -= 1
-
-        # 3) Recalcular límites y deshabilitar botones
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
+        total    = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // self.per_page if total else 0
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
-        # 4) Reconstruir embed y EDITAR el mensaje
-        embed = await self.build_embed()
-        await interaction.message.edit(embed=embed, view=self)
+        new_embed = await self.build_embed()
+        await interaction.message.edit(embed=new_embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
-    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def next_page(self, interaction, button):
         await interaction.response.defer_update()
-
-        # Subir página si puede
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
+        total    = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // self.per_page if total else 0
         if self.page < max_page:
             self.page += 1
-
-        # Deshabilitar según posición
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
-        embed = await self.build_embed()
-        await interaction.message.edit(embed=embed, view=self)
+        new_embed = await self.build_embed()
+        await interaction.message.edit(embed=new_embed, view=self)
 
 
 
@@ -774,16 +762,18 @@ class Matchmaking(commands.Cog):
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def top100(self, interaction: discord.Interaction):
+        # 1) Construye la View y deshabilita los botones según primera/última página
         view = Top100View(self.db_pool, interaction)
-
-        # deshabilita “◀️” en la primera página; “▶️” sólo si no hay más
         total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // view.per_page
+        max_page = (total - 1) // view.per_page if total else 0
         view.prev_page.disabled = True
         view.next_page.disabled = (0 == max_page)
 
-        embed = await view.build_embed()
-        await interaction.response.send_message(embed=embed, view=view)
+        # 2) **Definir** la variable antes de usarla**
+        page_embed = await view.build_embed()
+
+        # 3) Enviar la respuesta con embed y view
+        await interaction.response.send_message(embed=page_embed, view=view)
 
 
     @commands.command(name="debug_diffs")
