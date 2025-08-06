@@ -7,7 +7,7 @@ import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
 from discord import app_commands, Embed
-from discord import ui, ButtonStyle
+from discord import ui, ButtonStyle, Embed
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
