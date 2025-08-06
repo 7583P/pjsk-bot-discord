@@ -10,7 +10,7 @@ from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
-from discord import app_commands
+from discord.ui import View, button
 # ———————————————————————————————————————————————
 # — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
@@ -167,6 +167,72 @@ PLACEMENT_MMR_BONUS = {
     "Master":   701,
 }
 
+class Top100View(View):
+    def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction):
+        super().__init__(timeout=None)
+        self.db = db_pool
+        self.inter = interaction
+        self.page = 0
+        self.per_page = 20
+
+    async def build_embed(self) -> discord.Embed:
+        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // self.per_page
+        offset = self.page * self.per_page
+
+        rows = await self.db.fetch(
+            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
+            offset, self.per_page
+        )
+
+        embed = discord.Embed(
+            title="🏆 TOP 100 Jugadores por MMR 🥳",
+            color=0x00B4D8
+        )
+        header    = "T  | Name                     |   MMR   | Rank\n"
+        separator = "---+--------------------------+---------+-----------\n"
+        lines = []
+        for idx, r in enumerate(rows, start=offset + 1):
+            member = self.inter.guild.get_member(r["user_id"])
+            name   = (member.display_name if member else f"ID {r['user_id']}")[:25]
+            mmr    = f"{r['mmr']:,}"
+            rank   = r["role"]
+            lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank}")
+
+        embed.description = (
+            f"```prolog\n{header}{separator}"
+            + "\n".join(lines)
+            + f"\n```Página {self.page+1}/{max_page+1}"
+        )
+        return embed
+
+    @button(emoji="◀️", style=ButtonStyle.blurple)
+    async def prev_page(self, _, interaction: discord.Interaction):
+        await interaction.response.defer_update()
+        if self.page > 0:
+            self.page -= 1
+
+        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // self.per_page
+        self.prev_page.disabled = (self.page == 0)
+        self.next_page.disabled = (self.page == max_page)
+
+        embed = await self.build_embed()
+        await interaction.edit_original_message(embed=embed, view=self)
+
+    @button(emoji="▶️", style=ButtonStyle.blurple)
+    async def next_page(self, _, interaction: discord.Interaction):
+        await interaction.response.defer_update()
+        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // self.per_page
+        if self.page < max_page:
+            self.page += 1
+
+        self.prev_page.disabled = (self.page == 0)
+        self.next_page.disabled = (self.page == max_page)
+
+        embed = await self.build_embed()
+        await interaction.edit_original_message(embed=embed, view=self)
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
@@ -719,63 +785,20 @@ class Matchmaking(commands.Cog):
             await interaction.response.send_message(
                 f"{name} has {mmr_val} MMR and rank {role}."
             )
-
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def top100(self, interaction: discord.Interaction):
-        # Función para construir el embed de cada página
-        async def build_embed(page: int) -> Embed:
-            offset = page * 20
-            rows = await self.db_pool.fetch(
-                "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT 20",
-                offset
-            )
+        view = Top100View(self.db_pool, interaction)
 
-            header = (
-                " T | Name                     |     MMR    | Rank      \n"
-                "---+--------------------------+------------+-----------\n"
-            )
-            lines = []
-            for idx, r in enumerate(rows, start=offset + 1):
-                member = interaction.guild.get_member(r["user_id"])
-                name   = (member.display_name if member else f"ID {r['user_id']}")[:25]
-                mmr    = f"{r['mmr']:,}"
-                role   = r["role"][:10]
-                lines.append(f"{idx:>2}| {name:<25} | {mmr:>10} | {role:<10}")
+        # deshabilita “◀️” en la primera página; “▶️” sólo si no hay más
+        total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players")
+        max_page = (total - 1) // view.per_page
+        view.prev_page.disabled = True
+        view.next_page.disabled = (0 == max_page)
 
-            table = "```" + header + "\n".join(lines) + "```"
-            em = Embed(
-                title="🏆 TOP 100 Jugadores por MMR 🎉",
-                description=table,
-                color=0x00FFF7
-            )
-            em.set_footer(text=f"Página {page+1}/5")
-            return em
-
-        # View con botones que EDITAN el mismo mensaje
-        class Top100View(ui.View):
-            def __init__(self):
-                super().__init__(timeout=None)
-                self.page = 0
-
-            @ui.button(label="⬅️", style=ButtonStyle.secondary)
-            async def prev(self, button: ui.Button, interaction: discord.Interaction):
-                if self.page > 0:
-                    self.page -= 1
-                new_em = await build_embed(self.page)
-                await interaction.response.edit_message(embed=new_em, view=self)
-
-            @ui.button(label="➡️", style=ButtonStyle.secondary)
-            async def next(self, button: ui.Button, interaction: discord.Interaction):
-                if self.page < 4:
-                    self.page += 1
-                new_em = await build_embed(self.page)
-                await interaction.response.edit_message(embed=new_em, view=self)
-
-        # Envío inicial: UNICA llamada a response.*
-        first_em = await build_embed(0)
-        view     = Top100View()
-        await interaction.response.send_message(embed=first_em, view=view)
+        embed = await view.build_embed()
+        await interaction.response.send_message(embed=embed, view=view)
 
 
     @commands.command(name="debug_diffs")
