@@ -211,7 +211,7 @@ class Top100View(View):
         return embed
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
-    async def prev_page(self, button, interaction: discord.Interaction):
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             if self.page > 0:
                 self.page -= 1
@@ -230,7 +230,7 @@ class Top100View(View):
             await interaction.channel.send(f"❌ Excepción en prev_page: {type(e).__name__}: {e}")
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
-    async def next_page(self, button, interaction: discord.Interaction):
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
             total     = min(total_all or 0, 100)
@@ -243,7 +243,6 @@ class Top100View(View):
             self.next_page.disabled = (self.page == max_page)
 
             embed = await self.build_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
         except Exception as e:
             await interaction.channel.send(f"❌ Excepción en next_page: {type(e).__name__}: {e}")
 
