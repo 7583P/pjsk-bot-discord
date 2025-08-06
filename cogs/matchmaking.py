@@ -190,10 +190,10 @@ class Top100View(View):
 
         # construye el embed
         embed = Embed(
-            title="🏆 TOP 100 Jugadores por MMR 🥳",
+            title="PJSK LOUGE TOP 100",
             color=0x00B4D8
         )
-        header    = "T  | Name                     |   MMR   | Rank\n"
+        header    = "TOP| Name                     |   MMR   | Rank\n"
         separator = "---+--------------------------+---------+-----------\n"
         lines = []
         for idx, r in enumerate(rows, start=offset + 1):
