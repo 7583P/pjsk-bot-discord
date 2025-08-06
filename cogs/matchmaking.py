@@ -176,38 +176,7 @@ class Top100View(View):
         self.per_page = 20
 
     async def build_embed(self) -> discord.Embed:
-        # Limitar a los 100 primeros
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
-
-        offset = self.page * self.per_page
-        rows = await self.db.fetch(
-            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
-            offset, self.per_page
-        )
-
-        embed = discord.Embed(
-            title="🏆 TOP 100 Jugadores por MMR 🥳",
-            color=0x00B4D8
-        )
-        header    = "T  | Name                     |   MMR   | Rank\n"
-        separator = "---+--------------------------+---------+-----------\n"
-        lines = []
-        for idx, r in enumerate(rows, start=offset + 1):
-            member = self.inter.guild.get_member(r["user_id"])
-            name   = (member.display_name if member else f"ID {r['user_id']}")[:25]
-            mmr    = f"{r['mmr']:,}"
-            rank   = r["role"]
-            lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank}")
-
-        embed.description = (
-            "```\n"
-            + header
-            + separator
-            + "\n".join(lines)
-            + f"\n```Página {self.page+1}/{max_page+1}"
-        )
+        # … tu implementación idéntica …
         return embed
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
@@ -215,39 +184,39 @@ class Top100View(View):
         # 1) Acknowledge para que no caduque
         await interaction.response.defer_update()
 
-        # 2) Bajar página
+        # 2) Bajar página si puede
         if self.page > 0:
             self.page -= 1
 
-        # 3) Recalcular límites (top 100)
+        # 3) Recalcular límites y deshabilitar botones
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
         total     = min(total_all or 0, 100)
         max_page  = (total - 1) // self.per_page if total else 0
-
-        # 4) Habilitar/inhabilitar botones
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
-        # 5) Reconstruir embed y editar mensaje
+        # 4) Reconstruir embed y EDITAR el mensaje
         embed = await self.build_embed()
-        await interaction.edit_original_message(embed=embed, view=self)
+        await interaction.message.edit(embed=embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer_update()
 
+        # Subir página si puede
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
         total     = min(total_all or 0, 100)
         max_page  = (total - 1) // self.per_page if total else 0
-
         if self.page < max_page:
             self.page += 1
 
+        # Deshabilitar según posición
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
         embed = await self.build_embed()
-        await interaction.edit_original_message(embed=embed, view=self)
+        await interaction.message.edit(embed=embed, view=self)
+
 
 
 class Matchmaking(commands.Cog):
