@@ -170,21 +170,30 @@ PLACEMENT_MMR_BONUS = {
 class Top100View(View):
     def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction):
         super().__init__(timeout=None)
-        self.db = db_pool
-        self.inter = interaction
-        self.page = 0
+        self.db      = db_pool
+        self.inter   = interaction
+        self.page    = 0
         self.per_page = 20
 
     async def build_embed(self) -> discord.Embed:
-        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // self.per_page
+        # 1) Coge total real y lo capea a 100
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all, 100)
+        max_page  = (total - 1) // self.per_page
+
+        # 2) Offset para esta página
         offset = self.page * self.per_page
 
+        # 3) Trae SOLO hasta los 100 primeros (offset < 100)
         rows = await self.db.fetch(
-            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
+            "SELECT user_id, mmr, role "
+            "FROM players "
+            "ORDER BY mmr DESC "
+            "OFFSET $1 LIMIT $2",
             offset, self.per_page
         )
 
+        # 4) Construye el embed sin resaltado de sintaxis
         embed = discord.Embed(
             title="🏆 TOP 100 Jugadores por MMR 🥳",
             color=0x00B4D8
@@ -200,7 +209,9 @@ class Top100View(View):
             lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank}")
 
         embed.description = (
-            f"```prolog\n{header}{separator}"
+            "```\n"
+            + header
+            + separator
             + "\n".join(lines)
             + f"\n```Página {self.page+1}/{max_page+1}"
         )
@@ -212,8 +223,10 @@ class Top100View(View):
         if self.page > 0:
             self.page -= 1
 
-        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // self.per_page
+        # Recalcula límites con el tope de 100
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all, 100)
+        max_page  = (total - 1) // self.per_page
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
@@ -223,8 +236,10 @@ class Top100View(View):
     @button(emoji="▶️", style=ButtonStyle.blurple)
     async def next_page(self, _, interaction: discord.Interaction):
         await interaction.response.defer_update()
-        total = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // self.per_page
+
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all, 100)
+        max_page  = (total - 1) // self.per_page
         if self.page < max_page:
             self.page += 1
 
@@ -233,6 +248,7 @@ class Top100View(View):
 
         embed = await self.build_embed()
         await interaction.edit_original_message(embed=embed, view=self)
+
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
