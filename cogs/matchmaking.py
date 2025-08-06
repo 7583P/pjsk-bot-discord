@@ -212,39 +212,42 @@ class Top100View(View):
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            if self.page > 0:
-                self.page -= 1
+        # 1) Acknowledge para que no caduque
+        await interaction.response.defer_update()
 
-            total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-            total     = min(total_all or 0, 100)
-            max_page  = (total - 1) // self.per_page if total else 0
+        # 2) Bajar página
+        if self.page > 0:
+            self.page -= 1
 
-            self.prev_page.disabled = (self.page == 0)
-            self.next_page.disabled = (self.page == max_page)
+        # 3) Recalcular límites (top 100)
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all or 0, 100)
+        max_page  = (total - 1) // self.per_page if total else 0
 
-            embed = await self.build_embed()
-            await interaction.response.edit_message(embed=embed, view=self)
-        except Exception as e:
-            # Esto te mostrará el error real en el canal
-            await interaction.channel.send(f"❌ Excepción en prev_page: {type(e).__name__}: {e}")
+        # 4) Habilitar/inhabilitar botones
+        self.prev_page.disabled = (self.page == 0)
+        self.next_page.disabled = (self.page == max_page)
+
+        # 5) Reconstruir embed y editar mensaje
+        embed = await self.build_embed()
+        await interaction.edit_original_message(embed=embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-            total     = min(total_all or 0, 100)
-            max_page  = (total - 1) // self.per_page if total else 0
+        await interaction.response.defer_update()
 
-            if self.page < max_page:
-                self.page += 1
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all or 0, 100)
+        max_page  = (total - 1) // self.per_page if total else 0
 
-            self.prev_page.disabled = (self.page == 0)
-            self.next_page.disabled = (self.page == max_page)
+        if self.page < max_page:
+            self.page += 1
 
-            embed = await self.build_embed()
-        except Exception as e:
-            await interaction.channel.send(f"❌ Excepción en next_page: {type(e).__name__}: {e}")
+        self.prev_page.disabled = (self.page == 0)
+        self.next_page.disabled = (self.page == max_page)
+
+        embed = await self.build_embed()
+        await interaction.edit_original_message(embed=embed, view=self)
 
 
 class Matchmaking(commands.Cog):
