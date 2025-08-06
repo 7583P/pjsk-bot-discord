@@ -175,36 +175,83 @@ class Top100View(View):
         self.page     = 0
         self.per_page = 20
 
-    async def build_embed(self) -> discord.Embed:
-        # … tu implementación idéntica …
+    async def build_embed(self) -> Embed:
+        # 1) Cuenta total y páginas
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all or 0, 100)
+        max_page  = (total - 1) // self.per_page if total else 0
+
+        # 2) Consulta los jugadores de la página actual
+        offset = self.page * self.per_page
+        rows = await self.db.fetch(
+            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
+            offset, self.per_page
+        )
+
+        # 3) Crea el Embed
+        embed = Embed(
+            title="🏆 TOP 100 Jugadores por MMR 🥳",
+            color=0x00B4D8
+        )
+
+        # 4) Formatea la tabla ASCII
+        header    = "T  | Name                     |   MMR   | Rank\n"
+        separator = "---+--------------------------+---------+-----------\n"
+        lines = []
+        for idx, r in enumerate(rows, start=offset + 1):
+            member = self.inter.guild.get_member(r["user_id"])
+            name   = (member.display_name if member else f"ID {r['user_id']}")[:25]
+            mmr    = f"{r['mmr']:,}"
+            rank   = r["role"]
+            lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank}")
+
+        embed.description = (
+            "```\n"
+            + header
+            + separator
+            + "\n".join(lines)
+            + f"\n```Página {self.page+1}/{max_page+1}"
+        )
+
         return embed
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
-    async def prev_page(self, interaction, button):
+    async def prev_page(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer_update()
+
+        # Baja de página si es posible
         if self.page > 0:
             self.page -= 1
-        total    = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // self.per_page if total else 0
+
+        # Recalcula y ajusta habilitación de botones
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all or 0, 100)
+        max_page  = (total - 1) // self.per_page if total else 0
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
+        # Edita el mensaje original
         new_embed = await self.build_embed()
         await interaction.message.edit(embed=new_embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
-    async def next_page(self, interaction, button):
+    async def next_page(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer_update()
-        total    = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        max_page = (total - 1) // self.per_page if total else 0
+
+        # Sube de página si es posible
+        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
+        total     = min(total_all or 0, 100)
+        max_page  = (total - 1) // self.per_page if total else 0
         if self.page < max_page:
             self.page += 1
+
+        # Recalcula y ajusta habilitación de botones
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
+        # Edita el mensaje original
         new_embed = await self.build_embed()
         await interaction.message.edit(embed=new_embed, view=self)
-
 
 
 class Matchmaking(commands.Cog):
