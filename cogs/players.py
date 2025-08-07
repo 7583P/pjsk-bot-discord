@@ -42,7 +42,7 @@ async def upsert_player(user_id: int, name: str, country: str):
         await conn.close()
 
 # Actualiza solo el nombre y temporada, sin tocar country
-def update_player_name(user_id: int, name: str):
+async def update_player_name(user_id: int, name: str):
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
@@ -51,13 +51,21 @@ def update_player_name(user_id: int, name: str):
       name   = EXCLUDED.name,
       season = EXCLUDED.season
     """
-    return get_conn().then(lambda conn: conn.execute(sql, user_id, name, season).finally_(conn.close()))
+    conn = await get_conn()
+    try:
+        await conn.execute(sql, user_id, name, season)
+    finally:
+        await conn.close()
 
-# Obtiene el nombre a mostrar con prioridad: nickname > global_name (show name) > username
+# Obtiene el nombre a mostrar con prioridad: nickname > username global > show name
 
 def get_member_name(member: discord.Member) -> str:
     if member.nick:
         return member.nick
+    # Username global (member.name)
+    if member.name:
+        return member.name
+    # Show name (member.global_name)
     if getattr(member, 'global_name', None):
         return member.global_name
     return member.name
