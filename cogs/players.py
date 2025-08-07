@@ -57,15 +57,11 @@ async def update_player_name(user_id: int, name: str):
     finally:
         await conn.close()
 
-# Obtiene el nombre a mostrar con prioridad: nickname > username global > show name
+# Obtiene el nombre a mostrar con prioridad: nickname > show name > username global
 
 def get_member_name(member: discord.Member) -> str:
     if member.nick:
         return member.nick
-    # Username global (member.name)
-    if member.name:
-        return member.name
-    # Show name (member.global_name)
     if getattr(member, 'global_name', None):
         return member.global_name
     return member.name
