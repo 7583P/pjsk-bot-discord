@@ -42,7 +42,7 @@ async def upsert_player(user_id: int, name: str, country: str):
         await conn.close()
 
 # Actualiza solo el nombre y temporada, sin tocar country
-async def update_player_name(user_id: int, name: str):
+def update_player_name(user_id: int, name: str):
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
@@ -51,17 +51,18 @@ async def update_player_name(user_id: int, name: str):
       name   = EXCLUDED.name,
       season = EXCLUDED.season
     """
-    conn = await get_conn()
-    try:
-        await conn.execute(sql, user_id, name, season)
-    finally:
-        await conn.close()
+    return get_conn().then(lambda conn: conn.execute(sql, user_id, name, season).finally_(conn.close()))
 
-# Sincronización inicial sin sobreescribir country
+# Obtiene el nombre a mostrar con prioridad: nickname > global_name (show name) > username
+
 def get_member_name(member: discord.Member) -> str:
-    # Si tiene nickname, úsalo; si no, usa su username global
-    return member.nick if member.nick else member.name
+    if member.nick:
+        return member.nick
+    if getattr(member, 'global_name', None):
+        return member.global_name
+    return member.name
 
+# Sincronización inicial
 async def upsert_player_load(user_id: int, name: str):
     await update_player_name(user_id, name)
 
@@ -99,7 +100,6 @@ class PlayersCog(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
-        # Si cambia nickname o username, actualiza nombre
         prev = get_member_name(before)
         curr = get_member_name(after)
         if prev != curr:
