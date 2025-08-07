@@ -41,21 +41,29 @@ async def upsert_player(user_id: int, name: str, country: str):
     finally:
         await conn.close()
 
-# Sincronización inicial sin sobreescribir country
-async def upsert_player_load(user_id: int, name: str):
+# Actualiza solo el nombre y temporada, sin tocar country
+async def update_player_name(user_id: int, name: str):
     season = get_current_season_label()
     sql = """
     INSERT INTO players(user_id, name, mmr, role, country, season)
     VALUES ($1, $2, 0, 'Placement', '', $3)
     ON CONFLICT (user_id) DO UPDATE SET
-      name    = EXCLUDED.name,
-      season  = EXCLUDED.season
+      name   = EXCLUDED.name,
+      season = EXCLUDED.season
     """
     conn = await get_conn()
     try:
         await conn.execute(sql, user_id, name, season)
     finally:
         await conn.close()
+
+# Sincronización inicial sin sobreescribir country
+def get_member_name(member: discord.Member) -> str:
+    # Si tiene nickname, úsalo; si no, usa su username global
+    return member.nick if member.nick else member.name
+
+async def upsert_player_load(user_id: int, name: str):
+    await update_player_name(user_id, name)
 
 class PlayersCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -74,18 +82,28 @@ class PlayersCog(commands.Cog):
                 await guild.chunk()
                 for member in guild.members:
                     if not member.bot:
-                        await upsert_player_load(member.id, member.display_name)
+                        name = get_member_name(member)
+                        await upsert_player_load(member.id, name)
                         total += 1
             print(f"⚙️ Tabla sincronizada con {total} miembros existentes.")
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member):
         if not member.bot:
-            await upsert_player(member.id, member.display_name, "")
+            name = get_member_name(member)
+            await upsert_player(member.id, name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention} Execute command `/register <ISO2>` into #register to see your country in the page"
+                    f"Welcome {member.mention}! Ejecuta `/register <ISO2>` en #register para registrar tu país"
                 )
+
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        # Si cambia nickname o username, actualiza nombre
+        prev = get_member_name(before)
+        curr = get_member_name(after)
+        if prev != curr:
+            await update_player_name(after.id, curr)
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="register", description="Registra tu país (código ISO2)")
@@ -94,11 +112,12 @@ class PlayersCog(commands.Cog):
         code = country.strip().upper()
         if not re.match(r'^[A-Z]{2}$', code):
             return await interaction.response.send_message(
-                "You should especify your country with 2 letters (ISO2)", ephemeral=True
+                "Debes especificar un código de país ISO2 de dos letras", ephemeral=True
             )
-        await upsert_player(interaction.user.id, interaction.user.display_name, code)
+        name = get_member_name(interaction.user)
+        await upsert_player(interaction.user.id, name, code)
         await interaction.response.send_message(
-            f"✅ {interaction.user.display_name}, country registered **{code}**.",
+            f"✅ {name}, país registrado **{code}**.",
             ephemeral=True
         )
 
