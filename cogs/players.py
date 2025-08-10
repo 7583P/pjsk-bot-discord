@@ -99,7 +99,7 @@ class PlayersCog(commands.Cog):
             await upsert_player(member.id, name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention}! Ejecuta `/register <ISO2>` en #register para registrar tu país"
+                    f"Welcome {member.mention}! Excecute `/register <ISO2>` in #register to see your country in the page"
                 )
 
     @commands.Cog.listener()
@@ -110,18 +110,18 @@ class PlayersCog(commands.Cog):
             await update_player_name(after.id, curr)
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="register", description="Registra tu país (código ISO2)")
-    @app_commands.describe(country="Código ISO2 de dos letras (p.ej., PE)")
+    @app_commands.command(name="register", description="Register your country (código ISO2)")
+    @app_commands.describe(country="ISO2 2 letters code (p.ej., PE)")
     async def register(self, interaction: discord.Interaction, country: str):
         code = country.strip().upper()
         if not re.match(r'^[A-Z]{2}$', code):
             return await interaction.response.send_message(
-                "Debes especificar un código de país ISO2 de dos letras", ephemeral=True
+                "You should especify a 2 letter ISO2 code counrty", ephemeral=True
             )
         name = get_member_name(interaction.user)
         await upsert_player(interaction.user.id, name, code)
         await interaction.response.send_message(
-            f"✅ {name}, país registrado **{code}**.",
+            f"✅ {name}, Country registered **{code}**.",
             ephemeral=True
         )
 

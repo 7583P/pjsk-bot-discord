@@ -781,7 +781,7 @@ class Matchmaking(commands.Cog):
             )
         else:
             await interaction.response.send_message(
-                f"{name} tiene {mmr_val} MMR y rango {role}."
+                f"{name} has {mmr_val} MMR and rank {role}."
             )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
