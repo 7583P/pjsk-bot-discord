@@ -254,6 +254,38 @@ class Matchmaking(commands.Cog):
     # Ahora usamos la prioridad global
     DIFFS = DIFFICULTY_PRIORITY
 
+    @staticmethod
+    def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
+        """
+        ratings: MMR actual de cada jugador en el mismo orden que players_list
+        order: índices en orden final (0..n-1). Ej: [2,0,1] ⇒ 1º el jugador 2, 2º el 0, 3º el 1
+        K fijo. Con K fijo, la suma de Δ tiende a 0 antes del cap.
+        """
+        n = len(ratings)
+        if n <= 1:
+            return [0] * n
+
+        Kp = K / (n - 1)  # K por duelo
+        # posición final por jugador (0 = 1º lugar)
+        pos = [0] * n
+        for place, idx in enumerate(order):
+            pos[idx] = place
+
+        deltas = [0.0] * n
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                S_i = 1.0 if pos[i] < pos[j] else 0.0
+                E_i = 1.0 / (1.0 + 10 ** ((ratings[j] - ratings[i]) / scale))
+                deltas[i] += Kp * (S_i - E_i)
+
+        out = [int(round(x)) for x in deltas]
+        if cap is not None:
+            out = [max(-cap, min(cap, d)) for d in out]
+        return out
+
+
 
     @staticmethod
     def _range_for_counts(counts: dict[str, int]) -> tuple[int, int]:
@@ -482,9 +514,10 @@ class Matchmaking(commands.Cog):
 
         # 4) Construye el mensaje con notas individuales y total
         song_lines = "\n".join(
-            f"{i+1}. **{title}** (Lv {random.randint(low, high)} {diff}) [{notes} notas]"
-            for i, (title, _, diff, notes) in enumerate(picks)
+            f"{i+1}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
+            for i, (title, lvl, diff, notes) in enumerate(picks)
         )
+
 
         await thread.send(
             f"🎶 Canciones seleccionadas (Lv {low}–{high}) "
@@ -492,6 +525,8 @@ class Matchmaking(commands.Cog):
         )
 
         room_info["started"] = True
+        room_info["closed"]  = True        # ← NUEVO: cerrar para nuevos /c
+        self.inactivity.pop(thread.id, None)  # ← NUEVO: deja de pingear AFK de inmediato
 
 
     @app_commands.command(
@@ -551,17 +586,23 @@ class Matchmaking(commands.Cog):
         if is_join_thread:
             thread = ch
         else:
+            join_chan = ch
+            players   = [m for m in join_chan.members if not m.bot]
             thread = await join_chan.create_thread(
                 name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
-            self.rooms[max(self.rooms.keys(), default=0)+1] = {
+            new_id = max(self.rooms.keys(), default=0) + 1
+            self.rooms[new_id] = {
                 "players": players.copy(),
                 "thread": thread,
                 "category_id": join_chan.category_id or 0,
-                "closed": True,
+                "closed": True,               # ← ya cerrada para que /c no meta más
             }
+            room_entry = self.rooms[new_id]   # ← IMPORTANTE
+
+
 
         # — 6) Filtrar diffs según el rango (lo, hi)
         allowed_diffs = DIFFICULTY_PRIORITY
@@ -582,14 +623,20 @@ class Matchmaking(commands.Cog):
         # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas
         # … dentro de start()
         song_lines = "\n".join(
-            f"{i+1}. **{t}** (Lv {random.randint(lo, hi)} {df}) [{nts} notas]"
-            for i,(t,_,df,nts) in enumerate(picks)
+            f"{i+1}. **{t}** (Lv {lvl} {df}) [{nts} notas]"
+            for i,(t,lvl,df,nts) in enumerate(picks)
         )
+
 
         await thread.send(
             f"🎶 Canciones seleccionadas (Lv {lo}–{hi}) "
             f"(Total {total_notes} notas) 🎶\n{song_lines}"
         )
+
+        room_entry["started"] = True       # ← NUEVO
+        room_entry["closed"]  = True       # ← NUEVO
+        self.inactivity.pop(thread.id, None)  # ← NUEVO
+
 
 
         # — 9) Confirmación efímera al invocador —
@@ -670,6 +717,7 @@ class Matchmaking(commands.Cog):
             if (
                 info["category_id"] == current_cat
                 and not info.get("closed", False)    # ← ignorar salas cerradas
+                and not info.get("started", False)   # ← NUEVO: no meter a salas iniciadas
                 and len(info["players"]) < 5
             ):
                 best_rid = rid
@@ -707,7 +755,7 @@ class Matchmaking(commands.Cog):
         room["players"].append(member)
 
         await interaction.response.send_message(
-            f"Joined room{best_rid}.", ephemeral=True
+            f"Joined room {best_rid}.", ephemeral=True
         )
         await ch.send(f"**{member.display_name}** Joined room {best_rid} (MMR {mmr_val})")
         await room["thread"].add_user(member)
@@ -821,9 +869,9 @@ class Matchmaking(commands.Cog):
     @commands.command(name="debug_poll")
     async def debug_poll(self, ctx: commands.Context):
         songs = await self._get_9_songs(1, 99)
-        await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones", ephemeral=True)
+        await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones")
         if not songs:
-            return await ctx.send("⚠️ No hay canciones en debug_poll.", ephemeral=True)
+            return await ctx.send("⚠️ No hay canciones en debug_poll.")
         random.shuffle(songs)
         await ctx.send(
             "🎵 Canciones aleatorias:\n" + "\n".join(
@@ -832,32 +880,20 @@ class Matchmaking(commands.Cog):
             )
         )
 
+    @staticmethod
     def get_role_from_notes(stats):
         # stats: [perfect, great, good, bad, miss]
         perfect, great, good, bad, miss = stats
-
-        # 1) Si solo hay perfects y nada más → Master
         if perfect > 0 and great == 0 and good == 0 and bad == 0 and miss == 0:
             return "Master"
-
-        # 2) Mapeo según total de notas no-perfect
         total = great + good + bad + miss
-
-        if total <= 5:
-            return "Crystal"
-        elif total <= 15:
-            return "Diamond"
-        elif total <= 30:
-            return "Platinum"
-        elif total <= 50:
-            return "Gold"
-        elif total <= 100:
-            return "Silver"
-        elif total <= 250:
-            return "Bronze"
-        else:
-            return "Iron"
-
+        if total <= 5: return "Crystal"
+        elif total <= 15: return "Diamond"
+        elif total <= 30: return "Platinum"
+        elif total <= 50: return "Gold"
+        elif total <= 100: return "Silver"
+        elif total <= 250: return "Bronze"
+        else: return "Iron"
 
 
     @commands.command(name="submit")
@@ -975,60 +1011,34 @@ class Matchmaking(commands.Cog):
         # ——————————————————————————————
         for p in players_list:
             if p["role"] == "Placement":
-                bonus_role      = get_role_from_notes(p["stats"])
+                bonus_role      = self.get_role_from_notes(p["stats"])
                 p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
             else:
                 p["mmr_actual"] = p["old"]
 
         # ——————————————————————————————
-        # FASE 2: delta posicional escalado con underdog/favourite adjustment
         # ——————————————————————————————
+        # FASE 2 (NUEVA): Elo por pares con K fijo (sin 'games')
+        # ——————————————————————————————
+        # players_list YA está ORDENADA por puntos (1º…n)
         # Ordenar por puntos (total), mayor a menor
         players_list.sort(key=lambda x: x["total"], reverse=True)
-
-        avg  = sum(p["mmr_actual"] for p in players_list) / n
-        unit = max(1, int(avg // 20))
-
-        if   n == 5:
-            mu_map = {1:1.5, 2:1.0, 3:0.5, 4:-1.0, 5:-1.5}
-        elif n == 4:
-            mu_map = {1:1.5, 2:0.75, 3:-0.5, 4:-1.5}
-        elif n == 3:
-            mu_map = {1:1.0, 2:0.0, 3:-1.0}
-        elif n == 2:
-            mu_map = {1:0.75, 2:-0.75}
-        else:
-            raise RuntimeError(f"Sala inválida: espera 2–5 jugadores, no {n}")
+        ratings = [p["mmr_actual"] for p in players_list]
+        order   = list(range(len(players_list)))  # 0..n-1 ya en orden final
+        deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
 
         summary = []
-        for idx, p in enumerate(players_list, start=1):
-            mmr_prev = p["mmr_actual"]
-            base_raw = mu_map[idx] * unit
-            base     = max(-39, min(39, int(base_raw)))
-
-            rel = (mmr_prev - avg) / avg
-
-            if idx == 1:
-                # Ganador: underdog bonus / favorito nerf
-                adj   = max(-0.5, min(0.5, -rel))
-                scale = 1 + adj
-            elif idx == n:
-                # Perdedor: underdog penaliza menos / favorito penaliza más
-                adj   = max(-0.5, min(0.5, rel))
-                scale = 1 + adj
-            else:
-                # Intermedios: comportamiento neutro
-                scale = 1 - min(abs(rel), 0.5)
-
-            mmr_delta = int(base * scale)
+        for (idx, p), mmr_delta in zip(enumerate(players_list, start=1), deltas):
+            mmr_prev  = p["mmr_actual"]
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
 
-            # … dentro de for p in players_list: …
+            # Actualiza BD (sin 'games')
             await self.db_pool.execute(
                 "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
                 mmr_final, role_name, p["cc"], p["member"].id
             )
+
             # Actualiza roles en Discord
             role_id = RANK_ROLE_IDS.get(role_name)
             if role_id:
@@ -1036,10 +1046,10 @@ class Matchmaking(commands.Cog):
                 old_ranks  = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
                 keep_roles = [r for r in p["member"].roles if r.id not in old_ranks]
                 await p["member"].edit(roles=keep_roles + [role_obj])
+
             # Actualiza nickname
             await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
 
-            # Añade a summary para la tabla
             med = medals.get(idx, str(idx))
             summary.append((
                 med,
@@ -1050,6 +1060,7 @@ class Matchmaking(commands.Cog):
                 mmr_delta,
                 mmr_final
             ))
+
 
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
@@ -1075,140 +1086,6 @@ class Matchmaking(commands.Cog):
             rooms.pop(rid, None)
         rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
-
-
-
-        @commands.command(name="update")
-        async def update(self, ctx: commands.Context, *, block: str):
-            if ctx.author.id != 878310498720940102:
-                return await ctx.send("❌ Solo el administrador puede usar este comando.")
-
-            # Parseo de líneas y cálculo de 'total'
-            lines = [l.strip() for l in block.split("\n") if l.strip()]
-            ENTRY_RE = re.compile(
-                r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
-            )
-            players_list = []
-            for ln in lines:
-                m = ENTRY_RE.match(ln)
-                if not m:
-                    return await ctx.send(f"❌ Línea inválida: `{ln}`")
-                uid   = int(m.group("id"))
-                cc    = m.group("cc")
-                stats = list(map(int, m.group("stats").split(",")))
-                old, role = await self.fetch_player(uid)
-                total = sum(s*w for s, w in zip(stats, [5,3,2,1,0]))
-                players_list.append({
-                    "uid":   uid,
-                    "cc":    cc,
-                    "stats": stats,
-                    "old":   old,
-                    "role":  role,
-                    "total": total
-                })
-
-            n = len(players_list)
-            if not (2 <= n <= 5):
-                return await ctx.send("Room must have between 2-5 players")
-            
-                # — Valida que cada línea tenga la suma de notas correcta —
-            expected = room_entry.get("total_notes")  # o como llames al dict de la sala
-            if expected is not None:
-                for idx, ln in enumerate(lines, start=1):
-                    stats = list(map(int, ln.rsplit(" ", 1)[-1].split(",")))
-                    if sum(stats) != expected:
-                        return await ctx.send(
-                            f"there is an error on the calculation on line {idx}: "
-                            f"{sum(stats)} ≠ {expected}"
-                        )
-
-
-            # Ordenar por total (descendente)
-            players_list.sort(key=lambda x: x["total"], reverse=True)
-
-            # ——————————————————————————————
-            # FASE 1: bonus fijo para Placement
-            # ——————————————————————————————
-            for p in players_list:
-                if p["role"] == "Placement":
-                    bonus_role      = get_role_from_notes(p["stats"])
-                    p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
-                else:
-                    p["mmr_actual"] = p["old"]
-
-            # ——————————————————————————————
-            # FASE 2: delta posicional escalado con underdog/favourite adjustment
-            # ——————————————————————————————
-            avg  = sum(p["mmr_actual"] for p in players_list) / n
-            unit = max(1, int(avg // 20))
-
-            if   n == 5:
-                mu_map = {1:1.5, 2:1.0, 3:0.5, 4:-1.0, 5:-1.5}
-            elif n == 4:
-                mu_map = {1:1.5, 2:0.75, 3:-0.5, 4:-1.5}
-            elif n == 3:
-                mu_map = {1:1.0, 2:0.0, 3:-1.0}
-            elif n == 2:
-                mu_map = {1:0.75, 2:-0.75}
-            else:
-                raise RuntimeError(f"Sala inválida: espera 2–5 jugadores, no {n}")
-
-            summary = []
-            medals = {1:"🥇", 2:"🥈", 3:"🥉"}
-            old_ranks = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
-            for idx, p in enumerate(players_list, start=1):
-                mmr_prev = p["mmr_actual"]
-                base_raw = mu_map[idx] * unit
-                base     = max(-39, min(39, int(base_raw)))
-
-                rel = (mmr_prev - avg) / avg
-
-                if idx == 1:
-                    adj   = max(-0.5, min(0.5, -rel))
-                    scale = 1 + adj
-                elif idx == n:
-                    adj   = max(-0.5, min(0.5, rel))
-                    scale = 1 + adj
-                else:
-                    scale = 1 - min(abs(rel), 0.5)
-
-                mmr_delta = int(base * scale)
-                mmr_final = mmr_prev + mmr_delta
-                role_name = get_rank_from_mmr(mmr_final)
-
-                # BD
-                await self.db_pool.execute(
-                    "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
-                    mmr_final, role_name, p["uid"]
-                )
-                # Discord: rol y nickname
-                member = ctx.guild.get_member(p["uid"])
-                if member:
-                    if role_id := RANK_ROLE_IDS.get(role_name):
-                        keep = [r for r in member.roles if r.id not in old_ranks]
-                        await member.edit(roles=keep + [ctx.guild.get_role(role_id)])
-                    await member.edit(nick=f"{member.display_name} [{role_name}]")
-
-                # Resumen para tabla
-                med = medals.get(idx, str(idx))
-                summary.append((
-                    med,
-                    member.display_name if member else f"<@{p['uid']}>",
-                    p["total"],
-                    p["stats"],
-                    mmr_prev,
-                    mmr_delta,
-                    mmr_final
-                ))
-
-            # Tabla resultado
-            table = "**🏆 Posiciones finales (admin update) 🏆**\n"
-            table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
-            for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
-                pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-                table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
-            await ctx.send(table)
-
 
 
 async def setup(bot: commands.Bot):
