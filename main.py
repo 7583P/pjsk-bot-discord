@@ -14,8 +14,9 @@ GUILD_ID = os.getenv("GUILD_ID", "")
 # Configurar intents
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 intents.guilds = True
-intents.members = True  # Necesario para on_member_join
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 class MyBot(commands.Bot):
     def __init__(self):

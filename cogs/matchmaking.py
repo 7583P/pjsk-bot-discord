@@ -18,6 +18,7 @@ ALLOWED_JOIN_CHANNELS = {
     1378215330979254402,  # jp-pjsk   → #join
 }
 
+
 # — Mapeo de canal #join → canal #results —
 JOIN_TO_RESULTS = {
     1371307353437110282: 1371307931294892125,  # pjsk-queue → #results-pjsk
@@ -285,6 +286,70 @@ class Matchmaking(commands.Cog):
             out = [max(-cap, min(cap, d)) for d in out]
         return out
 
+    async def resolve_member_name(self, guild: discord.Guild, user_id: int) -> str:
+        """Nick del servidor > global display name > username."""
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                return f"ID:{user_id}"
+        return member.nick or getattr(member, "global_name", None) or member.name
+
+    async def _render_room_board_text(self, guild: discord.Guild, rid: int, capacity: int = 5) -> str:
+        """Construye el texto 'Room X: 2/5 Players · Average MMR YYY' + lista ordenada por MMR."""
+        info = self.rooms.get(rid)
+        if not info:
+            return ""
+        players = info["players"]
+
+        # Construye filas (user_id, mmr) y ordena por MMR desc
+        rows = []
+        for m in players:
+            mmr, _ = await self.fetch_player(m.id)
+            rows.append({"user_id": m.id, "mmr": int(mmr)})
+        rows.sort(key=lambda r: r["mmr"], reverse=True)
+
+        avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
+        header = f"Room {rid}: {len(rows)}/{capacity} Players · Average MMR {avg}"
+
+        lines = []
+        for r in rows:
+            name = await self.resolve_member_name(guild, r["user_id"])
+            lines.append(f"• {name} ({r['mmr']})")
+
+        ts = int(datetime.datetime.utcnow().timestamp())
+        return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
+
+    async def update_room_board(self, guild: discord.Guild, rid: int):
+        """Crea/edita el mensaje 'tablero' del room en su thread."""
+        info = self.rooms.get(rid)
+        if not info:
+            return
+        thread: discord.Thread = info["thread"]
+        content = await self._render_room_board_text(guild, rid)
+
+        msg_id = info.get("board_msg_id")
+        if msg_id:
+            try:
+                msg = await thread.fetch_message(msg_id)
+                await msg.edit(content=content)
+                return
+            except discord.NotFound:
+                info.pop("board_msg_id", None)
+
+        msg = await thread.send(content)
+        try:
+            await msg.pin()
+        except Exception:
+            pass
+        info["board_msg_id"] = msg.id
+
+    async def refresh_rooms_board_for_guild(self, guild: discord.Guild):
+        """Re-renderiza todos los rooms del guild (para cambios de nombres)."""
+        for rid, info in list(self.rooms.items()):
+            if info["thread"].guild.id == guild.id:
+                await self.update_room_board(guild, rid)
 
 
     @staticmethod
@@ -339,8 +404,10 @@ class Matchmaking(commands.Cog):
                     players.remove(member)
                     data.pop(member.id, None)
                     await thread.send(
-                        f"{member.mention} have been kicked due to inactivity"
+                        f"{member.mention} has been kicked due to inactivity"
                     )
+                    if players:
+                        await self.update_room_board(thread.guild, rid)
 
                     # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
                     if not players:
@@ -383,6 +450,18 @@ class Matchmaking(commands.Cog):
         # 4) ¡Procesar comandos!
         await self.bot.process_commands(message)
 
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        # cambio de nickname en el servidor
+        if before.nick != after.nick:
+            await self.refresh_rooms_board_for_guild(after.guild)
+
+    @commands.Cog.listener()
+    async def on_user_update(self, before: discord.User, after: discord.User):
+        # cambio de display name/username global
+        for g in self.bot.guilds:
+            if g.get_member(after.id):
+                await self.refresh_rooms_board_for_guild(g)
 
 
     async def cog_load(self):
@@ -690,6 +769,14 @@ class Matchmaking(commands.Cog):
             new_rooms[idx] = info
         self.rooms = new_rooms
 
+                # Re-render para que el encabezado del tablero refleje el nuevo índice
+        for rid in self.rooms.keys():
+            try:
+                await self.update_room_board(guild, rid)
+            except Exception:
+                pass
+
+
     @app_commands.command(name="c", description="Join a room")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
@@ -759,6 +846,8 @@ class Matchmaking(commands.Cog):
         )
         await ch.send(f"**{member.display_name}** Joined room {best_rid} (MMR {mmr_val})")
         await room["thread"].add_user(member)
+        await self.update_room_board(interaction.guild, best_rid)
+
 
         await self.sort_and_rename_rooms(interaction.guild)
         if len(room["players"]) == 5:
@@ -788,7 +877,7 @@ class Matchmaking(commands.Cog):
             if member in info["players"]:
                 # Quitar del thread y de la lista
                 info["players"].remove(member)
-                await info["thread"].send(f"**{member.display_name}** Leaved")
+                await info["thread"].send(f"**{member.display_name}** left")
                 try:
                     await info["thread"].remove_user(member)
                 except:
@@ -803,6 +892,9 @@ class Matchmaking(commands.Cog):
                         pass
                     self.rooms.pop(rid)
                     self.bot.dispatch('room_finished', rid)
+                else:
+                    await self.update_room_board(interaction.guild, rid)
+
 
                 # Confirmación al usuario y reordenar
                 await interaction.response.send_message(
@@ -814,6 +906,7 @@ class Matchmaking(commands.Cog):
         # Si no lo encontramos en ninguna sala válida
         await interaction.response.send_message(
             "You are not in a room", ephemeral=True
+            
         )
 
 
