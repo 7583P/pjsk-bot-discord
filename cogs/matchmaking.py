@@ -85,32 +85,32 @@ BRACKET_RANGES = {
     "Legend":        (32, 37),
 }
 
-
+MIN_LEVEL_GAP = 2
 
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
-    # Calcula el centro y el gap de cada rango
-    centers = []
-    gaps = []
+    centers, gaps = [], []
     for rank, num in counts.items():
         if num > 0:
             lo, hi = BRACKET_RANGES[rank]
             center = round((lo + hi) / 2)
-            gap = hi - lo
+            gap    = hi - lo
             centers.extend([center] * num)
             gaps.extend([gap] * num)
-    # Si no hay jugadores, usa Placement
+
+    # Si no hay jugadores, usa Placement con gap mínimo garantizado
     if not centers:
-        return BRACKET_RANGES["Placement"]
+        lo, hi = BRACKET_RANGES["Placement"]
+        if (hi - lo) < MIN_LEVEL_GAP:
+            hi = lo + MIN_LEVEL_GAP
+        return lo, hi
 
-    # Promedio de centros y de gaps
     avg_center = round(sum(centers) / len(centers))
-    avg_gap = round(sum(gaps) / len(gaps))
+    # Forzamos un gap mínimo (> 1) sin caer en 1 por redondeos
+    avg_gap    = max(MIN_LEVEL_GAP, round(sum(gaps) / len(gaps)))
 
-    # Calcula nuevo low-high usando el gap promedio
-    low = max(1, avg_center - avg_gap // 2)
+    low  = max(1, avg_center - avg_gap // 2)
     high = low + avg_gap
     return low, high
-
 
 
 
@@ -500,18 +500,40 @@ class Matchmaking(commands.Cog):
                 diffs  = await grab("musicDifficulties")
 
             title = {m["id"]: m["title"] for m in musics}
-            rows = [
-                (
-                    d["musicId"],
-                    title[d["musicId"]],
-                    d["musicDifficulty"],
-                    d["playLevel"],
-                    # Usamos notesCount (JSON) o, si existiera, noteCount
-                    d.get("notesCount", d.get("noteCount", 0))
-                )
-                for d in diffs
-                if d["musicDifficulty"] in DIFFICULTY_PRIORITY
-            ]
+
+            rows = []
+            for d in diffs:
+                if d["musicDifficulty"] in DIFFICULTY_PRIORITY:
+                    # — Calcular notas totales de forma robusta —
+                    notes_total = d.get("notesCount", None)
+
+                    # notesCount puede venir como dict o como lista de objetos
+                    if isinstance(notes_total, dict):
+                        notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
+                    elif isinstance(notes_total, list):
+                        t = 0
+                        for it in notes_total:
+                            if isinstance(it, dict):
+                                v = it.get("count") or it.get("notes") or 0
+                                if isinstance(v, int):
+                                    t += v
+                        notes_total = t
+
+                    # Fallbacks comunes
+                    if not isinstance(notes_total, int):
+                        notes_total = d.get("noteCount") or d.get("totalNoteCount") or 0
+                        notes_map   = d.get("notes")
+                        if isinstance(notes_map, dict):
+                            notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
+
+                    rows.append((
+                        d["musicId"],
+                        title.get(d["musicId"], f"ID {d['musicId']}"),
+                        d["musicDifficulty"],
+                        d["playLevel"],
+                        int(notes_total or 0),
+                    ))
+
             async with self.db_pool.acquire() as conn:
                 await conn.execute("DROP TABLE IF EXISTS songs")
                 await conn.execute(
