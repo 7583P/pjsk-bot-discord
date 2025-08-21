@@ -249,11 +249,19 @@ class Top100View(View):
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
-        "https://raw.githubusercontent.com/"
+
         "Sekai-World/sekai-master-db-en-diff/main"
     )
     # Ahora usamos la prioridad global
     DIFFS = DIFFICULTY_PRIORITY
+
+    def _find_player_room_id(self, member: discord.Member) -> int | None:
+        for rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if member in info.get("players", []):
+                return rid
+        return None
 
     @staticmethod
     def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
@@ -468,27 +476,49 @@ class Matchmaking(commands.Cog):
         # Pool global de PostgreSQL
         self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         async with self.db_pool.acquire() as conn:
+            # Jugadores
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS players (
                     user_id BIGINT PRIMARY KEY,
                     mmr     INTEGER DEFAULT 0,
-                    role    TEXT DEFAULT 'Placement'
+                    role    TEXT    DEFAULT 'Placement',
+                    country TEXT    DEFAULT ''
                 );
                 """
             )
-            # --- AÑADIDO: columna para almacenar país (2 letras) ---
+            # (Compat) por si faltaba la columna country en instalaciones previas
             await conn.execute(
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
+
+            # Canciones (catálogo global). PRIMARY KEY (id, diff) para UPSERT limpio
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS songs (
+                    id           INTEGER NOT NULL,
+                    title        TEXT    NOT NULL,
+                    diff         TEXT    NOT NULL,
+                    level        INTEGER NOT NULL,
+                    notes_count  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (id, diff)
+                );
+                """
+            )
+            # Índice por rango de nivel para selects rápidos
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_songs_level ON songs(level);"
+            )
+
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
         await self.refresh_songs()
 
+
     async def cog_unload(self):
         await self.db_pool.close()
 
-    @tasks.loop(hours=6)
+    @tasks.loop(hours=1)  # ← cada 1 hora
     async def refresh_songs(self):
         async with self._songs_lock:
             async with aiohttp.ClientSession() as s:
@@ -496,59 +526,58 @@ class Matchmaking(commands.Cog):
                     async with s.get(f"{self.RAW_EN}/{name}.json") as r:
                         return await r.json(content_type=None)
 
+                # Catálogo GLOBAL (en)
                 musics = await grab("musics")
                 diffs  = await grab("musicDifficulties")
 
-            title = {m["id"]: m["title"] for m in musics}
+            title_by_id = {m["id"]: m["title"] for m in musics}
 
             rows = []
             for d in diffs:
-                if d["musicDifficulty"] in DIFFICULTY_PRIORITY:
-                    # — Calcular notas totales de forma robusta —
-                    notes_total = d.get("notesCount", None)
+                if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
+                    continue
 
-                    # notesCount puede venir como dict o como lista de objetos
-                    if isinstance(notes_total, dict):
-                        notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
-                    elif isinstance(notes_total, list):
-                        t = 0
-                        for it in notes_total:
-                            if isinstance(it, dict):
-                                v = it.get("count") or it.get("notes") or 0
-                                if isinstance(v, int):
-                                    t += v
-                        notes_total = t
+                # Total de notas robusto
+                notes_total = d.get("notesCount", None)
+                if isinstance(notes_total, dict):
+                    notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
+                elif isinstance(notes_total, list):
+                    t = 0
+                    for it in notes_total:
+                        if isinstance(it, dict):
+                            v = it.get("count") or it.get("notes") or 0
+                            if isinstance(v, int):
+                                t += v
+                    notes_total = t
+                if not isinstance(notes_total, int):
+                    notes_total = d.get("noteCount") or d.get("totalNoteCount") or 0
+                    notes_map   = d.get("notes")
+                    if isinstance(notes_map, dict):
+                        notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
 
-                    # Fallbacks comunes
-                    if not isinstance(notes_total, int):
-                        notes_total = d.get("noteCount") or d.get("totalNoteCount") or 0
-                        notes_map   = d.get("notes")
-                        if isinstance(notes_map, dict):
-                            notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
+                rows.append((
+                    d["musicId"],
+                    title_by_id.get(d["musicId"], f"ID {d['musicId']}"),
+                    d["musicDifficulty"],
+                    int(d["playLevel"]),
+                    int(notes_total or 0),
+                ))
 
-                    rows.append((
-                        d["musicId"],
-                        title.get(d["musicId"], f"ID {d['musicId']}"),
-                        d["musicDifficulty"],
-                        d["playLevel"],
-                        int(notes_total or 0),
-                    ))
-
+            # UPSERT (sin borrar la tabla)
             async with self.db_pool.acquire() as conn:
-                await conn.execute("DROP TABLE IF EXISTS songs")
-                await conn.execute(
-                    """CREATE TABLE songs(
-                        id INTEGER,
-                        title TEXT,
-                        diff TEXT,
-                        level INTEGER,
-                        notes_count INTEGER
-                    )"""
-                )
                 await conn.executemany(
-                    "INSERT INTO songs VALUES($1, $2, $3, $4, $5)", rows
+                    """
+                    INSERT INTO songs (id, title, diff, level, notes_count)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (id, diff) DO UPDATE
+                    SET title = EXCLUDED.title,
+                        level = EXCLUDED.level,
+                        notes_count = EXCLUDED.notes_count
+                    """,
+                    rows
                 )
-        print("[songs] Catálogo actualizado")
+        print("[songs] Catálogo global actualizado (UPSERT)")
+
 
     @refresh_songs.before_loop
     async def _wait_ready(self):
@@ -569,15 +598,27 @@ class Matchmaking(commands.Cog):
                     low, high, *diffs
                 )
 
-        by_lvl = {lvl: [] for lvl in range(high, low - 1, -1)}
+        # Agrupar por nivel
+        songs_by_lvl = {}
         for r in rows:
-            title_, lvl, diff, notes = r["title"], r["level"], r["diff"], r["notes_count"]
-            by_lvl[lvl].append((title_, lvl, diff.capitalize(), notes))
+            lvl = r["level"]
+            songs_by_lvl.setdefault(lvl, []).append(
+                (r["title"], lvl, r["diff"].capitalize(), int(r["notes_count"]))
+            )
 
         picks = []
+        # Recorre niveles de mayor a menor y toma hasta 3 al azar por nivel
         for lvl in range(high, low - 1, -1):
-            picks.extend(by_lvl[lvl][:3])
+            pool = songs_by_lvl.get(lvl, [])
+            if not pool:
+                continue
+            k = min(3, len(pool))
+            picks.extend(random.sample(pool, k))
+
+        # Mezcla global y recorta a 9
+        random.shuffle(picks)
         return picks[:9]
+
 
 
 
@@ -810,14 +851,22 @@ class Matchmaking(commands.Cog):
                 ephemeral=True
             )
 
-        # — Resto de tu lógica igual que antes —
+        member = interaction.user
+
+        # ⛔️ Guard: ya estás en una sala activa
+        already = self._find_player_room_id(member)
+        if already is not None:
+            return await interaction.response.send_message(
+                f"❌ You are already in room {already}. Use **/d** to leave before joining another.",
+                ephemeral=True
+            )
+
         # Determinar la categoría padre (si viene de Thread)
         parent_chan = ch
         if isinstance(parent_chan, Thread) and parent_chan.parent:
             parent_chan = parent_chan.parent
         current_cat = parent_chan.category_id or 0
 
-        member = interaction.user
         mmr_val, _ = await self.fetch_player(member.id)
 
         # Buscar sala NO cerrada en esta categoría
@@ -825,13 +874,13 @@ class Matchmaking(commands.Cog):
         for rid, info in self.rooms.items():
             if (
                 info["category_id"] == current_cat
-                and not info.get("closed", False)    # ← ignorar salas cerradas
-                and not info.get("started", False)   # ← NUEVO: no meter a salas iniciadas
+                and not info.get("closed", False)      # ignorar salas cerradas
+                and not info.get("started", False)     # no meter a salas iniciadas
                 and len(info["players"]) < 5
             ):
                 best_rid = rid
                 break
-            
+
         # Crear sala si no hay
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
@@ -842,12 +891,16 @@ class Matchmaking(commands.Cog):
                 invitable=False
             )
             self.rooms[new_id] = {
-                "players": [], "thread": thread,
+                "players": [],
+                "thread": thread,
                 "category_id": current_cat,
+                "closed": False,
+                "started": False,
+                "finished": False,
             }
             best_rid = new_id
 
-            # Borrar aviso automático
+            # Borrar el aviso automático del sistema
             async for msg in ch.history(limit=5):
                 if msg.type == MessageType.thread_created and msg.author == interaction.user:
                     await msg.delete()
@@ -859,7 +912,7 @@ class Matchmaking(commands.Cog):
         room = self.rooms[best_rid]
         if member in room["players"]:
             return await interaction.response.send_message(
-                "You are already in a room", ephemeral=True
+                "You are already in this room", ephemeral=True
             )
         room["players"].append(member)
 
@@ -870,10 +923,12 @@ class Matchmaking(commands.Cog):
         await room["thread"].add_user(member)
         await self.update_room_board(interaction.guild, best_rid)
 
-
         await self.sort_and_rename_rooms(interaction.guild)
+
+        # Auto-start si llega a 5
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
+
 
 
     @app_commands.command(name="d", description="Salir de la sala")
