@@ -6,11 +6,24 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
+import aiohttp, logging, asyncio
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
+log = logging.getLogger(__name__)
+
+# === BLOQUE: URLs del dataset (EN) + fallback (JP) ===
+SEKAI_BASE = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-en-diff/main"
+ALT_BASE   = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/main"  # fallback JP
+
+MUSICS_URL       = f"{SEKAI_BASE}/musics.json"
+DIFFICULTIES_URL = f"{SEKAI_BASE}/musicDifficulties.json"
+VOCALS_URL       = f"{SEKAI_BASE}/musicVocals.json"
+
+# Seguridad: asegura que no sean rutas relativas (causan InvalidUrlClientError)
+assert MUSICS_URL.startswith("http") and DIFFICULTIES_URL.startswith("http")
 # ———————————————————————————————————————————————
 # — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
@@ -245,23 +258,53 @@ class Top100View(View):
 
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
+        
+    async def _http_json(url: str):
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
+                r.raise_for_status()
+                return await r.json(content_type=None)
 
 
 class Matchmaking(commands.Cog):
-    RAW_EN = (
+    def __init__(self, bot):
+        self.bot = bot
+        # --- INICIO: para catálogo de canciones ---
+        self.songs = []
+        self.difficulties = []
+        # refresco cada hora
+        self.refresh_songs.start()
+        # primer fetch inmediato (sin esperar 1h)
+        asyncio.create_task(self._prime_songs())
+        # --- FIN ---
 
-        "Sekai-World/sekai-master-db-en-diff/main"
-    )
-    # Ahora usamos la prioridad global
-    DIFFS = DIFFICULTY_PRIORITY
+    # === BLOQUE: primer fetch inmediato al arrancar ===
+    async def _prime_songs(self):
+        await self.bot.wait_until_ready()
+        await self._fetch_songs_once()
 
-    def _find_player_room_id(self, member: discord.Member) -> int | None:
-        for rid, info in self.rooms.items():
-            if info.get("finished", False):
-                continue
-            if member in info.get("players", []):
-                return rid
-        return None
+    # === BLOQUE: función que realmente descarga y asigna ===
+    async def _fetch_songs_once(self):
+        try:
+            musics = await _http_json(MUSICS_URL)
+            diffs  = await _http_json(DIFFICULTIES_URL)
+        except Exception as e:
+            log.warning("Fallo EN, uso fallback JP: %s", e)
+            musics = await _http_json(f"{ALT_BASE}/musics.json")
+            diffs  = await _http_json(f"{ALT_BASE}/musicDifficulties.json")
+        self.songs = musics
+        self.difficulties = diffs
+
+    # === BLOQUE: tarea periódica cada hora ===
+    from discord.ext import tasks
+    @tasks.loop(hours=1)
+    async def refresh_songs(self):
+        await self._fetch_songs_once()
+
+    @refresh_songs.before_loop
+    async def _wait_ready_for_loop(self):
+        await self.bot.wait_until_ready()
+
 
     @staticmethod
     def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
