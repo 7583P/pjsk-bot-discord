@@ -688,8 +688,8 @@ class Matchmaking(commands.Cog):
 
 
         await thread.send(
-            f"🎶 Canciones seleccionadas (Lv {low}–{high}) "
-            f"(Total {total_notes} notas) 🎶\n{song_lines}"
+            f"Selected songs (Lv {low}–{high}) "
+            f"(Total {total_notes} notes) 🎶\n{song_lines}"
         )
 
         room_info["started"] = True
@@ -797,8 +797,8 @@ class Matchmaking(commands.Cog):
 
 
         await thread.send(
-            f"🎶 Canciones seleccionadas (Lv {lo}–{hi}) "
-            f"(Total {total_notes} notas) 🎶\n{song_lines}"
+            f"Selected songs (Lv {lo}–{hi}) "
+            f"(Total {total_notes} notes) 🎶\n{song_lines}"
         )
 
         room_entry["started"] = True       # ← NUEVO
