@@ -248,11 +248,8 @@ class Top100View(View):
 
 
 class Matchmaking(commands.Cog):
-    RAW_EN = (
-
-        "Sekai-World/sekai-master-db-en-diff/main"
-    )
-    # Ahora usamos la prioridad global
+    RAW_EN = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-en-diff/main"
+    RAW_JP = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/main"
     DIFFS = DIFFICULTY_PRIORITY
 
     def _find_player_room_id(self, member: discord.Member) -> int | None:
@@ -518,17 +515,25 @@ class Matchmaking(commands.Cog):
     async def cog_unload(self):
         await self.db_pool.close()
 
-    @tasks.loop(hours=1)  # ← cada 1 hora
+    @tasks.loop(hours=1)
     async def refresh_songs(self):
         async with self._songs_lock:
             async with aiohttp.ClientSession() as s:
-                async def grab(name):
-                    async with s.get(f"{self.RAW_EN}/{name}.json") as r:
+                async def grab(base: str, name: str):
+                    url = f"{base}/{name}.json"
+                    assert url.startswith("http"), f"Invalid base URL: {base}"
+                    async with s.get(url, timeout=20) as r:
+                        r.raise_for_status()
                         return await r.json(content_type=None)
 
-                # Catálogo GLOBAL (en)
-                musics = await grab("musics")
-                diffs  = await grab("musicDifficulties")
+                try:
+                    # Catálogo GLOBAL (EN)
+                    musics = await grab(self.RAW_EN, "musics")
+                    diffs  = await grab(self.RAW_EN, "musicDifficulties")
+                except Exception as e:
+                    log.warning(f"[songs] EN fetch failed ({e}); trying JP fallback…")
+                    musics = await grab(self.RAW_JP, "musics")
+                    diffs  = await grab(self.RAW_JP, "musicDifficulties")
 
             title_by_id = {m["id"]: m["title"] for m in musics}
 
@@ -537,7 +542,7 @@ class Matchmaking(commands.Cog):
                 if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
                     continue
 
-                # Total de notas robusto
+                # Total de notas robusto (mantengo tu lógica)
                 notes_total = d.get("notesCount", None)
                 if isinstance(notes_total, dict):
                     notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
@@ -563,7 +568,6 @@ class Matchmaking(commands.Cog):
                     int(notes_total or 0),
                 ))
 
-            # UPSERT (sin borrar la tabla)
             async with self.db_pool.acquire() as conn:
                 await conn.executemany(
                     """
