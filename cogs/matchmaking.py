@@ -1123,60 +1123,64 @@ class Matchmaking(commands.Cog):
         if len(lines) != n:
             return await ctx.send(f"You should send {n} lines")
         
-        # — Valida que cada línea sume el total de notas esperado —
-        expected = room.get("total_notes")  # o room_entry, usa el nombre de tu variable
-        if expected is not None:
-            for idx, ln in enumerate(lines, start=1):
-                stats = list(map(int, ln.rsplit(" ", 1)[-1].split(",")))
-                if sum(stats) != expected:
-                    return await ctx.send(
-                        f"there is an error on the calculation on line {idx}: "
-                        f"{sum(stats)} ≠ {expected}"
-                    )
-
 
         intro = "✅ React ✅ to validate, ❎ to decline\n```\n" + "\n".join(lines) + "\n```"
         vote_msg = await ctx.send(intro)
         for emo in ("✅", "❎"):
             await vote_msg.add_reaction(emo)
 
-        threshold = n // 2 + 1
+        # Solo pueden votar los jugadores de la sala
+        allowed_voters = {m.id for m in players}
+        threshold = len(allowed_voters) // 2 + 1
+
+        counts = {"✅": 0, "❎": 0}
+        voted  = set()
+
         def check(reaction, user):
             return (
                 reaction.message.id == vote_msg.id
                 and not user.bot
+                and user.id in allowed_voters
                 and str(reaction.emoji) in ("✅", "❎")
             )
+
         ganador = None
-        try:
-            while True:
-                reaction, user = await self.bot.wait_for(
-                    "reaction_add", timeout=60.0, check=check
-                )
-                counts = {
-                    emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
-                    for emo in ("✅", "❎")
-                }
-                if counts["✅"] >= threshold:
-                    ganador = "✅"
-                    break
-                if counts["❎"] >= threshold:
-                    ganador = "❎"
-                    break
-        except asyncio.TimeoutError:
-            counts = {
-                emo: (discord.utils.get(vote_msg.reactions, emoji=emo).count - 1)
-                for emo in ("✅", "❎")
-            }
+        deadline = asyncio.get_event_loop().time() + 60.0  # ventana de 60s
+
+        while ganador is None:
+            timeout = max(0.0, deadline - asyncio.get_event_loop().time())
+            if timeout == 0.0:
+                break
+            try:
+                reaction, user = await self.bot.wait_for("reaction_add", timeout=timeout, check=check)
+            except asyncio.TimeoutError:
+                break
+
+            # evita votos múltiples del mismo usuario
+            if user.id in voted:
+                continue
+
+            choice = str(reaction.emoji)
+            counts[choice] += 1
+            voted.add(user.id)
+
+            if counts["✅"] >= threshold:
+                ganador = "✅"
+            elif counts["❎"] >= threshold:
+                ganador = "❎"
+
+        # Si no alcanzó el umbral, decide por mayoría simple; empate/0 votos = rechazo
+        if ganador is None:
             if counts["✅"] > counts["❎"]:
                 ganador = "✅"
             elif counts["❎"] > counts["✅"]:
                 ganador = "❎"
             else:
-                ganador = "Doubt"
+                ganador = "❎"
 
         if ganador != "✅":
             return await ctx.send("There might be an error, try doing it again.")
+
 
         summary = []
         medals  = {1:"🥇",2:"🥈",3:"🥉"}
