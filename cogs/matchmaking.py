@@ -489,23 +489,45 @@ class Matchmaking(commands.Cog):
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
 
-            # Canciones (catálogo global). PRIMARY KEY (id, diff) para UPSERT limpio
-            await conn.execute(
-                """
+            # Canciones (catálogo global). Si ya existe, no re-crea.
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS songs (
                     id           INTEGER NOT NULL,
                     title        TEXT    NOT NULL,
                     diff         TEXT    NOT NULL,
                     level        INTEGER NOT NULL,
-                    notes_count  INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (id, diff)
+                    notes_count  INTEGER NOT NULL DEFAULT 0
                 );
-                """
-            )
-            # Índice por rango de nivel para selects rápidos
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_songs_level ON songs(level);"
-            )
+            """)
+
+            # — 1) Elimina duplicados previos (deja 1 fila por (id,diff)) —
+            await conn.execute("""
+                DELETE FROM songs a
+                USING songs b
+                WHERE a.id = b.id
+                AND a.diff = b.diff
+                AND a.ctid > b.ctid;
+            """)
+
+            # — 2) Crea restricción única para que ON CONFLICT funcione —
+            await conn.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1
+                        FROM   pg_constraint
+                        WHERE  conname = 'songs_id_diff_key'
+                        AND conrelid = 'songs'::regclass
+                    ) THEN
+                        ALTER TABLE songs
+                        ADD CONSTRAINT songs_id_diff_key UNIQUE (id, diff);
+                    END IF;
+                END$$;
+            """)
+
+            # — 3) Índices útiles —
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_level ON songs(level);")
+
 
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
@@ -573,7 +595,7 @@ class Matchmaking(commands.Cog):
                     """
                     INSERT INTO songs (id, title, diff, level, notes_count)
                     VALUES ($1, $2, $3, $4, $5)
-                    ON CONFLICT (id, diff) DO UPDATE
+                    ON CONFLICT ON CONSTRAINT songs_id_diff_key DO UPDATE
                     SET title = EXCLUDED.title,
                         level = EXCLUDED.level,
                         notes_count = EXCLUDED.notes_count
