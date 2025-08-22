@@ -6,13 +6,21 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
-import aiohttp, logging, asyncio
+import aiohttp
+import logging
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
 log = logging.getLogger(__name__)
+
+# Helper HTTP global (GitHub a veces manda text/plain)
+async def _http_json(url: str):
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, timeout=20) as r:
+            r.raise_for_status()
+            return await r.json(content_type=None)
 
 # === BLOQUE: URLs del dataset (EN) + fallback (JP) ===
 SEKAI_BASE = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-en-diff/main"
@@ -258,53 +266,9 @@ class Top100View(View):
 
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
-        
-    async def _http_json(url: str):
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=20) as r:
-                r.raise_for_status()
-                return await r.json(content_type=None)
 
 
 class Matchmaking(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        # --- INICIO: para catálogo de canciones ---
-        self.songs = []
-        self.difficulties = []
-        # refresco cada hora
-        self.refresh_songs.start()
-        # primer fetch inmediato (sin esperar 1h)
-        asyncio.create_task(self._prime_songs())
-        # --- FIN ---
-
-    # === BLOQUE: primer fetch inmediato al arrancar ===
-    async def _prime_songs(self):
-        await self.bot.wait_until_ready()
-        await self._fetch_songs_once()
-
-    # === BLOQUE: función que realmente descarga y asigna ===
-    async def _fetch_songs_once(self):
-        try:
-            musics = await _http_json(MUSICS_URL)
-            diffs  = await _http_json(DIFFICULTIES_URL)
-        except Exception as e:
-            log.warning("Fallo EN, uso fallback JP: %s", e)
-            musics = await _http_json(f"{ALT_BASE}/musics.json")
-            diffs  = await _http_json(f"{ALT_BASE}/musicDifficulties.json")
-        self.songs = musics
-        self.difficulties = diffs
-
-    # === BLOQUE: tarea periódica cada hora ===
-    from discord.ext import tasks
-    @tasks.loop(hours=1)
-    async def refresh_songs(self):
-        await self._fetch_songs_once()
-
-    @refresh_songs.before_loop
-    async def _wait_ready_for_loop(self):
-        await self.bot.wait_until_ready()
-
 
     @staticmethod
     def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
@@ -555,32 +519,32 @@ class Matchmaking(commands.Cog):
 
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
-        await self.refresh_songs()
+        await self._refresh_songs_once()
 
 
     async def cog_unload(self):
         await self.db_pool.close()
 
-    @tasks.loop(hours=1)  # ← cada 1 hora
-    async def refresh_songs(self):
+    async def _refresh_songs_once(self):
         async with self._songs_lock:
-            async with aiohttp.ClientSession() as s:
-                async def grab(name):
-                    async with s.get(f"{self.RAW_EN}/{name}.json") as r:
-                        return await r.json(content_type=None)
+            # 1) Descargar EN, con fallback JP si falla
+            try:
+                musics = await _http_json(MUSICS_URL)
+                diffs  = await _http_json(DIFFICULTIES_URL)
+            except Exception as e:
+                log.warning("Fallo EN, uso fallback JP: %s", e)
+                musics = await _http_json(f"{ALT_BASE}/musics.json")
+                diffs  = await _http_json(f"{ALT_BASE}/musicDifficulties.json")
 
-                # Catálogo GLOBAL (en)
-                musics = await grab("musics")
-                diffs  = await grab("musicDifficulties")
-
+            # 2) Mapear títulos
             title_by_id = {m["id"]: m["title"] for m in musics}
 
+            # 3) Preparar filas con conteo robusto de notas
             rows = []
             for d in diffs:
                 if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
                     continue
 
-                # Total de notas robusto
                 notes_total = d.get("notesCount", None)
                 if isinstance(notes_total, dict):
                     notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
@@ -606,7 +570,7 @@ class Matchmaking(commands.Cog):
                     int(notes_total or 0),
                 ))
 
-            # UPSERT (sin borrar la tabla)
+            # 4) UPSERT a la tabla songs
             async with self.db_pool.acquire() as conn:
                 await conn.executemany(
                     """
@@ -620,6 +584,11 @@ class Matchmaking(commands.Cog):
                     rows
                 )
         print("[songs] Catálogo global actualizado (UPSERT)")
+
+    # === Loop cada hora que llama al helper ===
+    @tasks.loop(hours=1)
+    async def refresh_songs(self):
+        await self._refresh_songs_once()
 
 
     @refresh_songs.before_loop
