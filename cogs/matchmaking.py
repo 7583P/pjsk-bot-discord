@@ -6,32 +6,11 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
-import aiohttp
-import logging
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
-log = logging.getLogger(__name__)
-
-# Helper HTTP global (GitHub a veces manda text/plain)
-async def _http_json(url: str):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, timeout=20) as r:
-            r.raise_for_status()
-            return await r.json(content_type=None)
-
-# === BLOQUE: URLs del dataset (EN) + fallback (JP) ===
-SEKAI_BASE = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-en-diff/main"
-ALT_BASE   = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/main"  # fallback JP
-
-MUSICS_URL       = f"{SEKAI_BASE}/musics.json"
-DIFFICULTIES_URL = f"{SEKAI_BASE}/musicDifficulties.json"
-VOCALS_URL       = f"{SEKAI_BASE}/musicVocals.json"
-
-# Seguridad: asegura que no sean rutas relativas (causan InvalidUrlClientError)
-assert MUSICS_URL.startswith("http") and DIFFICULTIES_URL.startswith("http")
 # ———————————————————————————————————————————————
 # — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
@@ -269,6 +248,20 @@ class Top100View(View):
 
 
 class Matchmaking(commands.Cog):
+    RAW_EN = (
+
+        "Sekai-World/sekai-master-db-en-diff/main"
+    )
+    # Ahora usamos la prioridad global
+    DIFFS = DIFFICULTY_PRIORITY
+
+    def _find_player_room_id(self, member: discord.Member) -> int | None:
+        for rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if member in info.get("players", []):
+                return rid
+        return None
 
     @staticmethod
     def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
@@ -519,32 +512,32 @@ class Matchmaking(commands.Cog):
 
         # arranca el loop que refresca las canciones
         self.refresh_songs.start()
-        await self._refresh_songs_once()
+        await self.refresh_songs()
 
 
     async def cog_unload(self):
         await self.db_pool.close()
 
-    async def _refresh_songs_once(self):
+    @tasks.loop(hours=1)  # ← cada 1 hora
+    async def refresh_songs(self):
         async with self._songs_lock:
-            # 1) Descargar EN, con fallback JP si falla
-            try:
-                musics = await _http_json(MUSICS_URL)
-                diffs  = await _http_json(DIFFICULTIES_URL)
-            except Exception as e:
-                log.warning("Fallo EN, uso fallback JP: %s", e)
-                musics = await _http_json(f"{ALT_BASE}/musics.json")
-                diffs  = await _http_json(f"{ALT_BASE}/musicDifficulties.json")
+            async with aiohttp.ClientSession() as s:
+                async def grab(name):
+                    async with s.get(f"{self.RAW_EN}/{name}.json") as r:
+                        return await r.json(content_type=None)
 
-            # 2) Mapear títulos
+                # Catálogo GLOBAL (en)
+                musics = await grab("musics")
+                diffs  = await grab("musicDifficulties")
+
             title_by_id = {m["id"]: m["title"] for m in musics}
 
-            # 3) Preparar filas con conteo robusto de notas
             rows = []
             for d in diffs:
                 if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
                     continue
 
+                # Total de notas robusto
                 notes_total = d.get("notesCount", None)
                 if isinstance(notes_total, dict):
                     notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
@@ -570,7 +563,7 @@ class Matchmaking(commands.Cog):
                     int(notes_total or 0),
                 ))
 
-            # 4) UPSERT a la tabla songs
+            # UPSERT (sin borrar la tabla)
             async with self.db_pool.acquire() as conn:
                 await conn.executemany(
                     """
@@ -584,11 +577,6 @@ class Matchmaking(commands.Cog):
                     rows
                 )
         print("[songs] Catálogo global actualizado (UPSERT)")
-
-    # === Loop cada hora que llama al helper ===
-    @tasks.loop(hours=1)
-    async def refresh_songs(self):
-        await self._refresh_songs_once()
 
 
     @refresh_songs.before_loop
