@@ -1205,7 +1205,7 @@ class Matchmaking(commands.Cog):
                 "stats":     stats,
                 "stats_str": stats_str
             })
-
+            ctx.send(f"PLAYER: {current_role}")
         # ——————————————————————————————
         # FASE 1: bonus fijo para Placement
         # ——————————————————————————————
