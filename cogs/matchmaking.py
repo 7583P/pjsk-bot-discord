@@ -1189,7 +1189,7 @@ class Matchmaking(commands.Cog):
         for member, ln in zip(players, lines):
             m = ENTRY_RE.match(ln)
             if not m:
-                return await ctx.send(f"Formato incorrecto para: {players}")
+                return await ctx.send(f"Formato incorrecto para: {ln}")
             uid       = int(m.group("id"))
             cc        = m.group("cc")
             stats     = list(map(int, m.group("stats").split(",")))
@@ -1232,7 +1232,8 @@ class Matchmaking(commands.Cog):
             mmr_prev  = p["mmr_actual"]
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
-
+            ctx.send(f"PLAYER MMR FINAL: {mmr_final}")
+            ctx.send(f"PLAYER MMR PREV: {mmr_prev}")
             # Actualiza BD (sin 'games')
             await self.db_pool.execute(
                 "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
