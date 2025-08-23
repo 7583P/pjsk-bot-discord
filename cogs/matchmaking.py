@@ -1099,6 +1099,8 @@ class Matchmaking(commands.Cog):
         if not room:
             return await ctx.send("Only works inside a room thread")
 
+        await ctx.send(f"ROOM: {room}")
+        # state = room.get(ch.id)
         if not room.started:
             await ctx.send(
                 "start command need to be excecuted first"
