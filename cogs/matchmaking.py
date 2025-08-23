@@ -1099,14 +1099,11 @@ class Matchmaking(commands.Cog):
         if not room:
             return await ctx.send("Only works inside a room thread")
 
-        await ctx.send(f"ROOM: {room}")
-        # state = room.get(ch.id)
-        # if not state or not state.started:
-        #     await ctx.send(
-        #         "start command need to be excecuted first",
-        #         allowed_mentions=ALLOWED_NONE
-        #     )
-        #     return
+        if not room.started:
+            await ctx.send(
+                "start command need to be excecuted first"
+            )
+            return
     
         # Valida que la suma de stats por línea coincida con el total de notas esperado
         expected = room.get("total_notes")
