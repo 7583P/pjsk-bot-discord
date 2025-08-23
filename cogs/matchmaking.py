@@ -1226,14 +1226,15 @@ class Matchmaking(commands.Cog):
         ratings = [p["mmr_actual"] for p in players_list]
         order   = list(range(len(players_list)))  # 0..n-1 ya en orden final
         deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
-
+        await ctx.send(f"PLAYER LIST: {players_list}")
         summary = []
         for (idx, p), mmr_delta in zip(enumerate(players_list, start=1), deltas):
             mmr_prev  = p["mmr_actual"]
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
-            await ctx.send(f"PLAYER MMR FINAL: {mmr_final}")
-            await ctx.send(f"PLAYER MMR PREV: {mmr_prev}")
+            
+            await ctx.send(f"MEMBER ID: {p["member"].id}")
+            await ctx.send(f"MMR: {mmr_final}")
             # Actualiza BD (sin 'games')
             await self.db_pool.execute(
                 "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
