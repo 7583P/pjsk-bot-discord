@@ -1232,8 +1232,8 @@ class Matchmaking(commands.Cog):
             mmr_prev  = p["mmr_actual"]
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
-            ctx.send(f"PLAYER MMR FINAL: {mmr_final}")
-            ctx.send(f"PLAYER MMR PREV: {mmr_prev}")
+            await ctx.send(f"PLAYER MMR FINAL: {mmr_final}")
+            await ctx.send(f"PLAYER MMR PREV: {mmr_prev}")
             # Actualiza BD (sin 'games')
             await self.db_pool.execute(
                 "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
