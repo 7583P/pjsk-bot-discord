@@ -1228,7 +1228,7 @@ class Matchmaking(commands.Cog):
         deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
         await ctx.send(f"PLAYER LIST: {players_list}")
         summary = []
-        for (idx, p), mmr_delta in zip(enumerate(players_list, start=1), deltas):
+        for (idx, p), mmr_delta in zip(enumerate(players_list, start=0), deltas):
             mmr_prev  = p["mmr_actual"]
             mmr_final = mmr_prev + mmr_delta
             role_name = get_rank_from_mmr(mmr_final)
