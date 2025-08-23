@@ -1103,7 +1103,7 @@ class Matchmaking(commands.Cog):
         # state = room.get(ch.id)
         isStarted = room.get("started")
 
-        if not isStarted:
+        if isStarted == "False":
             await ctx.send(
                 "start command need to be excecuted first"
             )
