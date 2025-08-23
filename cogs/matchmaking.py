@@ -1229,43 +1229,64 @@ class Matchmaking(commands.Cog):
         await ctx.send(f"PLAYER LIST: {len(players_list)}")
         await ctx.send(f"PLAYER LIST DELTA:{len(deltas)}")
         summary = []
-        for (idx, p), mmr_delta in zip(enumerate(players_list, start=1), deltas):
-            mmr_prev  = p["mmr_actual"]
-            mmr_final = mmr_prev + mmr_delta
-            role_name = get_rank_from_mmr(mmr_final)
-            
-            await ctx.send(f"MEMBER ID: {p["member"].id}")
-            await ctx.send(f"MMR PREV: {mmr_prev}")
-            await ctx.send(f"MMR FINAL: {mmr_final}")
-            await ctx.send(f"MMR DELTA: {mmr_delta}")
-            # Actualiza BD (sin 'games')
-            await self.db_pool.execute(
-                "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
-                mmr_final, role_name, p["cc"], p["member"].id
-            )
 
-            # Actualiza roles en Discord
-            role_id = RANK_ROLE_IDS.get(role_name)
-            if role_id:
-                role_obj   = ctx.guild.get_role(role_id)
-                old_ranks  = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
-                keep_roles = [r for r in p["member"].roles if r.id not in old_ranks]
-                await p["member"].edit(roles=keep_roles + [role_obj])
+        await ctx.send(f"DEBUG: len(players)={len(players_list)} len(deltas)={len(deltas)} "
+                    f"types: players={type(players_list).__name__} deltas={type(deltas).__name__}")
 
-            # Actualiza nickname
-            await p["member"].edit(nick=f"{p['member'].display_name} [{role_name}]")
+        if len(players_list) != len(deltas):
+            await ctx.send("⚠️ Length mismatch: no voy a usar zip_longest para no desalinear datos.")
+            # Si prefieres fallar explícito:
+            # raise ValueError(f"Length mismatch: {len(players_list)} vs {len(deltas)}")
 
-            med = medals.get(idx, str(idx))
-            summary.append((
-                med,
-                p["member"].display_name,
-                p["total"],
-                p["stats"],
-                mmr_prev,
-                mmr_delta,
-                mmr_final
-            ))
+        for idx, p in enumerate(players_list, start=1):
+            try:
+                mmr_delta = deltas[idx-1]  # evita zip; fácil de razonar
+                mmr_prev  = int(p["mmr_actual"])
+                mmr_final = mmr_prev + int(mmr_delta)
+                role_name = get_rank_from_mmr(mmr_final)
 
+                await ctx.send(f"MEMBER ID: {p['member'].id}")
+                await ctx.send(f"MMR PREV: {mmr_prev}")
+                await ctx.send(f"MMR FINAL: {mmr_final}")
+                await ctx.send(f"MMR DELTA: {mmr_delta}")
+
+                # DB
+                await self.db_pool.execute(
+                    "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
+                    mmr_final, role_name, p["cc"], p["member"].id
+                )
+
+                # Roles
+                role_id = RANK_ROLE_IDS.get(role_name)
+                if role_id:
+                    role_obj = ctx.guild.get_role(role_id)
+                    if role_obj:
+                        old_ranks  = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
+                        keep_roles = [r for r in p["member"].roles if r.id not in old_ranks]
+                        new_roles  = list(dict.fromkeys(keep_roles + [role_obj]))  # sin duplicados
+                        try:
+                            await p["member"].edit(roles=new_roles, reason="Rank update")
+                        except (discord.Forbidden, discord.HTTPException) as e:
+                            await ctx.send(f"⚠️ No pude actualizar roles de {p['member'].mention}: {e}")
+
+                # Nick (cuida jerarquía/longitud 32)
+                if ctx.guild.me.guild_permissions.manage_nicknames:
+                    base = p["member"].display_name
+                    nick = f"{base} [{role_name}]"
+                    if len(nick) > 32:
+                        nick = f"{base[:max(0, 32 - len(role_name) - 3)]} [{role_name}]"
+                    try:
+                        await p["member"].edit(nick=nick)
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
+
+                med = medals.get(idx, str(idx))
+                summary.append((med, p["member"].display_name, p["total"], p["stats"], mmr_prev, mmr_delta, mmr_final))
+
+            except Exception as e:
+                uid = getattr(p.get("member"), "id", "¿?")
+                await ctx.send(f"❌ Fallo en iteración {idx} (user {uid}): {type(e).__name__}: {e}")
+                # opcional: continue
 
         join_parent    = ctx.channel.parent
         result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
