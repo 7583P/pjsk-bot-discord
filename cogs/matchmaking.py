@@ -1226,12 +1226,12 @@ class Matchmaking(commands.Cog):
         ratings = [p["mmr_actual"] for p in players_list]
         order   = list(range(len(players_list)))  # 0..n-1 ya en orden final
         deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
-        await ctx.send(f"PLAYER LIST: {len(players_list)}")
-        await ctx.send(f"PLAYER LIST DELTA:{len(deltas)}")
+        # await ctx.send(f"PLAYER LIST: {len(players_list)}")
+        # await ctx.send(f"PLAYER LIST DELTA:{len(deltas)}")
         summary = []
 
-        await ctx.send(f"DEBUG: len(players)={len(players_list)} len(deltas)={len(deltas)} "
-                    f"types: players={type(players_list).__name__} deltas={type(deltas).__name__}")
+        # await ctx.send(f"DEBUG: len(players)={len(players_list)} len(deltas)={len(deltas)} "
+        #             f"types: players={type(players_list).__name__} deltas={type(deltas).__name__}")
 
         if len(players_list) != len(deltas):
             await ctx.send("⚠️ Length mismatch: no voy a usar zip_longest para no desalinear datos.")
@@ -1245,10 +1245,10 @@ class Matchmaking(commands.Cog):
                 mmr_final = mmr_prev + int(mmr_delta)
                 role_name = get_rank_from_mmr(mmr_final)
 
-                await ctx.send(f"MEMBER ID: {p['member'].id}")
-                await ctx.send(f"MMR PREV: {mmr_prev}")
-                await ctx.send(f"MMR FINAL: {mmr_final}")
-                await ctx.send(f"MMR DELTA: {mmr_delta}")
+                # await ctx.send(f"MEMBER ID: {p['member'].id}")
+                # await ctx.send(f"MMR PREV: {mmr_prev}")
+                # await ctx.send(f"MMR FINAL: {mmr_final}")
+                # await ctx.send(f"MMR DELTA: {mmr_delta}")
 
                 # DB
                 await self.db_pool.execute(
@@ -1299,7 +1299,8 @@ class Matchmaking(commands.Cog):
             table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
         await result_chan.send(table)
         await result_chan.send("MMR Updated")
-
+        await ctx.send(table)
+        await ctx.send("MMR Updated")
         room["finished"] = True
 
         async def close_thread_later(thread, rooms, rid):
