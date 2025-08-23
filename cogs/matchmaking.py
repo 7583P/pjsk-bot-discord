@@ -1189,7 +1189,7 @@ class Matchmaking(commands.Cog):
         for member, ln in zip(players, lines):
             m = ENTRY_RE.match(ln)
             if not m:
-                return await ctx.send(f"Formato incorrecto para: {ln}")
+                return await ctx.send(f"Formato incorrecto para: {players}")
             uid       = int(m.group("id"))
             cc        = m.group("cc")
             stats     = list(map(int, m.group("stats").split(",")))
@@ -1205,7 +1205,7 @@ class Matchmaking(commands.Cog):
                 "stats":     stats,
                 "stats_str": stats_str
             })
-            ctx.send(f"PLAYER: {current_role}")
+            # ctx.send(f"PLAYER: {current_role}")
         # ——————————————————————————————
         # FASE 1: bonus fijo para Placement
         # ——————————————————————————————
