@@ -6,11 +6,13 @@ import datetime
 import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
+import logging
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
+log = logging.getLogger(__name__)
 # ———————————————————————————————————————————————
 # — IDs de los canales #join válidos —
 ALLOWED_JOIN_CHANNELS = {
@@ -427,33 +429,43 @@ class Matchmaking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # 1) Reset de inactividad en hilos privados
-        if isinstance(message.channel, Thread) and not message.author.bot:
-            now = datetime.datetime.utcnow()
-            data = self.inactivity.setdefault(message.channel.id, {})
-            entry = data.setdefault(
-                message.author.id,
-                {"last": now, "warned_at": None}
-            )
-            entry["last"] = now
-            entry["warned_at"] = None
-
-            # 2) Borrar TODO mensaje con mención
-            if message.mentions or message.role_mentions or message.mention_everyone:
-                try:
-                    await message.delete()
-                except:
-                    pass
-                return
-
-        # 3) Ignorar mensajes del bot
+        # Ignorar bots
         if message.author.bot:
             return
 
-        # — Aquí iría cualquier otra cosa que quieras ejecutar por mensaje —
+        # Si es un thread: reset de inactividad + control de menciones
+        if isinstance(message.channel, Thread):
+            now = datetime.datetime.utcnow()
+            data = self.inactivity.setdefault(message.channel.id, {})
+            entry = data.setdefault(message.author.id, {"last": now, "warned_at": None})
+            entry["last"] = now
+            entry["warned_at"] = None
 
-        # 4) ¡Procesar comandos!
+            # ——— BLOQUEO DE PINGS EN HILOS DE SALA ———
+            room = next((r for r in self.rooms.values() if r["thread"].id == message.channel.id), None)
+            if room:
+                allowed_ids = {m.id for m in room["players"]}
+
+                # Bloquear @everyone / @here y pings a roles SIEMPRE
+                if message.mention_everyone or message.role_mentions:
+                    try:
+                        await message.delete()
+                    except:
+                        pass
+                    return
+
+                # Permitir @usuarios solo si TODOS están en la sala
+                if message.mentions:
+                    if any(u.id not in allowed_ids for u in message.mentions):
+                        try:
+                            await message.delete()
+                        except:
+                            pass
+                        return
+
+        # Procesar comandos (después de filtros/borrados)
         await self.bot.process_commands(message)
+
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -649,6 +661,14 @@ class Matchmaking(commands.Cog):
 
 
     async def launch_song_poll(self, room_info):
+        # Evitar re-selección si ya fue iniciada
+        if room_info.get("started"):
+            try:
+                await room_info["thread"].send("songs has been selected")
+            except Exception:
+                pass
+            return
+
         thread  = room_info["thread"]
         players = room_info["players"]
 
@@ -726,7 +746,13 @@ class Matchmaking(commands.Cog):
                     "⚠️ No encuentro la sala asociada a este hilo.",
                     ephemeral=True
                 )
+
+            # ⛔ Ya se inició en esta sala
+            if room_entry.get("started"):
+                return await interaction.response.send_message("songs has been selected", ephemeral=True)
+
             players = room_entry["players"]
+
         else:
             join_chan = ch
             players   = [m for m in join_chan.members if not m.bot]
@@ -973,31 +999,37 @@ class Matchmaking(commands.Cog):
 
         # Buscamos al usuario en las salas de esta categoría
         for rid, info in list(self.rooms.items()):
-            # Solo salas cuyo thread pertenezca a este join
+            # Solo salas cuyo thread pertenezca a un canal #join permitido
             if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
                 continue
 
             if member in info["players"]:
+                # ⛔ No permitir salir si la sala ya inició
+                if info.get("started"):
+                    return await interaction.response.send_message(
+                        "You can't leave after the songs have been selected",
+                        ephemeral=True
+                    )
+
                 # Quitar del thread y de la lista
                 info["players"].remove(member)
                 await info["thread"].send(f"**{member.display_name}** left")
                 try:
                     await info["thread"].remove_user(member)
-                except:
+                except Exception:
                     pass
 
-                # Si la sala quedó vacía, arquivar y borrar
+                # Si la sala quedó vacía, archivar y borrar
                 if not info["players"]:
                     try:
                         await info["thread"].edit(archived=True, locked=True)
                         await info["thread"].delete()
-                    except:
+                    except Exception:
                         pass
-                    self.rooms.pop(rid)
+                    self.rooms.pop(rid, None)
                     self.bot.dispatch('room_finished', rid)
                 else:
                     await self.update_room_board(interaction.guild, rid)
-
 
                 # Confirmación al usuario y reordenar
                 await interaction.response.send_message(
@@ -1009,8 +1041,8 @@ class Matchmaking(commands.Cog):
         # Si no lo encontramos en ninguna sala válida
         await interaction.response.send_message(
             "You are not in a room", ephemeral=True
-            
         )
+
 
 
 
@@ -1099,7 +1131,6 @@ class Matchmaking(commands.Cog):
         if not room:
             return await ctx.send("Only works inside a room thread")
 
-        await ctx.send(f"ROOM: {room}")
         # state = room.get(ch.id)
         isStarted = room.get("started")
 
@@ -1132,6 +1163,33 @@ class Matchmaking(commands.Cog):
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if len(lines) != n:
             return await ctx.send(f"You should send {n} lines")
+        
+        # — Validar que las menciones del submit coincidan exactamente con los jugadores de la sala —
+        players_set = {m.id for m in players}
+
+        ids_in_lines = []
+        for ln in lines:
+            mobj = ENTRY_RE.match(ln)   # usa el ENTRY_RE global ya definido
+            if not mobj:
+                return await ctx.send(f"Incorrect format for: {ln}")
+            ids_in_lines.append(int(mobj.group("id")))
+
+        # Duplicados
+        if len(ids_in_lines) != len(set(ids_in_lines)):
+            return await ctx.send("❌ Duplicate users in submit.")
+
+        ids_set = set(ids_in_lines)
+        missing = players_set - ids_set   # jugadores de sala que no aparecen
+        extra   = ids_set - players_set   # usuarios en submit que no están en la sala
+
+        if missing or extra:
+            msg = []
+            if missing:
+                msg.append("Missing from submit: " + ", ".join(f"<@{x}>" for x in missing))
+            if extra:
+                msg.append("Not in the room: " + ", ".join(f"<@{x}>" for x in extra))
+            return await ctx.send("❌ Users do not match the room.\n" + "\n".join(msg))
+
         
 
         intro = "✅ React ✅ to validate, ❎ to decline\n```\n" + "\n".join(lines) + "\n```"
@@ -1194,18 +1252,28 @@ class Matchmaking(commands.Cog):
 
         summary = []
         medals  = {1:"🥇",2:"🥈",3:"🥉"}
-        ENTRY_RE = re.compile(r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$")
-        players_list = []
-        for member, ln in zip(players, lines):
+
+        # 1) Parsear TODAS las líneas -> mapa por user_id
+        by_id = {}
+        for ln in lines:
             m = ENTRY_RE.match(ln)
             if not m:
-                return await ctx.send(f"Formato incorrecto para: {ln}")
-            uid       = int(m.group("id"))
-            cc        = m.group("cc")
-            stats     = list(map(int, m.group("stats").split(",")))
-            stats_str = m.group("stats")
+                return await ctx.send(f"Incorrect format for: {ln}")
+            uid   = int(m.group("id"))
+            cc    = m.group("cc")
+            stats = list(map(int, m.group("stats").split(",")))
+            by_id[uid] = (cc, stats)
+
+        # 2) Construir players_list en base a players (orden independiente del texto)
+        players_list = []
+        for member in players:
+            uid = member.id
+            if uid not in by_id:
+                return await ctx.send(f"Line is missing for <@{uid}>")
+            cc, stats   = by_id[uid]
+            stats_str   = ",".join(map(str, stats))
             old, current_role = await self.fetch_player(uid)
-            total  = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
+            total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
             players_list.append({
                 "member":    member,
                 "cc":        cc,
@@ -1215,6 +1283,7 @@ class Matchmaking(commands.Cog):
                 "stats":     stats,
                 "stats_str": stats_str
             })
+
             # ctx.send(f"PLAYER: {current_role}")
         # ——————————————————————————————
         # FASE 1: bonus fijo para Placement
