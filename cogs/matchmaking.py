@@ -715,21 +715,24 @@ class Matchmaking(commands.Cog):
             for i, (title, lvl, diff, notes) in enumerate(picks)
         )
 
-
         await thread.send(
             f"Selected songs (Lv {low}–{high}) "
             f"(Total {total_notes} notes) 🎶\n{song_lines}"
         )
 
+        # ——— MARCAR INICIO + TIMESTAMP ———
         room_info["started"] = True
-        room_info["closed"]  = True        # ← NUEVO: cerrar para nuevos /c
-        self.inactivity.pop(thread.id, None)  # ← NUEVO: deja de pingear AFK de inmediato
-
+        room_info["closed"]  = True
+        self.inactivity.pop(thread.id, None)
         room_info.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
-        # refrescar el tablero del room para que se vea [STARTED] + hora
+        room_info.setdefault("started_ts", room_info["started_at"])  # ← para #rooms
+
+        # refrescar el tablero del room y #rooms
         rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
+            self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
+
 
 
     @app_commands.command(
@@ -811,49 +814,44 @@ class Matchmaking(commands.Cog):
             }
             room_entry = self.rooms[new_id]   # ← IMPORTANTE
 
-
-
-        # — 6) Filtrar diffs según el rango (lo, hi)
+        # — 6) Filtrar diffs según el rango (lo, hi) —
         allowed_diffs = DIFFICULTY_PRIORITY
         for rank,(rlo,rhi) in BRACKET_RANGES.items():
             if rlo == lo and rhi == hi:
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
 
-        # — 6.1) Obtener 5 canciones y mezclar
+        # — 6.1) Obtener 5 canciones y mezclar —
         all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
         picks     = all_songs[:5]
         random.shuffle(picks)
 
-        # — 6.2) Sumar total de notas y guardar en la sala
+        # — 6.2) Sumar total de notas y guardar en la sala —
         total_notes               = sum(song[3] for song in picks)
         room_entry["total_notes"] = total_notes
 
-        # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas
-        # … dentro de start()
+        # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas —
         song_lines = "\n".join(
             f"{i+1}. **{t}** (Lv {lvl} {df}) [{nts} notas]"
             for i,(t,lvl,df,nts) in enumerate(picks)
         )
-
-
         await thread.send(
             f"Selected songs (Lv {lo}–{hi}) "
             f"(Total {total_notes} notes) 🎶\n{song_lines}"
         )
 
-        room_entry["started"] = True       # ← NUEVO
-        room_entry["closed"]  = True       # ← NUEVO
-        self.inactivity.pop(thread.id, None)  # ← NUEVO
-
+        # ——— MARCAR INICIO + TIMESTAMP ———
+        room_entry["started"] = True
+        room_entry["closed"]  = True
+        self.inactivity.pop(thread.id, None)
         room_entry.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
-        # refrescar tablero
+        room_entry.setdefault("started_ts", room_entry["started_at"])  # ← para #rooms
+
+        # refrescar tablero y #rooms
         rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
         if rid is not None:
             await self.update_room_board(interaction.guild, rid)
-
-
-
+            self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
 
         # — 9) Confirmación efímera al invocador —
         await interaction.response.send_message(
@@ -1412,8 +1410,12 @@ class Matchmaking(commands.Cog):
             except Exception:
                 pass
             rooms.pop(rid, None)
-        rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
-        asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
+            # 🚨 Notificar al #rooms que la sala terminó
+            try:
+                self.bot.dispatch('room_finished', rid)
+            except Exception:
+                pass
+
 
 
 async def setup(bot: commands.Bot):

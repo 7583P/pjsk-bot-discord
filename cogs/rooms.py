@@ -55,17 +55,23 @@ class Rooms(commands.Cog):
         try:
             # 1) Obtener estado actual de Matchmaking
             mm = self.bot.get_cog("Matchmaking")
-            all_rooms = getattr(mm, "rooms", {})
+            if mm is None:
+                return
+            all_rooms = getattr(mm, "rooms", {}) or {}
 
             # 2) Agrupar por categoría
-            grouped: dict[int, list[tuple[int, list[tuple[discord.Member,int]], int]]] = {}
+            #    Cada item: (room_id, players_data[(member, mmr)], avg_mmr, started_bool, started_ts|None)
+            grouped: dict[int, list[tuple[int, list[tuple[discord.Member, int]], int, bool, int | None]]] = {}
+
             for rid, info in all_rooms.items():
                 cat = info.get("category_id")
                 if cat not in CATEGORY_TO_ROOM_CHANNEL:
                     continue
 
-                pdata: list[tuple[discord.Member,int]] = []
+                pdata: list[tuple[discord.Member, int]] = []
                 mmr_vals: list[int] = []
+
+                # Construimos listado de jugadores con MMR actual
                 for member in info.get("players", []):
                     if not isinstance(member, discord.Member):
                         continue
@@ -75,7 +81,19 @@ class Rooms(commands.Cog):
                     mmr_vals.append(mmr)
 
                 avg = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
-                grouped.setdefault(cat, []).append((rid, pdata, avg))
+
+                # Estado de inicio y timestamp
+                count = len(pdata)
+                started_flag = bool(info.get("started")) or (count >= 5)
+                # Aceptamos varias claves posibles por compatibilidad
+                started_ts = (
+                    info.get("started_ts")
+                    or info.get("start_ts")
+                    or info.get("started_at")
+                    or info.get("reached5_ts")
+                )
+                # Si sabemos que está iniciada pero no tenemos ts, lo dejamos en None
+                grouped.setdefault(cat, []).append((rid, pdata, avg, started_flag, started_ts))
 
             # 3) Para cada categoría, editar o enviar mensaje en su canal rooms
             now_ts = int(time.time())
@@ -86,19 +104,37 @@ class Rooms(commands.Cog):
 
                 lines: list[str] = []
                 rooms_list = grouped.get(cat_id, [])
+
                 if not rooms_list:
                     lines.append("**No active rooms**")
                 else:
-                    # orden ascendente por ID de sala
-                    rooms_list.sort(key=lambda x: x[0])
-                    for rid, pdata, avg in rooms_list:
+                    # Orden: por Average MMR desc, si empatan por room_id asc
+                    rooms_list.sort(key=lambda x: (-x[2], x[0]))
+
+                    for rid, pdata, avg, started_flag, started_ts in rooms_list:
                         count = len(pdata)
-                        lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg}**")
+
+                        # Formateo de estado
+                        if started_flag:
+                            # Si hay timestamp, lo mostramos a la derecha de [STARTED]
+                            if isinstance(started_ts, int) and started_ts > 0:
+                                status = f"[STARTED] <t:{started_ts}:t>"
+                            else:
+                                status = "[STARTED]"
+                        else:
+                            status = "[NO STARTED]"
+
+                        # Encabezado de la sala
+                        lines.append(
+                            f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**"
+                        )
+
+                        # Lista de jugadores
                         for member, mmr in pdata:
                             lines.append(f"- {member.display_name} ({mmr})")
                         lines.append("")  # separación
 
-                # Pie con timestamp relativo
+                # Pie con timestamp relativo de actualización
                 lines.append(f"Last Update <t:{now_ts}:R>")
                 content = "\n".join(lines)
 
@@ -107,7 +143,8 @@ class Rooms(commands.Cog):
                     msg = await channel.send(content)
                     self.posted_messages[cat_id] = msg
                 else:
-                    await prev_msg.edit(content=content)
+                    if prev_msg.content != content:
+                        await prev_msg.edit(content=content)
 
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")
