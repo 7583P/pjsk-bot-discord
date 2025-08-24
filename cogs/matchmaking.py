@@ -40,6 +40,7 @@ def is_allowed_leave(ch: discord.abc.GuildChannel) -> bool:
 DB_PATH           = "matchmaking.db"   # ignorado, pero por compatibilidad
 GUILD_ID          = int(os.getenv("GUILD_ID", "0"))
 JOIN_CHANNEL_NAME = "join"
+ROOMS_CHANNEL_NAME = "rooms"
 DATABASE_URL      = os.getenv("DB_HOST")  # postgresql://user:pass@host:port/dbname
 
 ENTRY_RE = re.compile(
@@ -193,7 +194,7 @@ class Top100View(View):
 
         # construye el embed
         embed = Embed(
-            title="PJSK LOUGE TOP 100",
+            title="PJSK LOUNGE TOP 100",
             color=0x00B4D8
         )
         header    = "TOP| Name                     |   MMR   | Rank\n"
@@ -381,6 +382,8 @@ class Matchmaking(commands.Cog):
         self.rooms: dict[int, dict] = {}
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
+        self.rooms_overview_msg_ids: dict[int, int] = {}  # guild_id -> message_id en #rooms
+
 
     @tasks.loop(minutes=1)
     async def monitor_inactivity(self):
@@ -427,6 +430,7 @@ class Matchmaking(commands.Cog):
                     )
                     if players:
                         await self.update_room_board(thread.guild, rid)
+                        await self.update_rooms_overview(thread.guild) 
 
                     # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
                     if not players:
@@ -437,6 +441,7 @@ class Matchmaking(commands.Cog):
                             pass
                         self.rooms.pop(rid, None)
                         self.inactivity.pop(thread.id, None)
+                        await self.update_rooms_overview(thread.guild)
                         continue
 
     @commands.Cog.listener()
@@ -724,12 +729,14 @@ class Matchmaking(commands.Cog):
         room_info["started"] = True
         room_info["closed"]  = True        # ← NUEVO: cerrar para nuevos /c
         self.inactivity.pop(thread.id, None)  # ← NUEVO: deja de pingear AFK de inmediato
+        
 
         room_info.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
         # refrescar el tablero del room para que se vea [STARTED] + hora
         rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
+            await self.update_rooms_overview(thread.guild) 
 
 
     @app_commands.command(
@@ -851,6 +858,7 @@ class Matchmaking(commands.Cog):
         rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
         if rid is not None:
             await self.update_room_board(interaction.guild, rid)
+            await self.update_rooms_overview(interaction.guild)
 
 
 
@@ -912,6 +920,111 @@ class Matchmaking(commands.Cog):
                 await self.update_room_board(guild, rid)
             except Exception:
                 pass
+
+        # << fuera del for >>
+        await self.update_rooms_overview(guild)
+
+    async def ensure_rooms_channel(self, guild: discord.Guild) -> discord.TextChannel:
+        # Busca un canal de texto llamado "rooms"
+        for ch in guild.text_channels:
+            if ch.name.lower() == ROOMS_CHANNEL_NAME:
+                return ch
+        # Si no existe, lo crea (opcional: misma categoría que algún #join)
+        # Intento colocar en la categoría del primer #join permitido que exista en este guild
+        parent = None
+        for ch in guild.text_channels:
+            if ch.id in ALLOWED_JOIN_CHANNELS and ch.category:
+                parent = ch.category
+                break
+        return await guild.create_text_channel(ROOMS_CHANNEL_NAME, category=parent)
+    
+    async def _render_rooms_overview_text(self, guild: discord.Guild, capacity: int = 5) -> str:
+        # Filtra rooms de este guild que no hayan terminado
+        entries = []
+        for rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if info["thread"].guild.id != guild.id:
+                continue
+            players = info.get("players", [])
+            if not players:
+                continue
+
+            # MMR promedio y lista ordenada por MMR DESC
+            rows = []
+            for m in players:
+                mmr, _ = await self.fetch_player(m.id)
+                rows.append({"user_id": m.id, "mmr": int(mmr)})
+            rows.sort(key=lambda r: r["mmr"], reverse=True)
+            avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
+
+            # Estado/tiempo
+            started    = info.get("started", False)
+            started_at = info.get("started_at")  # epoch int
+            if started:
+                ts_part = f" <t:{int(started_at)}:T> (<t:{int(started_at)}:R>)" if started_at else ""
+                status  = f"[STARTED]{ts_part}"
+            else:
+                status  = "[WAITING]"
+
+            # Resolve nombres y arma líneas de jugadores
+            lines = []
+            for r in rows:
+                name = await self.resolve_member_name(guild, r["user_id"])
+                lines.append(f"• {name} ({r['mmr']})")
+
+            entries.append({
+                "rid": rid,
+                "avg": avg,
+                "count": len(rows),
+                "status": status,
+                "lines": lines
+            })
+
+        # Ordenar salas por MMR promedio DESC (como haces en sort_and_rename_rooms)
+        entries.sort(key=lambda e: e["avg"], reverse=True)
+
+        # Armar el texto final
+        header = "**Active rooms**\n"
+        blocks = []
+        for e in entries:
+            blocks.append(
+                f"**Room {e['rid']}**: {e['count']}/{capacity} · Avg MMR {e['avg']} · {e['status']}\n"
+                + ("\n".join(e["lines"]) if e["lines"] else "")
+            )
+
+        now = int(datetime.datetime.utcnow().timestamp())
+        footer = f"\n\nLast update <t:{now}:R>"
+        body = ("\n\n".join(blocks)) if blocks else "_No active rooms_"
+        return header + body + footer
+    
+
+    async def update_rooms_overview(self, guild: discord.Guild):
+        try:
+            ch = await self.ensure_rooms_channel(guild)
+            content = await self._render_rooms_overview_text(guild)
+
+            msg_id = self.rooms_overview_msg_ids.get(guild.id)
+            if msg_id:
+                try:
+                    msg = await ch.fetch_message(msg_id)
+                    await msg.edit(content=content)
+                    return
+                except discord.NotFound:
+                    self.rooms_overview_msg_ids.pop(guild.id, None)
+
+            msg = await ch.send(content)
+            try:
+                await msg.pin()
+            except Exception:
+                pass
+            self.rooms_overview_msg_ids[guild.id] = msg.id
+        except Exception as e:
+            # No rompas el flujo si #rooms falla por permisos, etc.
+            log.warning(f"[rooms_overview] update failed for guild {guild.id}: {e}")
+
+
+
 
 
     @app_commands.command(name="c", description="Join a room")
@@ -997,7 +1110,8 @@ class Matchmaking(commands.Cog):
         await room["thread"].add_user(member)
         await self.update_room_board(interaction.guild, best_rid)
 
-        await self.sort_and_rename_rooms(interaction.guild)
+        await self.update_rooms_overview(interaction.guild)
+
 
         # Auto-start si llega a 5
         if len(room["players"]) == 5:
@@ -1053,11 +1167,10 @@ class Matchmaking(commands.Cog):
                 else:
                     await self.update_room_board(interaction.guild, rid)
 
-                # Confirmación al usuario y reordenar
                 await interaction.response.send_message(
                     f"Leaved room {rid}.", ephemeral=True
                 )
-                await self.sort_and_rename_rooms(interaction.guild)
+                await self.update_rooms_overview(interaction.guild)
                 return
 
         # Si no lo encontramos en ninguna sala válida
@@ -1403,6 +1516,7 @@ class Matchmaking(commands.Cog):
         await ctx.send(table)
         await ctx.send("MMR Updated")
         room["finished"] = True
+        await self.update_rooms_overview(ctx.guild) 
 
         async def close_thread_later(thread, rooms, rid):
             await asyncio.sleep(120)
@@ -1412,6 +1526,10 @@ class Matchmaking(commands.Cog):
             except Exception:
                 pass
             rooms.pop(rid, None)
+            try:
+                await self.update_rooms_overview(thread.guild)
+            except Exception:
+                pass
         rid = next((rid for rid, r in mm.rooms.items() if r["thread"].id == ctx.channel.id), None)
         asyncio.create_task(close_thread_later(ctx.channel, mm.rooms, rid))
 
