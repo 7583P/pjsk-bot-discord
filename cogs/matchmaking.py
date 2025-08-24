@@ -304,7 +304,7 @@ class Matchmaking(commands.Cog):
         return member.nick or getattr(member, "global_name", None) or member.name
 
     async def _render_room_board_text(self, guild: discord.Guild, rid: int, capacity: int = 5) -> str:
-        """Construye el texto 'Room X: 2/5 Players · Average MMR YYY' + lista ordenada por MMR."""
+        """Construye el texto 'Room X: N/5 Players · Average MMR YYY · [STATUS] (hora si aplica)' + lista por MMR."""
         info = self.rooms.get(rid)
         if not info:
             return ""
@@ -318,7 +318,18 @@ class Matchmaking(commands.Cog):
         rows.sort(key=lambda r: r["mmr"], reverse=True)
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
-        header = f"Room {rid}: {len(rows)}/{capacity} Players · Average MMR {avg}"
+
+        # Estado de la sala
+        started = info.get("started", False)
+        started_at = info.get("started_at")   # epoch int si existe
+        if started:
+            # hora (solo hora local del usuario en Discord) – puedes cambiar :T por :t o :f si prefieres
+            ts_part = f" <t:{int(started_at)}:T>" if started_at else ""
+            status = f"[STARTED]{ts_part}"
+        else:
+            status = "[NOT STARTED]"
+
+        header = f"Room {rid}: {len(rows)}/{capacity} Players · Average MMR {avg} · {status}"
 
         lines = []
         for r in rows:
@@ -327,6 +338,7 @@ class Matchmaking(commands.Cog):
 
         ts = int(datetime.datetime.utcnow().timestamp())
         return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
+
 
     async def update_room_board(self, guild: discord.Guild, rid: int):
         """Crea/edita el mensaje 'tablero' del room en su thread."""
@@ -462,10 +474,7 @@ class Matchmaking(commands.Cog):
                         except:
                             pass
                         return
-
-        # Procesar comandos (después de filtros/borrados)
-        await self.bot.process_commands(message)
-
+                    
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -716,6 +725,12 @@ class Matchmaking(commands.Cog):
         room_info["closed"]  = True        # ← NUEVO: cerrar para nuevos /c
         self.inactivity.pop(thread.id, None)  # ← NUEVO: deja de pingear AFK de inmediato
 
+        room_info.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
+        # refrescar el tablero del room para que se vea [STARTED] + hora
+        rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
+        if rid is not None:
+            await self.update_room_board(thread.guild, rid)
+
 
     @app_commands.command(
         name="start",
@@ -830,6 +845,13 @@ class Matchmaking(commands.Cog):
         room_entry["started"] = True       # ← NUEVO
         room_entry["closed"]  = True       # ← NUEVO
         self.inactivity.pop(thread.id, None)  # ← NUEVO
+
+        room_entry.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
+        # refrescar tablero
+        rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
+        if rid is not None:
+            await self.update_room_board(interaction.guild, rid)
+
 
 
 
