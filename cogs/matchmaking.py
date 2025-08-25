@@ -89,6 +89,8 @@ BRACKET_RANGES = {
 
 MIN_LEVEL_GAP = 2
 
+VOTE_TIMEOUT_SUBMIT = 30 
+
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
     centers, gaps = [], []
     for rank, num in counts.items():
@@ -193,7 +195,7 @@ class Top100View(View):
 
         # construye el embed
         embed = Embed(
-            title="PJSK LOUGE TOP 100",
+            title="PJSK LOUNGE TOP 100",
             color=0x00B4D8
         )
         header    = "TOP| Name                     |   MMR   | Rank\n"
@@ -382,6 +384,8 @@ class Matchmaking(commands.Cog):
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
 
+
+
     @tasks.loop(minutes=1)
     async def monitor_inactivity(self):
         now = datetime.datetime.utcnow()
@@ -406,7 +410,7 @@ class Matchmaking(commands.Cog):
                 # 5 min sin escribir → avisar
                 if warned is None and now - last > datetime.timedelta(minutes=5):
                     await thread.send(
-                        f"{member.mention} 5 minutess have passed, type something within 2 minutes to stay in the room"
+                        f"{member.mention} 5 minutes have passed, type something within 2 minutes to stay in the room"
                     )
                     entry["warned_at"] = now
 
@@ -1151,57 +1155,50 @@ class Matchmaking(commands.Cog):
         if not room:
             return await ctx.send("Only works inside a room thread")
 
-        # state = room.get(ch.id)
-        isStarted = room.get("started")
-
-        if isStarted == False:
-            await ctx.send(
-                "start command need to be excecuted first"
-            )
-            return
-    
-        # Valida que la suma de stats por línea coincida con el total de notas esperado
-        expected = room.get("total_notes")
-        if expected is not None:
-            lines_raw = [l.strip() for l in block.split("\n") if l.strip()]
-            for idx, ln in enumerate(lines_raw, start=1):
-                stats = list(map(int, ln.rsplit(" ", 1)[-1].split(",")))
-                if sum(stats) != expected:
-                    return await ctx.send(
-                        f"there is an error on the calculation on line {idx}: "
-                        f"{sum(stats)} ≠ {expected}"
-                    )
-
+        # ⛔ sala ya finalizada (no aceptar nuevos submit)
         if room.get("finished", False):
-            return await ctx.send("The room has already been finished, cannot submit again.")
+            return await ctx.send("this room has been submited results")
+
+        # ⛔ votación en curso
+        if room.get("vote_in_progress", False):
+            return await ctx.send("There is already a submit vote in progress in this room.")
+
+        # Debe haberse ejecutado /start
+        if room.get("started") is False:
+            return await ctx.send("start command need to be excecuted first")
 
         players = room["players"]
         n = len(players)
         if not (2 <= n <= 5):
             return await ctx.send("Room must have between 2-5 players")
 
+        # ---- Validaciones de formato y pertenencia ----
+        expected = room.get("total_notes")
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if len(lines) != n:
             return await ctx.send(f"You should send {n} lines")
-        
-        # — Validar que las menciones del submit coincidan exactamente con los jugadores de la sala —
-        players_set = {m.id for m in players}
 
+        # Validar formato de cada línea y (si aplica) suma de notas
+        players_set = {m.id for m in players}
         ids_in_lines = []
-        for ln in lines:
-            mobj = ENTRY_RE.match(ln)   # usa el ENTRY_RE global ya definido
+        for idx, ln in enumerate(lines, start=1):
+            mobj = ENTRY_RE.match(ln)
             if not mobj:
                 return await ctx.send(f"Incorrect format for: {ln}")
+            if expected is not None:
+                stats = list(map(int, mobj.group("stats").split(",")))
+                if sum(stats) != expected:
+                    return await ctx.send(
+                        f"there is an error on the calculation on line {idx}: {sum(stats)} ≠ {expected}"
+                    )
             ids_in_lines.append(int(mobj.group("id")))
 
-        # Duplicados
+        # Duplicados y miembros coincidentes con la sala
         if len(ids_in_lines) != len(set(ids_in_lines)):
             return await ctx.send("❌ Duplicate users in submit.")
-
         ids_set = set(ids_in_lines)
-        missing = players_set - ids_set   # jugadores de sala que no aparecen
-        extra   = ids_set - players_set   # usuarios en submit que no están en la sala
-
+        missing = players_set - ids_set
+        extra   = ids_set - players_set
         if missing or extra:
             msg = []
             if missing:
@@ -1210,165 +1207,151 @@ class Matchmaking(commands.Cog):
                 msg.append("Not in the room: " + ", ".join(f"<@{x}>" for x in extra))
             return await ctx.send("❌ Users do not match the room.\n" + "\n".join(msg))
 
-        
+        # A partir de aquí: bloquear nuevos submit mientras dure la votación
+        room["vote_in_progress"] = True
 
-        intro = "✅ React ✅ to validate, ❎ to decline\n```\n" + "\n".join(lines) + "\n```"
-        vote_msg = await ctx.send(intro)
-        for emo in ("✅", "❎"):
-            await vote_msg.add_reaction(emo)
-
-        # Solo pueden votar los jugadores de la sala
-        allowed_voters = {m.id for m in players}
-        threshold = len(allowed_voters) // 2 + 1
-
-        counts = {"✅": 0, "❎": 0}
-        voted  = set()
-
-        def check(reaction, user):
-            return (
-                reaction.message.id == vote_msg.id
-                and not user.bot
-                and user.id in allowed_voters
-                and str(reaction.emoji) in ("✅", "❎")
+        try:
+            # ---- Lanzar votación (30s) ----
+            intro = (
+                f"✅ React ✅ to validate, ❎ to decline (auto-close in {VOTE_TIMEOUT_SUBMIT}s)\n"
+                "```\n" + "\n".join(lines) + "\n```"
             )
+            vote_msg = await ctx.send(intro)
+            for emo in ("✅", "❎"):
+                await vote_msg.add_reaction(emo)
 
-        ganador = None
-        deadline = asyncio.get_event_loop().time() + 60.0  # ventana de 60s
+            allowed_voters = {m.id for m in players}
+            total_voters   = len(allowed_voters)
 
-        while ganador is None:
-            timeout = max(0.0, deadline - asyncio.get_event_loop().time())
-            if timeout == 0.0:
-                break
+            counts = {"✅": 0, "❎": 0}
+            voted  = set()
+            ganador = None
+
+            def check(reaction, user):
+                return (
+                    reaction.message.id == vote_msg.id
+                    and not user.bot
+                    and user.id in allowed_voters
+                    and str(reaction.emoji) in ("✅", "❎")
+                )
+
+            deadline = asyncio.get_event_loop().time() + float(VOTE_TIMEOUT_SUBMIT)
+
+            # Recolectar votos hasta que:
+            # - voten todos (y si todos ✅ ⇒ valida; si todos ❎ ⇒ declina), o
+            # - se acaben los 30s y decidir por mayoría
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+                try:
+                    reaction, user = await self.bot.wait_for("reaction_add", timeout=remaining, check=check)
+                except asyncio.TimeoutError:
+                    break
+
+                # Un solo voto por usuario
+                if user.id in voted:
+                    continue
+
+                choice = str(reaction.emoji)
+                voted.add(user.id)
+                counts[choice] += 1
+
+                # Todos votaron y son unánimes → decisión inmediata
+                if len(voted) == total_voters:
+                    if counts["✅"] == total_voters:
+                        ganador = "✅"
+                    elif counts["❎"] == total_voters:
+                        ganador = "❎"
+                    break
+
+            # Si no hubo unanimidad, decidir por mayoría al cierre
+            if ganador is None:
+                if counts["✅"] > counts["❎"]:
+                    ganador = "✅"
+                elif counts["❎"] > counts["✅"]:
+                    ganador = "❎"
+                else:
+                    ganador = "❎"  # empate ⇒ se declina
+
+            # Cerrar visualmente la votación
             try:
-                reaction, user = await self.bot.wait_for("reaction_add", timeout=timeout, check=check)
-            except asyncio.TimeoutError:
-                break
+                await vote_msg.edit(content=f"🗳️ Voting closed → {ganador}  (✅ {counts['✅']} / ❎ {counts['❎']})")
+            except Exception:
+                pass
 
-            # evita votos múltiples del mismo usuario
-            if user.id in voted:
-                continue
+            # ---- Resultado de la votación ----
+            if ganador != "✅":
+                return await ctx.send("Submit declined. There might be an error, try doing it again.")
 
-            choice = str(reaction.emoji)
-            counts[choice] += 1
-            voted.add(user.id)
+            # ==============================
+            # VOTO APROBADO → aplicar MMR
+            # ==============================
+            medals  = {1:"🥇",2:"🥈",3:"🥉"}
 
-            if counts["✅"] >= threshold:
-                ganador = "✅"
-            elif counts["❎"] >= threshold:
-                ganador = "❎"
+            # 1) Mapear datos por user_id
+            by_id = {}
+            for ln in lines:
+                m = ENTRY_RE.match(ln)
+                uid   = int(m.group("id"))
+                cc    = m.group("cc")
+                stats = list(map(int, m.group("stats").split(",")))
+                by_id[uid] = (cc, stats)
 
-        # Si no alcanzó el umbral, decide por mayoría simple; empate/0 votos = rechazo
-        if ganador is None:
-            if counts["✅"] > counts["❎"]:
-                ganador = "✅"
-            elif counts["❎"] > counts["✅"]:
-                ganador = "❎"
-            else:
-                ganador = "❎"
+            # 2) Construir players_list (en el orden lógico de sala)
+            players_list = []
+            for member in players:
+                uid = member.id
+                cc, stats = by_id[uid]
+                old, current_role = await self.fetch_player(uid)
+                total_points = sum(s*w for s, w in zip(stats, [5,3,2,1,0]))
+                players_list.append({
+                    "member": member,
+                    "cc": cc,
+                    "stats": stats,
+                    "total": total_points,
+                    "old": old,
+                    "role": current_role
+                })
 
-        if ganador != "✅":
-            return await ctx.send("There might be an error, try doing it again.")
+            # Fase 1: bonus de Placement
+            for p in players_list:
+                if p["role"] == "Placement":
+                    bonus_role      = self.get_role_from_notes(p["stats"])
+                    p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
+                else:
+                    p["mmr_actual"] = p["old"]
 
+            # Fase 2: Elo por pares con K fijo
+            players_list.sort(key=lambda x: x["total"], reverse=True)
+            ratings = [p["mmr_actual"] for p in players_list]
+            order   = list(range(len(players_list)))
+            deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
 
-        summary = []
-        medals  = {1:"🥇",2:"🥈",3:"🥉"}
-
-        # 1) Parsear TODAS las líneas -> mapa por user_id
-        by_id = {}
-        for ln in lines:
-            m = ENTRY_RE.match(ln)
-            if not m:
-                return await ctx.send(f"Incorrect format for: {ln}")
-            uid   = int(m.group("id"))
-            cc    = m.group("cc")
-            stats = list(map(int, m.group("stats").split(",")))
-            by_id[uid] = (cc, stats)
-
-        # 2) Construir players_list en base a players (orden independiente del texto)
-        players_list = []
-        for member in players:
-            uid = member.id
-            if uid not in by_id:
-                return await ctx.send(f"Line is missing for <@{uid}>")
-            cc, stats   = by_id[uid]
-            stats_str   = ",".join(map(str, stats))
-            old, current_role = await self.fetch_player(uid)
-            total = sum(s*w for s, w in zip(stats, [5, 3, 2, 1, 0]))
-            players_list.append({
-                "member":    member,
-                "cc":        cc,
-                "total":     total,
-                "old":       old,
-                "role":      current_role,
-                "stats":     stats,
-                "stats_str": stats_str
-            })
-
-            # ctx.send(f"PLAYER: {current_role}")
-        # ——————————————————————————————
-        # FASE 1: bonus fijo para Placement
-        # ——————————————————————————————
-        for p in players_list:
-            if p["role"] == "Placement":
-                bonus_role      = self.get_role_from_notes(p["stats"])
-                p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
-            else:
-                p["mmr_actual"] = p["old"]
-
-        # ——————————————————————————————
-        # ——————————————————————————————
-        # FASE 2 (NUEVA): Elo por pares con K fijo (sin 'games')
-        # ——————————————————————————————
-        # players_list YA está ORDENADA por puntos (1º…n)
-        # Ordenar por puntos (total), mayor a menor
-        players_list.sort(key=lambda x: x["total"], reverse=True)
-        ratings = [p["mmr_actual"] for p in players_list]
-        order   = list(range(len(players_list)))  # 0..n-1 ya en orden final
-        deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
-        # await ctx.send(f"PLAYER LIST: {len(players_list)}")
-        # await ctx.send(f"PLAYER LIST DELTA:{len(deltas)}")
-        summary = []
-
-        # await ctx.send(f"DEBUG: len(players)={len(players_list)} len(deltas)={len(deltas)} "
-        #             f"types: players={type(players_list).__name__} deltas={type(deltas).__name__}")
-
-        if len(players_list) != len(deltas):
-            await ctx.send("⚠️ Length mismatch: no voy a usar zip_longest para no desalinear datos.")
-            # Si prefieres fallar explícito:
-            # raise ValueError(f"Length mismatch: {len(players_list)} vs {len(deltas)}")
-
-        for idx, p in enumerate(players_list, start=1):
-            try:
-                mmr_delta = deltas[idx-1]  # evita zip; fácil de razonar
+            summary = []
+            for idx, p in enumerate(players_list, start=1):
                 mmr_prev  = int(p["mmr_actual"])
-                mmr_final = mmr_prev + int(mmr_delta)
+                mmr_delta = int(deltas[idx-1])
+                mmr_final = mmr_prev + mmr_delta
                 role_name = get_rank_from_mmr(mmr_final)
 
-                # await ctx.send(f"MEMBER ID: {p['member'].id}")
-                # await ctx.send(f"MMR PREV: {mmr_prev}")
-                # await ctx.send(f"MMR FINAL: {mmr_final}")
-                # await ctx.send(f"MMR DELTA: {mmr_delta}")
-
-                # DB
                 await self.db_pool.execute(
                     "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
                     mmr_final, role_name, p["cc"], p["member"].id
                 )
 
-                # Roles
                 role_id = RANK_ROLE_IDS.get(role_name)
                 if role_id:
                     role_obj = ctx.guild.get_role(role_id)
                     if role_obj:
                         old_ranks  = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
                         keep_roles = [r for r in p["member"].roles if r.id not in old_ranks]
-                        new_roles  = list(dict.fromkeys(keep_roles + [role_obj]))  # sin duplicados
+                        new_roles  = list(dict.fromkeys(keep_roles + [role_obj]))
                         try:
                             await p["member"].edit(roles=new_roles, reason="Rank update")
                         except (discord.Forbidden, discord.HTTPException) as e:
                             await ctx.send(f"⚠️ No pude actualizar roles de {p['member'].mention}: {e}")
 
-                # Nick (cuida jerarquía/longitud 32)
                 if ctx.guild.me.guild_permissions.manage_nicknames:
                     base = p["member"].display_name
                     nick = f"{base} [{role_name}]"
@@ -1380,41 +1363,41 @@ class Matchmaking(commands.Cog):
                         await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
 
                 med = medals.get(idx, str(idx))
-                summary.append((med, p["member"].display_name, p["total"], p["stats"], mmr_prev, mmr_delta, mmr_final))
+                summary.append((
+                    med,
+                    p["member"].display_name,
+                    p["total"],
+                    p["stats"],
+                    mmr_prev,
+                    mmr_delta,
+                    mmr_final
+                ))
 
-            except Exception as e:
-                uid = getattr(p.get("member"), "id", "¿?")
-                await ctx.send(f"❌ Fallo en iteración {idx} (user {uid}): {type(e).__name__}: {e}")
-                # opcional: continue
+            # Publicar resultados en canal de resultados y en el hilo
+            join_parent    = ctx.channel.parent
+            result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
+            result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
-        join_parent    = ctx.channel.parent
-        result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
-        result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
+            table = "**🏆 Results 🏆**\n"
+            table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
+            for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
+                pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+                table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
 
-        table = "**🏆 Posiciones finales 🏆**\n"
-        table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
-        for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
-            pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-            table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
-        await result_chan.send(table)
-        await result_chan.send("MMR Updated")
-        await ctx.send(table)
-        await ctx.send("MMR Updated")
-        room["finished"] = True
+            await result_chan.send(table)
+            await result_chan.send("MMR Updated")
+            await ctx.send(table)
+            await ctx.send("MMR Updated")
 
-        async def close_thread_later(thread, rooms, rid):
-            await asyncio.sleep(120)
-            try:
-                await thread.edit(archived=True, locked=True)
-                await thread.delete()
-            except Exception:
-                pass
-            rooms.pop(rid, None)
-            # 🚨 Notificar al #rooms que la sala terminó
-            try:
-                self.bot.dispatch('room_finished', rid)
-            except Exception:
-                pass
+            # Bloquear futuros submit en esta sala
+            room["finished"] = True
+            await ctx.send("this room has been submited results")
+
+        finally:
+            # Siempre liberar el bloqueo de votación
+            room["vote_in_progress"] = False
+
+
 
 
 

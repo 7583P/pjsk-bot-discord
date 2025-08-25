@@ -122,7 +122,7 @@ class Rooms(commands.Cog):
                             else:
                                 status = "[STARTED]"
                         else:
-                            status = "[NO STARTED]"
+                            status = "[NOT STARTED]"
 
                         # Encabezado de la sala
                         lines.append(
