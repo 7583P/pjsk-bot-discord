@@ -68,19 +68,39 @@ class Rooms(commands.Cog):
                 if cat not in CATEGORY_TO_ROOM_CHANNEL:
                     continue
 
-                pdata: list[tuple[discord.Member, int]] = []
-                mmr_vals: list[int] = []
+                # Miembros válidos
+                players_list = [m for m in info.get("players", []) if isinstance(m, discord.Member)]
+                ids = [m.id for m in players_list]
 
-                # Construimos listado de jugadores con MMR actual
-                for member in info.get("players", []):
-                    if not isinstance(member, discord.Member):
-                        continue
-                    # fetch_player devuelve (mmr, role)
-                    mmr, _ = await mm.fetch_player(member.id)
-                    pdata.append((member, mmr))
-                    mmr_vals.append(mmr)
+                # ----- Obtener MMRs con UNA consulta por sala (menos I/O) -----
+                mmr_map: dict[int, int] = {}
+                if ids:
+                    try:
+                        # Usar el pool del Matchmaking si existe
+                        if getattr(mm, "db_pool", None) is not None:
+                            async with mm.db_pool.acquire() as con:
+                                rows_db = await con.fetch(
+                                    "SELECT user_id, COALESCE(mmr,0) AS mmr FROM players WHERE user_id = ANY($1::bigint[])",
+                                    ids
+                                )
+                            mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
+                        else:
+                            # Fallback: una a una (más I/O, pero seguro)
+                            for m in players_list:
+                                _mmr, _ = await mm.fetch_player(m.id)
+                                mmr_map[m.id] = int(_mmr)
+                    except Exception:
+                        # Fallback robusto si falla la consulta por lote
+                        for m in players_list:
+                            _mmr, _ = await mm.fetch_player(m.id)
+                            mmr_map[m.id] = int(_mmr)
 
-                avg = sum(mmr_vals) // len(mmr_vals) if mmr_vals else 0
+                # pdata = [(member, mmr)] ORDENADO por MMR DESC (mayor arriba)
+                pdata: list[tuple[discord.Member, int]] = [(m, mmr_map.get(m.id, 0)) for m in players_list]
+                pdata.sort(key=lambda t: t[1], reverse=True)  # ← orden dentro de la sala por MMR
+
+                mmr_vals = [mmr for _, mmr in pdata]
+                avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
 
                 # Estado de inicio y timestamp
                 count = len(pdata)
@@ -92,7 +112,7 @@ class Rooms(commands.Cog):
                     or info.get("started_at")
                     or info.get("reached5_ts")
                 )
-                # Si sabemos que está iniciada pero no tenemos ts, lo dejamos en None
+
                 grouped.setdefault(cat, []).append((rid, pdata, avg, started_flag, started_ts))
 
             # 3) Para cada categoría, editar o enviar mensaje en su canal rooms
@@ -125,11 +145,9 @@ class Rooms(commands.Cog):
                             status = "[NOT STARTED]"
 
                         # Encabezado de la sala
-                        lines.append(
-                            f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**"
-                        )
+                        lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**")
 
-                        # Lista de jugadores
+                        # Lista de jugadores (ya viene ordenada por MMR DESC)
                         for member, mmr in pdata:
                             lines.append(f"- {member.display_name} ({mmr})")
                         lines.append("")  # separación
@@ -139,12 +157,26 @@ class Rooms(commands.Cog):
                 content = "\n".join(lines)
 
                 prev_msg = self.posted_messages.get(cat_id)
+
+                # Si no existe mensaje previo o el canal cambió, mandamos uno nuevo
                 if prev_msg is None or prev_msg.channel.id != room_chan_id:
-                    msg = await channel.send(content)
+                    try:
+                        msg = await channel.send(content)
+                    except discord.Forbidden:
+                        continue
                     self.posted_messages[cat_id] = msg
-                else:
-                    if prev_msg.content != content:
+                    continue
+
+                # Si existe, intentamos editar; si fue borrado, re-crear
+                if prev_msg.content != content:
+                    try:
                         await prev_msg.edit(content=content)
+                    except (discord.NotFound, discord.HTTPException):
+                        try:
+                            msg = await channel.send(content)
+                            self.posted_messages[cat_id] = msg
+                        except discord.Forbidden:
+                            pass
 
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")

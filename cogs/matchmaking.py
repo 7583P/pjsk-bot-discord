@@ -340,6 +340,30 @@ class Matchmaking(commands.Cog):
 
         ts = int(datetime.datetime.utcnow().timestamp())
         return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
+    
+    async def close_room(self, thread: discord.Thread, *, delay: int = 60, delete: bool = True):
+        """Cierra/borra la sala con un retardo (delay). Por defecto: elimina a los 60s."""
+        if not isinstance(thread, discord.Thread):
+            return
+        if getattr(self, "_closing_threads", None) is None:
+            self._closing_threads = set()
+        if thread.id in self._closing_threads:
+            return
+
+        self._closing_threads.add(thread.id)
+        try:
+            await asyncio.sleep(delay)
+            if delete:
+                await thread.delete(reason="Room auto-deleted 1 minute after results")
+            else:
+                await thread.edit(archived=True, locked=True)
+        except discord.Forbidden:
+            log.error("Faltan permisos: Manage Threads para eliminar hilos.")
+        except Exception:
+            log.exception("close_room falló para %s", thread.id)
+        finally:
+            self._closing_threads.discard(thread.id)
+
 
 
     async def update_room_board(self, guild: discord.Guild, rid: int):
@@ -1393,11 +1417,14 @@ class Matchmaking(commands.Cog):
             room["finished"] = True
             await ctx.send("this room has been submited results")
 
+            thread = interaction.channel  # o ctx.channel
+            # No bloquees el handler: programa la eliminación en background
+            asyncio.create_task(self.close_room(thread, delay=60, delete=True))
+
+
         finally:
             # Siempre liberar el bloqueo de votación
             room["vote_in_progress"] = False
-
-
 
 
 
