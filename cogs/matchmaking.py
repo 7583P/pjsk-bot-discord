@@ -1413,11 +1413,22 @@ class Matchmaking(commands.Cog):
             await ctx.send(table)
             await ctx.send("MMR Updated")
 
-            # Bloquear futuros submit en esta sala
-            room["finished"] = True
-            await ctx.send("this room has been submited results")
+            # Bloquear futuros submit en esta sala y permitir /c en otra
+            room["closed"] = True           # ya no acepta entradas nuevas
+            room["finished"] = True         # _find_player_room_id ahora la ignora para el bloqueo de /c
 
-            thread = interaction.channel  # o ctx.channel
+            await ctx.send("This room has been submited results")
+
+            # Notificar al resto de cogs (por ejemplo, Rooms) que la sala terminó
+            rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == ctx.channel.id), None)
+            if rid is not None:
+                self.bot.dispatch('room_finished', rid)
+
+            # Programar el cierre/borrado en segundo plano
+            asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
+
+
+            thread = ctx.channel # o ctx.channel
             # No bloquees el handler: programa la eliminación en background
             asyncio.create_task(self.close_room(thread, delay=60, delete=True))
 
