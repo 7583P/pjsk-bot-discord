@@ -321,15 +321,16 @@ class Matchmaking(commands.Cog):
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
 
-        # Estado de la sala
         started = info.get("started", False)
         started_at = info.get("started_at")   # epoch int si existe
-        if started:
-            # hora (solo hora local del usuario en Discord) – puedes cambiar :T por :t o :f si prefieres
+        if info.get("finished", False):
+            status = "[FINISHED]"
+        elif started:
             ts_part = f" <t:{int(started_at)}:T>" if started_at else ""
             status = f"[STARTED]{ts_part}"
         else:
             status = "[NOT STARTED]"
+
 
         header = f"Room {rid}: {len(rows)}/{capacity} Players · Average MMR {avg} · {status}"
 
@@ -1371,12 +1372,13 @@ class Matchmaking(commands.Cog):
                 mmr_final = mmr_prev + mmr_delta
                 role_name = get_rank_from_mmr(mmr_final)
 
+                # Persistencia de MMR y rol
                 await self.db_pool.execute(
                     "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
                     mmr_final, role_name, p["member"].id
                 )
 
-
+                # Actualización de roles en Discord
                 role_id = RANK_ROLE_IDS.get(role_name)
                 if role_id:
                     role_obj = ctx.guild.get_role(role_id)
@@ -1389,6 +1391,7 @@ class Matchmaking(commands.Cog):
                         except (discord.Forbidden, discord.HTTPException) as e:
                             await ctx.send(f"⚠️ No pude actualizar roles de {p['member'].mention}: {e}")
 
+                # Opcional: actualizar nick con el rango
                 if ctx.guild.me.guild_permissions.manage_nicknames:
                     base = p["member"].display_name
                     nick = f"{base} [{role_name}]"
@@ -1398,10 +1401,13 @@ class Matchmaking(commands.Cog):
                         await p["member"].edit(nick=nick)
                     except (discord.Forbidden, discord.HTTPException) as e:
                         await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
-                        
+
+                # ← medalla / posición: usa 🥇🥈🥉 para top3 y número para el resto
+                pos_str = medals.get(idx) or f"{idx}."
+
                 name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append((
-                    med,
+                    pos_str,
                     name_with_flag,
                     p["total"],
                     p["stats"],
@@ -1440,11 +1446,6 @@ class Matchmaking(commands.Cog):
 
             # Programar el cierre/borrado en segundo plano
             asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
-
-
-            thread = ctx.channel # o ctx.channel
-            # No bloquees el handler: programa la eliminación en background
-            asyncio.create_task(self.close_room(thread, delay=60, delete=True))
 
 
         finally:
