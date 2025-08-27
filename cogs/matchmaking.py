@@ -7,6 +7,7 @@ import aiohttp                 # descarga catálogo canciones
 import asyncpg                 # PostgreSQL asíncrono
 import discord
 import logging
+from collections import defaultdict
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
 from discord import Thread, TextChannel, MessageType
@@ -90,6 +91,9 @@ BRACKET_RANGES = {
 MIN_LEVEL_GAP = 2
 
 VOTE_TIMEOUT_SUBMIT = 30 
+
+ROOM_NAME_RE = re.compile(r"^sala\s+(\d+)\b", re.IGNORECASE)
+
 
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
     centers, gaps = [], []
@@ -407,6 +411,49 @@ class Matchmaking(commands.Cog):
         self.rooms: dict[int, dict] = {}
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
+        self.next_room_num: dict[int, int] = defaultdict(lambda: 1)
+        # Precarga números leyendo hilos existentes (activos/archivados)
+        self.bot.loop.create_task(self._warm_room_counters())
+
+    async def _warm_room_counters(self):
+        """Inicializa los contadores por categoría mirando hilos existentes."""
+        await self.bot.wait_until_ready()
+        for chan_id in ALLOWED_JOIN_CHANNELS:
+            chan = self.bot.get_channel(chan_id)
+            if not isinstance(chan, TextChannel):
+                continue
+
+            cat_id = chan.category_id
+            max_n = 0
+
+            # Activos
+            for th in chan.threads:
+                m = ROOM_NAME_RE.match(th.name)
+                if m:
+                    n = int(m.group(1))
+                    if n > max_n:
+                        max_n = n
+
+            # Archivados (API discord.py 2.x)
+            try:
+                async for th in chan.archived_threads(limit=None, private=False):
+                    m = ROOM_NAME_RE.match(th.name)
+                    if m:
+                        n = int(m.group(1))
+                        if n > max_n:
+                            max_n = n
+            except AttributeError:
+                # Si tu versión no tiene archived_threads, simplemente ignóralo
+                pass
+
+            # Siguiente número disponible en esa categoría
+            self.next_room_num[cat_id] = max(self.next_room_num[cat_id], max_n + 1)
+
+    def _next_room_name(self, category_id: int) -> str:
+        """Devuelve 'Sala N' y avanza el contador de esa categoría."""
+        n = self.next_room_num[category_id]
+        self.next_room_num[category_id] = n + 1
+        return f"Sala {n}"
 
 
 
@@ -828,19 +875,25 @@ class Matchmaking(commands.Cog):
         else:
             join_chan = ch
             players   = [m for m in join_chan.members if not m.bot]
+            cat_id = join_chan.category_id or 0
+            room_name = f"{self._next_room_name(cat_id)} ({lo}–{hi}★)"  # ej. "Sala 3 (23–27★)"
+
             thread = await join_chan.create_thread(
-                name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
+                name=room_name,
                 auto_archive_duration=60,
                 type=discord.ChannelType.public_thread
             )
+
             new_id = max(self.rooms.keys(), default=0) + 1
             self.rooms[new_id] = {
                 "players": players.copy(),
                 "thread": thread,
-                "category_id": join_chan.category_id or 0,
+                "category_id": cat_id,
                 "closed": True,               # ← ya cerrada para que /c no meta más
             }
-            room_entry = self.rooms[new_id]   # ← IMPORTANTE
+            room_entry = self.rooms[new_id]
+
+
 
         # — 6) Filtrar diffs según el rango (lo, hi) —
         allowed_diffs = DIFFICULTY_PRIORITY
@@ -984,12 +1037,15 @@ class Matchmaking(commands.Cog):
         # Crear sala si no hay
         if best_rid is None:
             new_id = max(self.rooms.keys(), default=0) + 1
+            room_name = self._next_room_name(current_cat)  # ej. "Sala 1"
+
             thread = await ch.create_thread(
-                name=f"sala-{new_id}",
+                name=room_name,
                 auto_archive_duration=60,
                 type=discord.ChannelType.private_thread,
                 invitable=False
             )
+
             self.rooms[new_id] = {
                 "players": [],
                 "thread": thread,
@@ -999,6 +1055,7 @@ class Matchmaking(commands.Cog):
                 "finished": False,
             }
             best_rid = new_id
+
 
             # Borrar el aviso automático del sistema
             async for msg in ch.history(limit=5):
@@ -1328,15 +1385,27 @@ class Matchmaking(commands.Cog):
                 uid = member.id
                 cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
+
+                # Bandera oficial (DB) como fallback — NO se actualiza aquí
+                profile_cc = await self.db_pool.fetchval(
+                    "SELECT country FROM players WHERE user_id=$1", uid
+                ) or ""
+
+                # Bandera SOLO para el mensaje de resultados (no persistente)
+                cc_up = (cc or "").upper()
+                display_flag = country_flag(cc_up) or country_flag(profile_cc)
+
                 total_points = sum(s*w for s, w in zip(stats, [5,3,2,1,0]))
                 players_list.append({
                     "member": member,
-                    "cc": cc,
+                    "cc": cc,                  # del submit (no persistir)
                     "stats": stats,
                     "total": total_points,
                     "old": old,
-                    "role": current_role
+                    "role": current_role,
+                    "display_flag": display_flag,  # ← usamos esto al imprimir resultados
                 })
+
 
             # Fase 1: bonus de Placement
             for p in players_list:
@@ -1360,9 +1429,10 @@ class Matchmaking(commands.Cog):
                 role_name = get_rank_from_mmr(mmr_final)
 
                 await self.db_pool.execute(
-                    "UPDATE players SET mmr=$1, role=$2, country=$3 WHERE user_id=$4",
-                    mmr_final, role_name, p["cc"], p["member"].id
+                    "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
+                    mmr_final, role_name, p["member"].id
                 )
+
 
                 role_id = RANK_ROLE_IDS.get(role_name)
                 if role_id:
@@ -1386,16 +1456,17 @@ class Matchmaking(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException) as e:
                         await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
 
-                med = medals.get(idx, str(idx))
+                name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append((
                     med,
-                    p["member"].display_name,
+                    name_with_flag,
                     p["total"],
                     p["stats"],
                     mmr_prev,
                     mmr_delta,
                     mmr_final
                 ))
+
 
             # Publicar resultados en canal de resultados y en el hilo
             join_parent    = ctx.channel.parent
