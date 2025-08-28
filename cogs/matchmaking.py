@@ -343,7 +343,7 @@ class Matchmaking(commands.Cog):
         return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
     
     async def close_room(self, thread: discord.Thread, *, delay: int = 60, delete: bool = True):
-        """Cierra/borra la sala con un retardo (delay). Por defecto: elimina a los 60s."""
+        """Cierra/borra la sala y la saca de self.rooms; avisa a Rooms."""
         if not isinstance(thread, discord.Thread):
             return
         if getattr(self, "_closing_threads", None) is None:
@@ -354,42 +354,64 @@ class Matchmaking(commands.Cog):
         self._closing_threads.add(thread.id)
         try:
             await asyncio.sleep(delay)
+            # 1) Intenta cerrar/borrar el hilo
             if delete:
-                await thread.delete(reason="Room auto-deleted 1 minute after results")
+                await thread.delete(reason="Room auto-deleted after results")
             else:
                 await thread.edit(archived=True, locked=True)
+
         except discord.Forbidden:
-            log.error("Faltan permisos: Manage Threads para eliminar hilos.")
+            log.error("Faltan permisos: Manage Threads para eliminar/editar hilos.")
         except Exception:
             log.exception("close_room falló para %s", thread.id)
         finally:
+            # 2) Saquemos la sala del dict y notifiquemos a Rooms
+            rid = next((rid for rid, info in self.rooms.items() if info["thread"].id == thread.id), None)
+            if rid is not None:
+                self.rooms.pop(rid, None)
+                try:
+                    self.bot.dispatch('room_finished', rid)
+                except Exception:
+                    pass
             self._closing_threads.discard(thread.id)
 
 
 
+
     async def update_room_board(self, guild: discord.Guild, rid: int):
-        """Crea/edita el mensaje 'tablero' del room en su thread."""
         info = self.rooms.get(rid)
         if not info:
             return
-        thread: discord.Thread = info["thread"]
-        content = await self._render_room_board_text(guild, rid)
+        # No intentes refrescar tableros de salas terminadas
+        if info.get("finished", False):
+            return
 
-        msg_id = info.get("board_msg_id")
-        if msg_id:
-            try:
+        thread: discord.Thread = info["thread"]
+        try:
+            content = await self._render_room_board_text(guild, rid)
+            msg_id = info.get("board_msg_id")
+
+            if msg_id:
                 msg = await thread.fetch_message(msg_id)
                 await msg.edit(content=content)
                 return
-            except discord.NotFound:
-                info.pop("board_msg_id", None)
 
-        msg = await thread.send(content)
-        try:
-            await msg.pin()
+            msg = await thread.send(content)
+            try:
+                await msg.pin()
+            except Exception:
+                pass
+            info["board_msg_id"] = msg.id
+
+        except (discord.NotFound, discord.Forbidden):
+            # El hilo ya no existe o no tenemos permisos: quita la sala y avisa
+            dead_rid = next((k for k, v in self.rooms.items() if v is info), None)
+            if dead_rid is not None:
+                self.rooms.pop(dead_rid, None)
+                self.bot.dispatch('room_finished', dead_rid)
         except Exception:
-            pass
-        info["board_msg_id"] = msg.id
+            log.exception("update_room_board falló para rid=%s", rid)
+
 
     async def refresh_rooms_board_for_guild(self, guild: discord.Guild):
         """Re-renderiza todos los rooms del guild (para cambios de nombres)."""
