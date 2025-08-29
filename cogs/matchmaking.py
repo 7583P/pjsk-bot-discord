@@ -161,16 +161,6 @@ RANK_ROLE_IDS = {
 # Constantes de Placement
 # ——————————————————————————————
 PLACEMENT_ROLE_ID = 1371321594068336811
-PLACEMENT_MMR_BONUS = {
-    "Iron":     50,
-    "Bronze":   101,
-    "Silver":   201,
-    "Gold":     301,
-    "Platinum": 401,
-    "Diamond":  501,
-    "Crystal":  601,
-    "Master":   701,
-}
 
 class Top100View(View):
     def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction):
@@ -1180,19 +1170,43 @@ class Matchmaking(commands.Cog):
         )
 
     @staticmethod
-    def get_role_from_notes(stats):
-        # stats: [perfect, great, good, bad, miss]
+    def placement_seed_from_stats(stats) -> tuple[int, str]:
+        """
+        stats: [perfect, great, good, bad, miss] sumados en las 5 canciones.
+        Devuelve (seed_mmr, seed_rank) según la tabla de Placement.
+        """
         perfect, great, good, bad, miss = stats
-        if perfect > 0 and great == 0 and good == 0 and bad == 0 and miss == 0:
-            return "Master"
-        total = great + good + bad + miss
-        if total <= 5: return "Crystal"
-        elif total <= 15: return "Diamond"
-        elif total <= 30: return "Platinum"
-        elif total <= 50: return "Gold"
-        elif total <= 100: return "Silver"
-        elif total <= 250: return "Bronze"
-        else: return "Iron"
+        other = great + good + bad + miss
+
+        if other == 0:                # All perfect (5 songs)
+            return 801, "Champion"
+        if other == 1:
+            return 750, "Master"
+        if other == 2:
+            return 740, "Master"
+        if other == 3:
+            return 730, "Master"
+        if other == 4:
+            return 720, "Master"
+        if other == 5:
+            return 710, "Master"
+        if 6 <= other <= 10:
+            return 701, "Master"
+        if 11 <= other <= 15:
+            return 601, "Crystal"
+        if 16 <= other <= 30:
+            return 501, "Diamond"
+        if 31 <= other <= 50:
+            return 401, "Platinum"
+        if 51 <= other <= 100:
+            return 301, "Gold"
+        if 101 <= other <= 200:
+            return 201, "Silver"
+        if 201 <= other <= 350:
+            return 101, "Bronze"
+        return 50, "Iron"  # 351 - infinito
+
+
 
 
     @commands.command(name="submit")
@@ -1376,10 +1390,12 @@ class Matchmaking(commands.Cog):
             # Fase 1: bonus de Placement
             for p in players_list:
                 if p["role"] == "Placement":
-                    bonus_role      = self.get_role_from_notes(p["stats"])
-                    p["mmr_actual"] = PLACEMENT_MMR_BONUS[bonus_role]
+                    seed_mmr, seed_rank = self.placement_seed_from_stats(p["stats"])
+                    p["mmr_actual"] = seed_mmr
+                    p["seed_rank"]  = seed_rank
                 else:
                     p["mmr_actual"] = p["old"]
+
 
             # Fase 2: Elo por pares con K fijo
             players_list.sort(key=lambda x: x["total"], reverse=True)
