@@ -1375,7 +1375,7 @@ class Matchmaking(commands.Cog):
                 cc_up = (cc or "").upper()
                 display_flag = country_flag(cc_up) or country_flag(profile_cc)
 
-                total_points = sum(s*w for s, w in zip(stats, [5,3,2,1,0]))
+                total_points = sum(s*w for s, w in zip(stats, [4,3,2,1,0]))
                 players_list.append({
                     "member": member,
                     "cc": cc,                  # del submit (no persistir)
