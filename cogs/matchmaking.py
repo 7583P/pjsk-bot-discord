@@ -120,23 +120,23 @@ def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
 
 def get_rank_from_mmr(mmr: int) -> str:
 
-    if mmr <= 100:
+    if mmr <= 99:
         return "Iron"
-    elif mmr <= 200:
+    elif mmr <= 199:
         return "Bronze"
-    elif mmr <= 300:
+    elif mmr <= 299:
         return "Silver"
-    elif mmr <= 400:
+    elif mmr <= 399:
         return "Gold"
-    elif mmr <= 500:
+    elif mmr <= 499:
         return "Platinum"
-    elif mmr <= 600:
+    elif mmr <= 599:
         return "Diamond"
-    elif mmr <= 700:
+    elif mmr <= 699:
         return "Crystal"
-    elif mmr <= 800:
+    elif mmr <= 799:
         return "Master"
-    elif mmr <= 900:
+    elif mmr <= 899:
         return "Champion"
     elif mmr <= 999:
         return "Grand Champion"
@@ -1191,19 +1191,19 @@ class Matchmaking(commands.Cog):
         if other == 5:
             return 710, "Master"
         if 6 <= other <= 10:
-            return 701, "Master"
+            return 700, "Master"
         if 11 <= other <= 15:
-            return 601, "Crystal"
+            return 600, "Crystal"
         if 16 <= other <= 30:
-            return 501, "Diamond"
+            return 500, "Diamond"
         if 31 <= other <= 50:
-            return 401, "Platinum"
+            return 400, "Platinum"
         if 51 <= other <= 100:
-            return 301, "Gold"
+            return 300, "Gold"
         if 101 <= other <= 200:
-            return 201, "Silver"
+            return 200, "Silver"
         if 201 <= other <= 350:
-            return 101, "Bronze"
+            return 100, "Bronze"
         return 50, "Iron"  # 351 - infinito
 
 
