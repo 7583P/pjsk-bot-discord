@@ -1179,7 +1179,7 @@ class Matchmaking(commands.Cog):
         other = great + good + bad + miss
 
         if other == 0:                # All perfect (5 songs)
-            return 801, "Champion"
+            return 800, "Champion"
         if other == 1:
             return 750, "Master"
         if other == 2:
