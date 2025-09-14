@@ -57,7 +57,7 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 
 # Mapeo de rangos a dificultades permitidas
 ALLOWED_DIFFS_BY_RANK = {
-    "Placement":     ("hard", "expert", "master", "append"),
+    "Placement":     ("hard", "expert", "master"),
     "Iron":          ("hard", "expert", "master"),
     "Bronze":        ("hard", "expert", "master", "append"),
     "Silver":        ("hard", "expert", "master", "append"),
@@ -73,7 +73,7 @@ ALLOWED_DIFFS_BY_RANK = {
 
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
-    "Placement":     (21, 28),
+    "Placement":     (24, 28),
     "Iron":          (17, 22),
     "Bronze":        (19, 24),
     "Silver":        (20, 25),
@@ -736,10 +736,15 @@ class Matchmaking(commands.Cog):
 
         # 2.1) Determinar diffs permitidos según el rango resultante
         allowed_diffs = DIFFICULTY_PRIORITY
-        for rank, (lo, hi) in BRACKET_RANGES.items():
-            if lo == low and hi == high:
+        for rank, (lo, hi2) in BRACKET_RANGES.items():
+            if lo == low and hi2 == high:
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
+
+        # 🚫 Regla adicional: si hay al menos un Placement en la sala, quitar "append"
+        if counts.get("Placement", 0) > 0:
+            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
+
 
         # 3) Obtén el pool de canciones
         all_songs = await self._get_9_songs(low, high, allowed_diffs)
@@ -861,6 +866,10 @@ class Matchmaking(commands.Cog):
             if rlo == lo and rhi == hi:
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
+
+        # 🚫 Regla adicional: si hay Placement en la sala, quitar "append"
+        if counts.get("Placement", 0) > 0:
+            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
 
         # — 6.1) Obtener 5 canciones y mezclar —
         all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
