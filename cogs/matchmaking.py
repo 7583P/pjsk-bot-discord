@@ -731,13 +731,17 @@ class Matchmaking(commands.Cog):
             )
             counts[user_rank] += 1
 
-        # 2) Elige low/high según media de centros
-        low, high = dynamic_range(counts)
+        # — 2) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
+        if counts.get("Placement", 0) > 0:
+            low, high = BRACKET_RANGES["Placement"]  # (25, 28)
+        else:
+            low, high = dynamic_range(counts)
 
-        # 2.1) Determinar diffs permitidos según el rango resultante
+        # — 2.1) Dificultades permitidas según el (low,high) elegido —
+        #        (si se forzó Placement, esto devolverá ("hard","expert","master"))
         allowed_diffs = DIFFICULTY_PRIORITY
-        for rank, (lo, hi2) in BRACKET_RANGES.items():
-            if lo == low and hi2 == high:
+        for rank, (lo_r, hi_r) in BRACKET_RANGES.items():
+            if lo_r == low and hi_r == high:
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
 
@@ -837,8 +841,12 @@ class Matchmaking(commands.Cog):
             )
             counts[user_rank] += 1
 
-        # — 5) Elige low/high según media de centros —
-        lo, hi = dynamic_range(counts)
+        # — 5) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
+        if counts.get("Placement", 0) > 0:
+            lo, hi = BRACKET_RANGES["Placement"]  # (25, 28)
+        else:
+            lo, hi = dynamic_range(counts)
+
 
         # — 8) Envía la vista en el hilo correspondiente —
         if is_join_thread:
@@ -862,10 +870,11 @@ class Matchmaking(commands.Cog):
 
         # — 6) Filtrar diffs según el rango (lo, hi) —
         allowed_diffs = DIFFICULTY_PRIORITY
-        for rank,(rlo,rhi) in BRACKET_RANGES.items():
+        for rank, (rlo, rhi) in BRACKET_RANGES.items():
             if rlo == lo and rhi == hi:
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
+
 
         # 🚫 Regla adicional: si hay Placement en la sala, quitar "append"
         if counts.get("Placement", 0) > 0:
