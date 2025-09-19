@@ -73,7 +73,7 @@ ALLOWED_DIFFS_BY_RANK = {
 
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
-    "Placement":     (24, 28),
+    "Placement":     (25, 28),
     "Iron":          (17, 22),
     "Bronze":        (19, 24),
     "Silver":        (20, 25),
@@ -87,7 +87,7 @@ BRACKET_RANGES = {
     "Legend":        (32, 37),
 }
 
-MIN_LEVEL_GAP = 2
+MIN_LEVEL_GAP = 3
 
 VOTE_TIMEOUT_SUBMIT = 30 
 
