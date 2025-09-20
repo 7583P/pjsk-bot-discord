@@ -1,10 +1,11 @@
 import os
-import aiosqlite
+import asyncpg
 import discord
 from discord.ext import commands
 
 # ─────────── CONFIGURACIÓN ───────────
 DB_PATH   = "matchmaking.db"
+DATABASE_URL      = os.getenv("DB_HOST")  # postgresql://user:pass@host:port/dbname
 GUILD_ID  = int(os.getenv("GUILD_ID", "0"))  # Asegúrate de que la variable GUILD_ID esté definida en tu entorno
 
 class AutoRoles(commands.Cog):
@@ -17,15 +18,16 @@ class AutoRoles(commands.Cog):
         Se ejecuta cuando se carga el cog.
         Conecta a la base de datos y se asegura de que exista la tabla players.
         """
-        self.db = await aiosqlite.connect(DB_PATH)
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                user_id INTEGER PRIMARY KEY,
-                mmr     INTEGER DEFAULT 0,
-                role    TEXT    DEFAULT 'Placement'
-            );
-        """)
-        await self.db.commit()
+        self.db_pool = await asyncpg.create_pool(DATABASE_URL)
+        # self.db = await aiosqlite.connect(DB_PATH)
+        # await self.db.execute("""
+        #     CREATE TABLE IF NOT EXISTS players (
+        #         user_id INTEGER PRIMARY KEY,
+        #         mmr     INTEGER DEFAULT 0,
+        #         role    TEXT    DEFAULT 'Placement'
+        #     );
+        # """)
+        # await self.db.commit()
         print("[AutoRoles] Tabla 'players' creada o ya existía.")
 
     async def cog_unload(self):
