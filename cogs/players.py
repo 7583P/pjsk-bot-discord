@@ -62,14 +62,14 @@ async def upsert_player(user_id: int, name: str, country: str):
         ON CONFLICT (user_id) DO UPDATE SET
           name = EXCLUDED.name,
           country = EXCLUDED.country
-        RETURNING id
+        RETURNING user_id
     """
 
     # seasonplayers has (player_id, season_id, ...) with a unique constraint on that pair
     sql_seasonplayers = """
-        INSERT INTO seasonplayers (player_id, season_id, points, mmr, role)
+        INSERT INTO seasonplayers (user_id, season_id, points, mmr, role)
         VALUES ($1, $2, 0, 0, 'Placement')
-        ON CONFLICT (player_id, season_id) DO UPDATE SET
+        ON CONFLICT (user_id, season_id) DO UPDATE SET
           season_id = EXCLUDED.season_id
     """
 
@@ -77,7 +77,7 @@ async def upsert_player(user_id: int, name: str, country: str):
     try:
         async with conn.transaction():
             player_row = await conn.fetchrow(sql_players, user_id, name, country)
-            player_id = player_row["id"]
+            player_id = player_row["user_id"]
             await conn.execute(sql_seasonplayers, player_id, season_id)
     finally:
         await conn.close()
