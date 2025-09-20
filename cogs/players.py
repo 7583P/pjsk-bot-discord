@@ -246,33 +246,33 @@ class PlayersCog(commands.Cog):
         # Resolver member
         member = member_or_id if isinstance(member_or_id, discord.Member) else guild.get_member(int(member_or_id))
         if member is None:
-            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
             try:
                 member = await guild.fetch_member(int(member_or_id))
             except Exception:
                 return False
 
-        # Normaliza y resuelve rol objetivo (fallback a Placement)
+        # Rol destino (fallback a Placement)
         role_name = (role_name or "Placement").strip()
-        if role_name not in RANK_ROLE_IDS:
-            role_name = "Placement"
-
-        target_role = guild.get_role(RANK_ROLE_IDS[role_name])
+        role_id = RANK_ROLE_IDS.get(role_name, RANK_ROLE_IDS["Placement"])
+        target_role = guild.get_role(role_id)
         if not target_role:
-            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
+            # Intentar Placement si el rol destino no existe en el server
             target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
             if not target_role:
                 return False
 
-        # Mantener roles NO-rango y agregar el nuevo rango
-        keep = [r for r in member.roles if r.id not in rank_role_ids]
-        new_roles = list(dict.fromkeys(keep + [target_role]))
+        # Quitar todos los rangos antiguos y dejar solo el destino (sin tocar roles no-rango)
+        to_remove = [r for r in member.roles if r.id in rank_role_ids and r.id != target_role.id]
 
         try:
-            await member.edit(roles=new_roles, reason=reason or f"Apply rank {role_name}")
+            if to_remove:
+                await member.remove_roles(*to_remove, reason=reason or f"Remove old rank roles -> {role_name}")
+            if target_role not in member.roles:
+                await member.add_roles(target_role, reason=reason or f"Apply rank {role_name}")
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
+
 
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -325,10 +325,7 @@ class PlayersCog(commands.Cog):
             if guild is None:
                 return await interaction.response.send_message("❌ This command must be used inside a server.", ephemeral=True)
 
-            placement_role = guild.get_role(1371321594068336811)
-
             async with self.db_pool.acquire() as conn:
-                # fetch batch to sync
                 rows = await conn.fetch("""
                     SELECT sp.user_id, sp.role
                     FROM seasonplayers sp
@@ -336,26 +333,24 @@ class PlayersCog(commands.Cog):
                     AND sp.synced = false
                 """, current_season_id)
 
-                synced = 0
-                for r in rows:
-                    uid = int(r["user_id"])
-                    role_name = (r["role"] or "Placement").strip()
-                    ok = await self._apply_rank_role(
-                        guild,
-                        uid,
-                        role_name,
-                        reason=f"Season {current_season_id} sync"
-                    )
-                    if ok:
-                        synced += 1
+            ok_ids = []
 
-                # marcar synced=true para todos los procesados
-                await conn.execute("""
-                    UPDATE seasonplayers
-                    SET synced = true
-                    WHERE season_id = $1 AND synced = false
-                """, current_season_id)
+            for r in rows:
+                uid = int(r["user_id"])
+                role_name = (r["role"] or "Placement").strip()
+                ok = await self._apply_rank_role(guild, uid, role_name, reason=f"Season {current_season_id} sync")
+                if ok:
+                    ok_ids.append(uid)
+                    synced += 1
 
+            if ok_ids:
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE seasonplayers
+                        SET synced = true
+                        WHERE season_id = $1
+                        AND user_id = ANY($2::bigint[])
+                    """, current_season_id, ok_ids)
 
         except Exception as e:
             return await interaction.response.send_message(f"⚠️ Partial success (season ok). Role sync error: {e}", ephemeral=True)
