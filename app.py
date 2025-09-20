@@ -64,5 +64,27 @@ WHERE sp.season_id = $1 order by sp.mmr desc;
         for r in rows
     ]
 
+@app.get("/api/seasons")
+async def get_seasons():    
+    # Cambia el query: usa user_id o el campo PK real
+    query = """
+        select id, 'Current' as name, active, startdate, enddate from seasons where active = true
+        union all
+        select id, name, active, startdate, enddate from seasons where active = false order by startdate asc;
+    """
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(query)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+
+    return [
+        {"id":      r["id"],
+         "name":    r["name"],
+         "startdate":     r["startdate"],
+         "enddate": r["enddate"]}
+        for r in rows
+    ]
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
