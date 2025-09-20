@@ -179,7 +179,7 @@ class Top100View(View):
         # datos de la página actual
         offset = self.page * self.per_page
         rows = await self.db.fetch(
-            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
+            "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
             offset, self.per_page
         )
 

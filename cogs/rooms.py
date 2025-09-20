@@ -80,7 +80,7 @@ class Rooms(commands.Cog):
                         if getattr(mm, "db_pool", None) is not None:
                             async with mm.db_pool.acquire() as con:
                                 rows_db = await con.fetch(
-                                    "SELECT user_id, COALESCE(mmr,0) AS mmr FROM players WHERE user_id = ANY($1::bigint[])",
+                                    "SELECT p.user_id, COALESCE(sp.mmr,0) AS mmr FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = ANY($1::bigint[])",
                                     ids
                                 )
                             mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
