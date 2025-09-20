@@ -36,13 +36,25 @@ class AutoRoles(commands.Cog):
         await self.db.close()
 
     # ─────────── MÉTODO AUXILIAR: fetch_player ───────────
+
+    async def get_current_season(self):
+        sql = """ 
+        SELECT ID, Name, Active, StartDate, EndDate from seasons where active = true
+        """;        
+        try:
+            row = await self.db.fetchrow(sql)
+            return row  # asyncpg.Record (dict-like object)
+        finally:
+            await self.db.close()
+
     async def fetch_player(self, user_id: int):
+        season = self.get_current_season()
         """
         Recupera (mmr, role) de la tabla players para user_id.
         Si no existe, lo crea con mmr=0 y role='Placement' y devuelve (0, 'Placement').
         """
         async with self.db.execute(
-            "SELECT mmr, role FROM players WHERE user_id = ?", (user_id,)
+            "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE sp.season_id = ? and p.user_id = ?", (season["season_id"],user_id,)
         ) as cursor:
             row = await cursor.fetchone()
 

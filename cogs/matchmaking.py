@@ -179,7 +179,7 @@ class Top100View(View):
         # datos de la página actual
         offset = self.page * self.per_page
         rows = await self.db.fetch(
-            "SELECT user_id, mmr, role FROM players ORDER BY mmr DESC OFFSET $1 LIMIT $2",
+            "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
             offset, self.per_page
         )
 
@@ -539,8 +539,7 @@ class Matchmaking(commands.Cog):
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS players (
-                    user_id BIGINT PRIMARY KEY,
-                    mmr     INTEGER DEFAULT 0,
+                    user_id BIGINT PRIMARY KEY,                    
                     role    TEXT    DEFAULT 'Placement',
                     country TEXT    DEFAULT ''
                 );
@@ -922,16 +921,16 @@ class Matchmaking(commands.Cog):
     async def fetch_player(self, user_id: int):
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT mmr, role FROM players WHERE user_id = $1", user_id
+                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1", user_id
             )
             if row:
                 return row["mmr"], row["role"]
-            await conn.execute(
-                "INSERT INTO players (user_id, mmr, role) VALUES ($1, 0, 'Placement')",
-                user_id,
-            )
+            # await conn.execute(
+            #     "INSERT INTO players (user_id, mmr, role) VALUES ($1, 0, 'Placement')",
+            #     user_id,
+            # )
             row = await conn.fetchrow(
-                "SELECT mmr, role FROM players WHERE user_id = $1", user_id
+                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1", user_id
             )
             return row["mmr"], row["role"]
 
