@@ -916,12 +916,28 @@ class Matchmaking(commands.Cog):
             f"✅ Votación iniciada en {thread.mention}", ephemeral=True
         )
 
-
+    async def get_current_season(self) -> asyncpg.Record | None:
+        """
+        Returns the active season row or None.
+        """
+        assert self.db_pool is not None, "DB pool not initialized"
+        sql = """
+            SELECT id, name, active, startdate, enddate
+            FROM seasons
+            WHERE active = true
+            ORDER BY startdate DESC
+            LIMIT 1
+        """
+        async with self.db_pool.acquire() as conn:
+            return await conn.fetchrow(sql)
 
     async def fetch_player(self, user_id: int):
+        season = await self.get_current_season()
+        season_id = season["id"]
+
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1", user_id
+                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1 and sp.season_id  = $2", user_id, season_id
             )
             if row:
                 return row["mmr"], row["role"]
@@ -930,7 +946,7 @@ class Matchmaking(commands.Cog):
             #     user_id,
             # )
             row = await conn.fetchrow(
-                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1", user_id
+                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1 and sp.season_id  = $2", user_id, season_id
             )
             return row["mmr"], row["role"]
 
@@ -1156,7 +1172,9 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def top100(self, interaction: discord.Interaction):
         view = Top100View(self.db_pool, interaction)
-        total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players")
+        season = await self.get_current_season()
+        season_id = season["id"]
+        total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $1", season_id)
         max_page = (total - 1) // view.per_page if total else 0
         view.prev_page.disabled = True
         view.next_page.disabled = (0 == max_page)
