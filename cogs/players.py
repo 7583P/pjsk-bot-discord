@@ -13,6 +13,23 @@ load_dotenv()
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
 
+# Diccionario con todos los roles de rango (Discord Role IDs)
+RANK_ROLE_IDS = {
+    "Placement":      1371321594068336811,
+    "Iron":           1394444407536881845,        
+    "Bronze":         1371324225838645339,
+    "Silver":         1389343997100560514,
+    "Gold":           1371324328708149328,
+    "Platinum":       1389343805521789098,
+    "Diamond":        1371324561542484108,
+    "Crystal":        1394445724703527012,
+    "Master":         1394635883466199110,
+    "Champion":       1371323543501144115,
+    "Grand Champion": 1394444744892874832,
+    "Legend":         1371323380510363749,
+}
+
+
 # Crea una conexión temporal a PostgreSQL (usa un pool en producción)
 async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
@@ -226,6 +243,12 @@ class PlayersCog(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="newseason", description="Setup new season (create if needed, migrate players, sync roles)")
     async def newseason(self, interaction: discord.Interaction):
+        # Permitir solo a un usuario específico
+        if interaction.user.id != 878310498720940102:
+            return await interaction.response.send_message(
+                "❌ No tienes permiso para ejecutar este comando.", ephemeral=True
+            )
+
         # 1) Ensure current season exists (create if needed)
         try:
             current_season_id, prev_season_id, created = await self._ensure_current_season()
@@ -279,31 +302,29 @@ class PlayersCog(commands.Cog):
                 """, current_season_id)
 
                 # assign roles in Discord
-                rank_role_ids = {1371321594068336811}
+                rank_role_ids = set(RANK_ROLE_IDS.values())  # todos los roles de rango
                 for r in rows:
                     uid = int(r["user_id"])
                     role_name = r["role"] or "Placement"
                     member = guild.get_member(uid)
                     if member is None:
-                        # member not in guild or not cached — skip silently
                         continue
 
-                    # target role
-                    target_role = placement_role
-
+                    # Rol objetivo (si no existe el rol en guild, usa Placement por defecto)
+                    target_role = guild.get_role(RANK_ROLE_IDS.get(role_name, RANK_ROLE_IDS["Placement"]))
                     if not target_role:
-                        # if role missing in guild, skip this user
                         continue
 
-                    # keep non-rank roles; add target
+                    # Mantener roles que NO sean de rango + agregar el nuevo rol
                     keep = [rr for rr in member.roles if rr.id not in rank_role_ids]
                     new_roles = list(dict.fromkeys(keep + [target_role]))
+
                     try:
                         await member.edit(roles=new_roles, reason=f"Season {current_season_id} sync")
                         synced += 1
                     except (discord.Forbidden, discord.HTTPException):
-                        # insufficient perms or hierarchy — skip
                         continue
+
 
                 # mark synced=true for everyone we attempted where they now have the role
                 # (to keep logic simple, set synced=true for all rows processed this run)

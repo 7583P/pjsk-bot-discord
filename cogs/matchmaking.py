@@ -171,6 +171,7 @@ class Top100View(View):
         self.page     = 0
         self.per_page = 20
 
+
     async def build_embed(self) -> Embed:
         # total hasta 100 y páginas
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
@@ -285,6 +286,102 @@ class Matchmaking(commands.Cog):
         if cap is not None:
             out = [max(-cap, min(cap, d)) for d in out]
         return out
+    
+    def _format_results_board(self, season_name: str, summary_rows: list[tuple]) -> str:
+        """
+        summary_rows = lista de tuplas:
+        (pos_str, name_with_flag, total_points, stats_list, mmr_prev, mmr_delta, mmr_final)
+        Devuelve una tabla monoespaciada lista para enviar.
+        """
+        header = f"RESULTS — Season {season_name} (activa)"
+        colh   = "Pos · Player                      · Points · PGGBM       ·  MMR/+-"
+        sep    = "----+------------------------------+--------+-------------+----------------------"
+
+        lines = []
+        for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
+            # columnas: Pos (4) · Nombre (30) · Pts (6) · PGGBM (11) · "prev  Δ = final"
+            pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+            lines.append(
+                f"{med:>3} | {name:<30} | {pts:>6} | {pggbm:<11} | {mmr_prev:>5} {mmr_delta:+3d} = {mmr_final:<5}"
+            )
+
+        body = "\n".join(lines) if lines else "(sin filas)"
+        return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
+
+    async def _resolve_season_id(self, season_choice: str | None) -> tuple[int | None, str]:
+        """
+        Devuelve (season_id, season_name) según la elección del usuario.
+        - None o "actual"  => temporada activa (get_current_season)
+        - "beta"           => busca por nombre 'beta'
+        """
+        if (season_choice or "actual").lower() in ("actual", "current"):
+            row = await self.get_current_season()
+            return (row["id"], row["name"]) if row else (None, "N/A")
+
+        # Beta por nombre (case-insensitive)
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id, name FROM seasons WHERE LOWER(name) = 'beta' ORDER BY startdate LIMIT 1"
+            )
+        return (row["id"], row["name"]) if row else (None, "Beta")
+
+    async def _fetch_user_stats(self, user_id: int, season_id: int):
+        """
+        Devuelve (pos, total, mmr, role) para user_id en la season dada, o None si no existe.
+        """
+        sql = """
+        WITH ranked AS (
+          SELECT
+            sp.user_id,
+            sp.mmr,
+            sp.role,
+            RANK() OVER (ORDER BY sp.mmr DESC) AS pos
+          FROM seasonplayers sp
+          WHERE sp.season_id = $2
+        )
+        SELECT r.pos, (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
+               r.mmr, r.role
+        FROM ranked r
+        WHERE r.user_id = $1
+        """
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(sql, user_id, season_id)
+        if not row:
+            return None
+        return int(row["pos"]), int(row["total"]), int(row["mmr"]), row["role"]
+
+    async def _fetch_cutoff(self, season_id: int, rank_n: int) -> int:
+        """
+        Devuelve el MMR del puesto N (rank_n) en la season dada.
+        Si no existe ese puesto, devuelve 0.
+        """
+        sql = """
+            SELECT sp.mmr
+            FROM seasonplayers sp
+            WHERE sp.season_id = $1
+            ORDER BY sp.mmr DESC
+            OFFSET $2 LIMIT 1
+        """
+        async with self.db_pool.acquire() as conn:
+            val = await conn.fetchval(sql, season_id, max(0, rank_n - 1))
+        return int(val) if val is not None else 0
+
+    def _format_cutoffs_board(self, season_name: str, data: dict[int, int]) -> str:
+        """
+        data: {10:mmr, 20:mmr, 30:mmr, 40:mmr, 50:mmr, 100:mmr}
+        Devuelve el board monoespaciado.
+        """
+        header = f"CUTOFFS — Season {season_name}"
+        colh   = "Tier |   MMR"
+        sep    = "-----+-------"
+        lines  = []
+        for n in (10, 20, 30, 40, 50, 100):
+            mmr = data.get(n, 0)
+            lines.append(f"T{n:<3}| {mmr:>6}")
+        body = "\n".join(lines) if lines else "(sin datos)"
+        return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
+
+
 
     async def resolve_member_name(self, guild: discord.Guild, user_id: int) -> str:
         """Nick del servidor > global display name > username."""
@@ -1077,6 +1174,97 @@ class Matchmaking(commands.Cog):
             asyncio.create_task(self.launch_song_poll(room))
 
 
+    @app_commands.command(name="stats", description="Muestra tu posición, rango y MMR en la season elegida")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(season="Temporada: Actual o Beta")
+    @app_commands.choices(
+        season=[
+            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Beta",   value="beta"),
+        ]
+    )
+    async def stats(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
+        season_val = season.value if season else None
+        season_id, season_name = await self._resolve_season_id(season_val)
+        if not season_id:
+            return await interaction.response.send_message("⚠️ No encontré la temporada seleccionada.", ephemeral=True)
+
+        user_id = interaction.user.id
+        data = await self._fetch_user_stats(user_id, season_id)
+        if not data:
+            return await interaction.response.send_message(
+                f"No tienes registro en **Season {season_name}**.", ephemeral=True
+            )
+
+        pos, total, mmr, role = data
+        msg = (
+            f"**📊 Stats — Season {season_name}**\n"
+            f"• **Jugador:** {interaction.user.mention}\n"
+            f"• **Posición:** #{pos} de {total}\n"
+            f"• **MMR:** {mmr}\n"
+            f"• **Rango:** {role}"
+        )
+        await interaction.response.send_message(msg)
+
+    @app_commands.command(name="stats_user", description="Muestra posición, rango y MMR de un jugador en la season elegida")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(user="Jugador", season="Temporada: Actual o Beta")
+    @app_commands.choices(
+        season=[
+            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Beta",   value="beta"),
+        ]
+    )
+    async def stats_user(self, interaction: discord.Interaction, user: discord.Member, season: app_commands.Choice[str] | None = None):
+        season_val = season.value if season else None
+        season_id, season_name = await self._resolve_season_id(season_val)
+        if not season_id:
+            return await interaction.response.send_message("⚠️ No encontré la temporada seleccionada.", ephemeral=True)
+
+        data = await self._fetch_user_stats(user.id, season_id)
+        if not data:
+            return await interaction.response.send_message(
+                f"{user.mention} no tiene registro en **Season {season_name}**.", ephemeral=True
+            )
+
+        pos, total, mmr, role = data
+        msg = (
+            f"**📊 Stats — Season {season_name}**\n"
+            f"• **Jugador:** {user.mention}\n"
+            f"• **Posición:** #{pos} de {total}\n"
+            f"• **MMR:** {mmr}\n"
+            f"• **Rango:** {role}"
+        )
+        await interaction.response.send_message(msg)
+
+    @app_commands.command(
+        name="cutoffs",
+        description="Muestra los MMR de T10, T20, T30, T40, T50 y T100 para la season elegida"
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(season="Temporada: Actual o Beta")
+    @app_commands.choices(
+        season=[
+            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Beta",   value="beta"),
+        ]
+    )
+    async def cutoffs(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
+        season_val = season.value if season else None
+        season_id, season_name = await self._resolve_season_id(season_val)
+        if not season_id:
+            return await interaction.response.send_message("⚠️ No encontré la temporada seleccionada.", ephemeral=True)
+
+        # calcular cutoffs
+        tiers = (10, 20, 30, 40, 50, 100)
+        data  = {}
+        for n in tiers:
+            data[n] = await self._fetch_cutoff(season_id, n)
+
+        board = self._format_cutoffs_board(season_name, data)
+        await interaction.response.send_message(board)
+
+
 
     @app_commands.command(name="d", description="Salir de la sala")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -1491,21 +1679,19 @@ class Matchmaking(commands.Cog):
                 ))
 
 
-            # Publicar resultados en canal de resultados y en el hilo
-            join_parent    = ctx.channel.parent
+            # Publicar resultados en canal de resultados y en el hilo (como board)
+            season_row    = await self.get_current_season()
+            season_name   = season_row["name"] if season_row else "N/A"
+            join_parent   = ctx.channel.parent
             result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
             result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
-            table = "**🏆 Results 🏆**\n"
-            table += "Pos · Player · Points · PGGBM ·  MMR (previo + Δ = final)\n"
-            for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary:
-                pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-                table += f"{med} · **{name}** · {pts} · {pggbm} · {mmr_prev} {mmr_delta:+d} = {mmr_final}\n"
-
-            await result_chan.send(table)
+            board = self._format_results_board(season_name, summary)
+            await result_chan.send(board)
+            await ctx.send(board)
             await result_chan.send("MMR Updated")
-            await ctx.send(table)
             await ctx.send("MMR Updated")
+
 
             # Bloquear futuros submit en esta sala y permitir /c en otra
             room["closed"] = True           # ya no acepta entradas nuevas
