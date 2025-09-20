@@ -1,7 +1,7 @@
 import os
 import re
 import asyncpg
-from datetime import datetime
+import datetime as dt
 import calendar
 import discord
 from discord import app_commands
@@ -12,14 +12,6 @@ from dotenv import load_dotenv
 load_dotenv()
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
-
-# Calcula la temporada actual ('beta' o número cada 3 meses)
-def get_current_season_label() -> str:
-    start = datetime(2025, 5, 16)
-    now = datetime.now()
-    months = (now.year - start.year) * 12 + (now.month - start.month)
-    period = months // 3
-    return "beta" if period == 0 else str(period)
 
 # Crea una conexión temporal a PostgreSQL (usa un pool en producción)
 async def get_conn():
@@ -177,19 +169,20 @@ class PlayersCog(commands.Cog):
         )
 
     @staticmethod
-    def _month_bounds_utc(today: datetime.date) -> tuple[datetime.date, datetime.date]:
+    def _month_bounds_utc(today: dt.date) -> tuple[dt.date, dt.date]:
         start = today.replace(day=1)
         last_day = calendar.monthrange(today.year, today.month)[1]
         end = today.replace(day=last_day)
         return start, end
-
+    
     async def _ensure_current_season(self) -> tuple[int, int | None, bool]:
         """
         Returns (current_season_id, previous_active_season_id, created_new_flag).
         Creates a new active season for the *current month* if none active covers today.
         """
         pool = self.db_pool        
-        today = datetime.date.today()
+        today = dt.date.today()
+        startdate, enddate = self._month_bounds_utc(today)
         async with pool.acquire() as conn:
             async with conn.transaction():
                 cur = await conn.fetchrow("""
