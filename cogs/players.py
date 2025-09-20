@@ -33,7 +33,7 @@ async def get_current_season():
         row = await conn.fetchrow(sql)
         return row  # asyncpg.Record (dict-like object)
     finally:
-        await conn.close
+        await conn.close()
 
 async def get_all_seasons():
     sql = """ 
