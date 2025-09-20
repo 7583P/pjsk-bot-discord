@@ -163,10 +163,11 @@ RANK_ROLE_IDS = {
 PLACEMENT_ROLE_ID = 1371321594068336811
 
 class Top100View(View):
-    def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction):
+    def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction, season_id: int):
         super().__init__(timeout=None)
         self.db       = db_pool
         self.inter    = interaction
+        self.season_id = season_id
         self.page     = 0
         self.per_page = 20
 
@@ -176,14 +177,14 @@ class Top100View(View):
         total     = min(total_all or 0, 100)
         max_page  = (total - 1) // self.per_page if total else 0
 
-        season = await self.get_current_season()
-        season_id = season["id"]
+        season = await self.get_season_fn()
+        self.season_id = season["id"]
 
         # datos de la página actual
         offset = self.page * self.per_page
         rows = await self.db.fetch(
             "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $3 ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
-            offset, self.per_page, season_id
+            offset, self.per_page, self.season_id
         )
 
         # construye el embed
@@ -1174,9 +1175,9 @@ class Matchmaking(commands.Cog):
     @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def top100(self, interaction: discord.Interaction):
-        view = Top100View(self.db_pool, interaction)
         season = await self.get_current_season()
         season_id = season["id"]
+        view = Top100View(self.db_pool, interaction, season_id)       
         total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $1", season_id)
         max_page = (total - 1) // view.per_page if total else 0
         view.prev_page.disabled = True
