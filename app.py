@@ -1,7 +1,7 @@
 import os
 import traceback
 from datetime import datetime
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 import asyncpg
@@ -40,22 +40,17 @@ def get_current_season_label() -> str:
     return "beta" if period == 0 else str(period)
 
 @app.get("/api/players")
-async def get_players():
+async def get_players(season_id: int = Query(..., description="Season ID")):
     season_label = get_current_season_label()
     # Cambia el query: usa user_id o el campo PK real
     query = """
-      SELECT user_id AS id,
-             name,
-             mmr,
-             country,
-             role AS rank
-        FROM players
-       WHERE season = $1 or season = 'beta'
-       ORDER BY mmr DESC
+      SELECT p.user_id as id, p.name, sp.mmr, p.country, sp.role as rank
+	FROM players p INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
+WHERE sp.season_id = $1 order by sp.mmr desc;
     """
     try:
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query, season_label)
+            rows = await conn.fetch(query, season_id)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"DB error: {e}")

@@ -24,36 +24,75 @@ def get_current_season_label() -> str:
 async def get_conn():
     return await asyncpg.connect(DATABASE_URL)
 
-# Inserta o actualiza un jugador (comando /register)
-async def upsert_player(user_id: int, name: str, country: str):
-    season = get_current_season_label()
-    sql = """
-    INSERT INTO players(user_id, name, mmr, role, country, season)
-    VALUES ($1, $2, 0, 'Placement', $3, $4)
-    ON CONFLICT (user_id) DO UPDATE SET
-      name    = EXCLUDED.name,
-      country = EXCLUDED.country,
-      season  = EXCLUDED.season
+async def get_current_season():
+    sql = """ 
+    SELECT ID, Name, Active, StartDate, EndDate from seasons where active = true
+    """;
+    conn = await get_conn()
+    try:
+        row = await conn.fetchrow(sql)
+        return row  # asyncpg.Record (dict-like object)
+    finally:
+        await conn.close
+
+async def get_all_seasons():
+    sql = """ 
+    SELECT id, name, active, startdate, enddate 
+    FROM seasons
+    ORDER BY startdate DESC
     """
     conn = await get_conn()
     try:
-        await conn.execute(sql, user_id, name, country, season)
+        rows = await conn.fetch(sql)
+        return rows  # list of asyncpg.Record
+    finally:
+        await conn.close()
+
+# Inserta o actualiza un jugador (comando /register)
+async def upsert_player(user_id: int, name: str, country: str):
+    season = await get_current_season()
+    if not season:
+        raise RuntimeError("No active season found")
+    season_id = season["id"]
+
+    # Upsert player and get players.id (surrogate PK)
+    sql_players = """
+        INSERT INTO players (user_id, name, country)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (user_id) DO UPDATE SET
+          name = EXCLUDED.name,
+          country = EXCLUDED.country
+        RETURNING id
+    """
+
+    # seasonplayers has (player_id, season_id, ...) with a unique constraint on that pair
+    sql_seasonplayers = """
+        INSERT INTO seasonplayers (player_id, season_id, points, mmr, role)
+        VALUES ($1, $2, 0, 0, 'Placement')
+        ON CONFLICT (player_id, season_id) DO UPDATE SET
+          season_id = EXCLUDED.season_id
+    """
+
+    conn = await get_conn()
+    try:
+        async with conn.transaction():
+            player_row = await conn.fetchrow(sql_players, user_id, name, country)
+            player_id = player_row["id"]
+            await conn.execute(sql_seasonplayers, player_id, season_id)
     finally:
         await conn.close()
 
 # Actualiza solo el nombre y temporada, sin tocar country
-async def update_player_name(user_id: int, name: str):
-    season = get_current_season_label()
+async def update_player_name(user_id: int, name: str):    
     sql = """
-    INSERT INTO players(user_id, name, mmr, role, country, season)
-    VALUES ($1, $2, 0, 'Placement', '', $3)
+    INSERT INTO players(user_id, name)
+    VALUES ($1, $2)
     ON CONFLICT (user_id) DO UPDATE SET
-      name   = EXCLUDED.name,
-      season = EXCLUDED.season
+      name   = EXCLUDED.name
     """
     conn = await get_conn()
     try:
-        await conn.execute(sql, user_id, name, season)
+        await conn.execute(sql, user_id, name)
     finally:
         await conn.close()
 
