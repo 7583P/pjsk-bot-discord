@@ -176,11 +176,14 @@ class Top100View(View):
         total     = min(total_all or 0, 100)
         max_page  = (total - 1) // self.per_page if total else 0
 
+        season = await self.get_current_season()
+        season_id = season["id"]
+
         # datos de la página actual
         offset = self.page * self.per_page
         rows = await self.db.fetch(
-            "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
-            offset, self.per_page
+            "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $3 ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
+            offset, self.per_page, season_id
         )
 
         # construye el embed
