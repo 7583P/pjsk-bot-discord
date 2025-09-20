@@ -68,9 +68,17 @@ WHERE sp.season_id = $1 order by sp.mmr desc;
 async def get_seasons():    
     # Cambia el query: usa user_id o el campo PK real
     query = """
-        select id, 'Current' as name, active, startdate, enddate from seasons where active = true
-        union all
-        select id, name, active, startdate, enddate from seasons where active = false order by startdate asc;
+       SELECT *
+        FROM (
+            SELECT id, 'Current' AS name, active, startdate, enddate
+            FROM seasons
+            WHERE active = true
+            UNION ALL
+            SELECT id, name, active, startdate, enddate
+            FROM seasons
+            WHERE active = false
+        ) s
+        ORDER BY s.active DESC, s.startdate ASC
     """
     try:
         async with db_pool.acquire() as conn:
