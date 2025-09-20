@@ -114,10 +114,21 @@ class PlayersCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.synced = False
+        self.db_pool: asyncpg.Pool | None = None
 
     async def cog_load(self):
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL env var not set")
+        self.db_pool = await asyncpg.create_pool(DATABASE_URL)
         await self.bot.tree.sync(guild=discord.Object(id=GUILD_ID))
-
+        print("[PlayersCog] asyncpg pool ready.")        
+    
+    async def cog_unload(self):
+        if self.db_pool:
+            await self.db_pool.close()
+            self.db_pool = None
+        print("[PlayersCog] asyncpg pool closed.")
+        
     @commands.Cog.listener()
     async def on_ready(self):
         if not self.synced:
