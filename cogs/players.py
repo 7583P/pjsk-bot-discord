@@ -239,6 +239,41 @@ class PlayersCog(commands.Cog):
                 """, new_id)
                 prev_id = prev["id"] if prev else None
                 return new_id, prev_id, True
+            
+    async def _apply_rank_role(self, guild: discord.Guild, member_or_id, role_name: str, reason: str = "") -> bool:
+        rank_role_ids = set(RANK_ROLE_IDS.values())
+
+        # Resolver member
+        member = member_or_id if isinstance(member_or_id, discord.Member) else guild.get_member(int(member_or_id))
+        if member is None:
+            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
+            try:
+                member = await guild.fetch_member(int(member_or_id))
+            except Exception:
+                return False
+
+        # Normaliza y resuelve rol objetivo (fallback a Placement)
+        role_name = (role_name or "Placement").strip()
+        if role_name not in RANK_ROLE_IDS:
+            role_name = "Placement"
+
+        target_role = guild.get_role(RANK_ROLE_IDS[role_name])
+        if not target_role:
+            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
+            target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
+            if not target_role:
+                return False
+
+        # Mantener roles NO-rango y agregar el nuevo rango
+        keep = [r for r in member.roles if r.id not in rank_role_ids]
+        new_roles = list(dict.fromkeys(keep + [target_role]))
+
+        try:
+            await member.edit(roles=new_roles, reason=reason or f"Apply rank {role_name}")
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="newseason", description="Setup new season (create if needed, migrate players, sync roles)")
@@ -301,38 +336,26 @@ class PlayersCog(commands.Cog):
                     AND sp.synced = false
                 """, current_season_id)
 
-                # assign roles in Discord
-                rank_role_ids = set(RANK_ROLE_IDS.values())  # todos los roles de rango
+                synced = 0
                 for r in rows:
                     uid = int(r["user_id"])
-                    role_name = r["role"] or "Placement"
-                    member = guild.get_member(uid)
-                    if member is None:
-                        continue
-
-                    # Rol objetivo (si no existe el rol en guild, usa Placement por defecto)
-                    target_role = guild.get_role(RANK_ROLE_IDS.get(role_name, RANK_ROLE_IDS["Placement"]))
-                    if not target_role:
-                        continue
-
-                    # Mantener roles que NO sean de rango + agregar el nuevo rol
-                    keep = [rr for rr in member.roles if rr.id not in rank_role_ids]
-                    new_roles = list(dict.fromkeys(keep + [target_role]))
-
-                    try:
-                        await member.edit(roles=new_roles, reason=f"Season {current_season_id} sync")
+                    role_name = (r["role"] or "Placement").strip()
+                    ok = await self._apply_rank_role(
+                        guild,
+                        uid,
+                        role_name,
+                        reason=f"Season {current_season_id} sync"
+                    )
+                    if ok:
                         synced += 1
-                    except (discord.Forbidden, discord.HTTPException):
-                        continue
 
-
-                # mark synced=true for everyone we attempted where they now have the role
-                # (to keep logic simple, set synced=true for all rows processed this run)
+                # marcar synced=true para todos los procesados
                 await conn.execute("""
                     UPDATE seasonplayers
                     SET synced = true
                     WHERE season_id = $1 AND synced = false
                 """, current_season_id)
+
 
         except Exception as e:
             return await interaction.response.send_message(f"⚠️ Partial success (season ok). Role sync error: {e}", ephemeral=True)
