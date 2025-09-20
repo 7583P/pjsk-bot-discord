@@ -175,10 +175,7 @@ class Top100View(View):
         # total hasta 100 y páginas
         total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
         total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
-
-        season = await self.get_season_fn()
-        self.season_id = season["id"]
+        max_page  = (total - 1) // self.per_page if total else 0        
 
         # datos de la página actual
         offset = self.page * self.per_page
