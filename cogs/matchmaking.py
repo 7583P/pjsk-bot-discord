@@ -1174,12 +1174,12 @@ class Matchmaking(commands.Cog):
             asyncio.create_task(self.launch_song_poll(room))
 
 
-    @app_commands.command(name="stats", description="Muestra tu posición, rango y MMR en la season elegida")
+    @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Temporada: Actual o Beta")
+    @app_commands.describe(season="Season: Current or Beta")
     @app_commands.choices(
         season=[
-            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Current", value="current"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
@@ -1187,31 +1187,31 @@ class Matchmaking(commands.Cog):
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message("⚠️ No encontré la temporada seleccionada.", ephemeral=True)
+            return await interaction.response.send_message("⚠️ Season not founf", ephemeral=True)
 
         user_id = interaction.user.id
         data = await self._fetch_user_stats(user_id, season_id)
         if not data:
             return await interaction.response.send_message(
-                f"No tienes registro en **Season {season_name}**.", ephemeral=True
+                f"You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
         pos, total, mmr, role = data
         msg = (
-            f"**📊 Stats — Season {season_name}**\n"
-            f"• **Jugador:** {interaction.user.mention}\n"
-            f"• **Posición:** #{pos} de {total}\n"
+            f"**Stats — Season {season_name}**\n"
+            f"• **Player:** {interaction.user.mention}\n"
+            f"• **Position:** #{pos} of {total}\n"
             f"• **MMR:** {mmr}\n"
-            f"• **Rango:** {role}"
+            f"• **Rank:** {role}"
         )
         await interaction.response.send_message(msg)
 
-    @app_commands.command(name="stats_user", description="Muestra posición, rango y MMR de un jugador en la season elegida")
+    @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(user="Jugador", season="Temporada: Actual o Beta")
+    @app_commands.describe(user="Player", season="Season: Current or Beta")
     @app_commands.choices(
         season=[
-            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Current", value="current"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
@@ -1224,28 +1224,28 @@ class Matchmaking(commands.Cog):
         data = await self._fetch_user_stats(user.id, season_id)
         if not data:
             return await interaction.response.send_message(
-                f"{user.mention} no tiene registro en **Season {season_name}**.", ephemeral=True
+                f"{user.mention} You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
         pos, total, mmr, role = data
         msg = (
-            f"**📊 Stats — Season {season_name}**\n"
-            f"• **Jugador:** {user.mention}\n"
-            f"• **Posición:** #{pos} de {total}\n"
+            f"**Stats — Season {season_name}**\n"
+            f"• **Player:** {user.mention}\n"
+            f"• **Position:** #{pos} of {total}\n"
             f"• **MMR:** {mmr}\n"
-            f"• **Rango:** {role}"
+            f"• **Rank:** {role}"
         )
         await interaction.response.send_message(msg)
 
     @app_commands.command(
         name="cutoffs",
-        description="Muestra los MMR de T10, T20, T30, T40, T50 y T100 para la season elegida"
+        description="Shows the MMR Cutoff of T10, T20, T30, T40, T50 y T100 for the selected season"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Temporada: Actual o Beta")
+    @app_commands.describe(season="Temporada: Current or Beta")
     @app_commands.choices(
         season=[
-            app_commands.Choice(name="Actual", value="actual"),
+            app_commands.Choice(name="Current", value="Current"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
