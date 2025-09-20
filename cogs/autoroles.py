@@ -48,25 +48,40 @@ class AutoRoles(commands.Cog):
             await self.db.close()
 
     async def fetch_player(self, user_id: int):
-        season = self.get_current_season()
-        """
-        Recupera (mmr, role) de la tabla players para user_id.
-        Si no existe, lo crea con mmr=0 y role='Placement' y devuelve (0, 'Placement').
-        """
+        season = await self.get_current_season()
+        season_id = season["id"]
+
+        # 1) Check if season row exists
         async with self.db.execute(
-            "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE sp.season_id = ? and p.user_id = ?", (season["season_id"],user_id,)
+            """
+            SELECT sp.mmr, sp.role
+            FROM seasonplayers sp
+            INNER JOIN players p ON p.user_id = sp.user_id
+            WHERE sp.season_id = ? AND p.user_id = ?
+            """,
+            (season_id, user_id),
         ) as cursor:
             row = await cursor.fetchone()
 
         if row:
-            return row  # Devuelve (mmr, role)
+            return row  # (mmr, role)
 
-        # Si no existe registro, lo insertamos como Placement
+        # 2) Ensure player row exists
         await self.db.execute(
-            "INSERT INTO players (user_id, mmr, role) VALUES (?, 0, 'Placement')",
-            (user_id,)
+            "INSERT OR IGNORE INTO players (user_id, name, country) VALUES (?, ?, ?)",
+            (user_id, "", ""),
+        )
+
+        # 3) Insert season row
+        await self.db.execute(
+            """
+            INSERT INTO seasonplayers (user_id, season_id, points, mmr, role)
+            VALUES (?, ?, 0, 0, 'Placement')
+            """,
+            (user_id, season_id),
         )
         await self.db.commit()
+
         return (0, "Placement")
 
     # ─────────── LISTENER on_member_join ───────────
