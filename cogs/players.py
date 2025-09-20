@@ -188,8 +188,9 @@ class PlayersCog(commands.Cog):
         Returns (current_season_id, previous_active_season_id, created_new_flag).
         Creates a new active season for the *current month* if none active covers today.
         """
+        pool = self.db_pool        
         today = datetime.date.today()
-        async with self.db_pool.acquire() as conn:
+        async with pool.acquire() as conn:
             async with conn.transaction():
                 cur = await conn.fetchrow("""
                     SELECT id FROM seasons
@@ -234,7 +235,7 @@ class PlayersCog(commands.Cog):
     async def newseason(self, interaction: discord.Interaction):
         # 1) Ensure current season exists (create if needed)
         try:
-            current_season_id, prev_season_id, created = await self._ensure_current_season(self.db_pool)
+            current_season_id, prev_season_id, created = await self._ensure_current_season()
         except Exception as e:
             return await interaction.response.send_message(f"❌ DB error ensuring season: {e}", ephemeral=True)
 
