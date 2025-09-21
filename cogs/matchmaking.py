@@ -87,7 +87,7 @@ ALLOWED_DIFFS_BY_RANK = {
 
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
-    "Placement":     (25, 28),
+    "Placement":     (24, 28),
     "Iron":          (17, 22),
     "Bronze":        (19, 24),
     "Silver":        (20, 25),
