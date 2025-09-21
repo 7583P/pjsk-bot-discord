@@ -13,6 +13,7 @@ load_dotenv()
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
 
+# Diccionario con todos los roles de rango (Discord Role IDs)
 RANK_ROLE_IDS = {
     "Placement":      1371321594068336811,
     "Iron":           1394444407536881845,        
@@ -191,41 +192,6 @@ class PlayersCog(commands.Cog):
         end = today.replace(day=last_day)
         return start, end
     
-    async def _apply_rank_role(self, guild: discord.Guild, member_or_id, role_name: str, reason: str = "") -> bool:
-        rank_role_ids = set(RANK_ROLE_IDS.values())
-
-        # Resolver member
-        member = member_or_id if isinstance(member_or_id, discord.Member) else guild.get_member(int(member_or_id))
-        if member is None:
-            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
-            try:
-                member = await guild.fetch_member(int(member_or_id))
-            except Exception:
-                return False
-
-        # Normaliza y resuelve rol objetivo (fallback a Placement)
-        role_name = (role_name or "Placement").strip()
-        if role_name not in RANK_ROLE_IDS:
-            role_name = "Placement"
-
-        target_role = guild.get_role(RANK_ROLE_IDS[role_name])
-        if not target_role:
-            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
-            target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
-            if not target_role:
-                return False
-
-        # Mantener roles NO-rango y agregar el nuevo rango
-        keep = [r for r in member.roles if r.id not in rank_role_ids]
-        new_roles = list(dict.fromkeys(keep + [target_role]))
-
-        try:
-            await member.edit(roles=new_roles, reason=reason or f"Apply rank {role_name}")
-            return True
-        except (discord.Forbidden, discord.HTTPException):
-            return False
-
-
     async def _ensure_current_season(self) -> tuple[int, int | None, bool]:
         """
         Returns (current_season_id, previous_active_season_id, created_new_flag).
@@ -273,6 +239,41 @@ class PlayersCog(commands.Cog):
                 """, new_id)
                 prev_id = prev["id"] if prev else None
                 return new_id, prev_id, True
+            
+    async def _apply_rank_role(self, guild: discord.Guild, member_or_id, role_name: str, reason: str = "") -> bool:
+        rank_role_ids = set(RANK_ROLE_IDS.values())
+
+        # Resolver member
+        member = member_or_id if isinstance(member_or_id, discord.Member) else guild.get_member(int(member_or_id))
+        if member is None:
+            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
+            try:
+                member = await guild.fetch_member(int(member_or_id))
+            except Exception:
+                return False
+
+        # Normaliza y resuelve rol objetivo (fallback a Placement)
+        role_name = (role_name or "Placement").strip()
+        if role_name not in RANK_ROLE_IDS:
+            role_name = "Placement"
+
+        target_role = guild.get_role(RANK_ROLE_IDS[role_name])
+        if not target_role:
+            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
+            target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
+            if not target_role:
+                return False
+
+        # Mantener roles NO-rango y agregar el nuevo rango
+        keep = [r for r in member.roles if r.id not in rank_role_ids]
+        new_roles = list(dict.fromkeys(keep + [target_role]))
+
+        try:
+            await member.edit(roles=new_roles, reason=reason or f"Apply rank {role_name}")
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="newseason", description="Setup new season (create if needed, migrate players, sync roles)")
@@ -324,18 +325,9 @@ class PlayersCog(commands.Cog):
             if guild is None:
                 return await interaction.response.send_message("❌ This command must be used inside a server.", ephemeral=True)
 
-            placement_role = guild.get_role(1371321594068336811)
 
             async with self.db_pool.acquire() as conn:
                 # fetch batch to sync
-                rows = await conn.fetch("""
-                    SELECT sp.user_id, sp.role
-                    FROM seasonplayers sp
-                    WHERE sp.season_id = $1
-                    AND sp.synced = false
-                """, current_season_id)
-
-                # assign roles in Discord
                 rows = await conn.fetch("""
                     SELECT sp.user_id, sp.role
                     FROM seasonplayers sp
@@ -364,15 +356,6 @@ class PlayersCog(commands.Cog):
                 """, current_season_id)
 
 
-
-                # mark synced=true for everyone we attempted where they now have the role
-                # (to keep logic simple, set synced=true for all rows processed this run)
-                await conn.execute("""
-                    UPDATE seasonplayers
-                    SET synced = true
-                    WHERE season_id = $1 AND synced = false
-                """, current_season_id)
-
         except Exception as e:
             return await interaction.response.send_message(f"⚠️ Partial success (season ok). Role sync error: {e}", ephemeral=True)
 
@@ -387,5 +370,3 @@ class PlayersCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayersCog(bot))
-
-
