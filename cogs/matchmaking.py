@@ -390,30 +390,31 @@ class Matchmaking(commands.Cog):
 
 
     
-    def _format_results_board(self, season_name: str, summary_rows: list[tuple]) -> str:
+    def _format_results_board(self, summary_rows: list[tuple]) -> str:
         """
-        summary_rows = lista de tuplas:
-        (pos_str, name_with_flag, total_points, stats_list, mmr_prev, mmr_delta, mmr_final)
+        summary_rows = [
+        (pos_str, name_with_flag, total_points, stats_list, mmr_prev, mmr_delta, mmr_final),
+        ...
+        ]
 
-        Formato requerido:
+        Dibuja la tabla:
         POS | PLAYER | PGGBM | POINTS | MMR (+/-)
         """
-        # ——— Config de anchos (ajústalos si lo necesitas) ———
-        W_POS     = 4    
-        W_PLAYER  = 28
-        W_PGGBM   = 13    
-        W_POINTS  = 7
-        # La última columna la dejamos flexible para "prev  +/- = final"
+        # Anchos de columnas (ajústalos si tuvieras nombres larguísimos)
+        W_POS    = 4
+        W_PLAYER = 28
+        W_PGGBM  = 13   # "(5553,1,0,0,0)"
+        W_POINTS = 7
 
-        header  = f"RESULTS — Season {season_name}"
-        colh    = (
+        # Encabezado y separador (igual estilo que top100)
+        colh = (
             f"{'POS':<{W_POS}}| "
             f"{'PLAYER':<{W_PLAYER}}| "
             f"{'PGGBM':<{W_PGGBM}}| "
             f"{'POINTS':>{W_POINTS}}| "
             f"MMR (+/-)"
         )
-        sep     = (
+        sep = (
             f"{'-'*W_POS}+"
             f"{'-'*(W_PLAYER+1)}+"
             f"{'-'*(W_PGGBM+1)}+"
@@ -422,21 +423,21 @@ class Matchmaking(commands.Cog):
         )
 
         lines = []
-        for pos, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
+        for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
             # PGGBM como (p,g,gd,b,m)
             pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-            # Fila: POS | PLAYER | PGGBM | POINTS | "prev  +/- = final"
+            # Fila final (usa name_with_flag que ya trae la bandera 🇵🇪 etc.)
             lines.append(
                 f"{str(pos):<{W_POS}}| "
-                f"{name:<{W_PLAYER}}| "
+                f"{name_with_flag:<{W_PLAYER}}| "
                 f"{pggbm:<{W_PGGBM}}| "
                 f"{pts:>{W_POINTS}}| "
                 f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
             )
 
         body = "\n".join(lines) if lines else "(sin filas)"
-        return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
-
+        # Solo retorna el bloque monoespaciado (sin título). El título irá en el Embed.
+        return "```\n" + colh + "\n" + sep + "\n" + body + "\n```"
 
     async def _resolve_season_id(self, season_choice: str | None) -> tuple[int | None, str]:
         """
@@ -1857,9 +1858,14 @@ class Matchmaking(commands.Cog):
             result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
             result_chan = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
 
-            board = self._format_results_board(season_name, summary)
-            await result_chan.send(board)
-            await ctx.send(board)
+            board_block = self._format_results_board(summary)
+            embed = discord.Embed(
+                title=f"RESULTS — Season {season_name}",
+                description=board_block,
+                color=0x00B4D8
+            )
+            await result_chan.send(embed=embed)
+            await ctx.send(embed=embed)
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
 
