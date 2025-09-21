@@ -345,34 +345,37 @@ class Matchmaking(commands.Cog):
     async def _pick_placement_songs(self) -> list[tuple[str, int, str, int]]:
         """
         Regla especial de Placement:
-        - 1 canción HARD, 1 EXPERT, 1 MASTER, todas Lv 24–28
-        - +2 canciones adicionales de EXPERT/MASTER (también 24–28)
-        Si no hay stock suficiente, cae al comportamiento general.
+        - Solo EXPERT/MASTER
+        - Niveles 24–28
+        - 5 canciones en total, intentando incluir al menos 1 de cada (Expert y Master)
         """
         low, high = 24, 28
         picks: list[tuple[str, int, str, int]] = []
         chosen = set()
 
-        # 1 por dificultad base
-        for d in ("hard", "expert", "master"):
-            one = await self._get_random_songs(low, high, (d,), 1, exclude_titles=chosen)
-            if not one:
-                # Fallback: si falla alguna, usar el método general
-                generic = await self._get_9_songs(low, high, ("hard", "expert", "master"))
-                return generic[:5] if len(generic) >= 5 else generic
-            picks.extend(one)
-            chosen.add(one[0][0])  # title
+        # Intenta garantizar 1 Expert y 1 Master
+        expert_one = await self._get_random_songs(low, high, ("expert",), 1, exclude_titles=chosen)
+        if expert_one:
+            picks.extend(expert_one)
+            chosen.add(expert_one[0][0])
 
-        # 2 adicionales de expert/master
-        rest = await self._get_random_songs(low, high, ("expert", "master"), 2, exclude_titles=chosen)
-        if len(rest) < 2:
-            # Fallback suave: intentar completar con cualquier diff permitida
-            need = 2 - len(rest)
-            extra = await self._get_random_songs(low, high, ("hard", "expert", "master"), need, exclude_titles=chosen)
-            rest.extend(extra)
+        master_one = await self._get_random_songs(low, high, ("master",), 1, exclude_titles=chosen)
+        if master_one:
+            picks.extend(master_one)
+            chosen.add(master_one[0][0])
 
-        picks.extend(rest)
-        # Barajar por aleatoriedad
+        # Completar hasta 5 con expert/master (sin repetir títulos)
+        remaining = 5 - len(picks)
+        if remaining > 0:
+            rest = await self._get_random_songs(low, high, ("expert", "master"), remaining, exclude_titles=chosen)
+            picks.extend(rest)
+
+        # Si aún faltan por falta de stock, fallback suave (no debería ocurrir)
+        remaining = 5 - len(picks)
+        if remaining > 0:
+            extra = await self._get_random_songs(low, high, ("expert", "master"), remaining)
+            picks.extend(extra)
+
         random.shuffle(picks)
         return picks[:5]
 
