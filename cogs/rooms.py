@@ -51,6 +51,25 @@ class Rooms(commands.Cog):
         await asyncio.sleep(1)
         await self._do_update()
 
+
+    async def _get_active_season_id(self, mm) -> int | None:
+        # intenta reutilizar info del cog Matchmaking si la expone
+        sid = getattr(mm, "current_season_id", None)
+        if isinstance(sid, int) and sid > 0:
+            return sid
+
+        # fallback: leer de la BD
+        if getattr(mm, "db_pool", None) is None:
+            return None
+        try:
+            async with mm.db_pool.acquire() as con:
+                row = await con.fetchrow(
+                    "SELECT id FROM seasons WHERE active = true ORDER BY startdate DESC LIMIT 1"
+                )
+                return int(row["id"]) if row else None
+        except Exception:
+            return None
+
     async def _do_update(self):
         try:
             # 1) Obtener estado actual de Matchmaking
@@ -76,19 +95,29 @@ class Rooms(commands.Cog):
                 mmr_map: dict[int, int] = {}
                 if ids:
                     try:
-                        # Usar el pool del Matchmaking si existe
-                        if getattr(mm, "db_pool", None) is not None:
+                        season_id = await self._get_active_season_id(mm)
+
+                        if getattr(mm, "db_pool", None) is not None and season_id:
                             async with mm.db_pool.acquire() as con:
                                 rows_db = await con.fetch(
-                                    "SELECT p.user_id, COALESCE(sp.mmr,0) AS mmr FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = ANY($1::bigint[])",
-                                    ids
+                                    """
+                                    WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
+                                    SELECT u.user_id,
+                                        COALESCE(sp.mmr, 0) AS mmr
+                                    FROM u
+                                    LEFT JOIN seasonplayers sp
+                                    ON sp.user_id = u.user_id
+                                    AND sp.season_id = $2
+                                    """,
+                                    ids, season_id
                                 )
                             mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
                         else:
-                            # Fallback: una a una (más I/O, pero seguro)
+                            # Fallback: una a una (si no hay pool o no se pudo resolver season)
                             for m in players_list:
-                                _mmr, _ = await mm.fetch_player(m.id)
+                                _mmr, _ = await mm.fetch_player(m.id)   # este método debe leer la current season
                                 mmr_map[m.id] = int(_mmr)
+
                     except Exception:
                         # Fallback robusto si falla la consulta por lote
                         for m in players_list:

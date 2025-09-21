@@ -320,42 +320,72 @@ class Matchmaking(commands.Cog):
             out.append((r["title"], int(r["level"]), r["diff"].capitalize(), int(r["notes_count"])))
         return out
 
-    async def _pick_placement_songs(self) -> list[tuple[str, int, str, int]]:
+    async def _pick_placement_songs_levels_24_to_28(self) -> list[tuple[str, int, str, int]]:
         """
-        Regla especial de Placement:
+        Regla especial Placement:
+        - EXACTAMENTE 1 canción por nivel: 24, 25, 26, 27 y 28
         - Solo EXPERT/MASTER
-        - Niveles 24–28
-        - 5 canciones en total, intentando incluir al menos 1 de cada (Expert y Master)
+        - Evita repetir títulos
+        - Si un nivel no tiene canciones Expert/Master en el catálogo, intenta fallback aleatorio dentro 24–28.
         """
-        low, high = 24, 28
+        levels = [24, 25, 26, 27, 28]
         picks: list[tuple[str, int, str, int]] = []
-        chosen = set()
+        chosen_titles: set[str] = set()
 
-        # Intenta garantizar 1 Expert y 1 Master
-        expert_one = await self._get_random_songs(low, high, ("expert",), 1, exclude_titles=chosen)
-        if expert_one:
-            picks.extend(expert_one)
-            chosen.add(expert_one[0][0])
+        async with self._songs_lock:
+            async with self.db_pool.acquire() as conn:
+                for L in levels:
+                    # Intenta 1 canción EXACTA de ese nivel (Expert/Master)
+                    rows = await conn.fetch(
+                        """
+                        SELECT title, level, diff, notes_count
+                        FROM songs
+                        WHERE level = $1
+                          AND diff IN ('expert','master')
+                        ORDER BY random()
+                        LIMIT 5
+                        """,
+                        L
+                    )
 
-        master_one = await self._get_random_songs(low, high, ("master",), 1, exclude_titles=chosen)
-        if master_one:
-            picks.extend(master_one)
-            chosen.add(master_one[0][0])
+                    # toma la primera cuyo título no esté usado
+                    picked = None
+                    for r in rows:
+                        if r["title"] not in chosen_titles:
+                            picked = r
+                            break
 
-        # Completar hasta 5 con expert/master (sin repetir títulos)
-        remaining = 5 - len(picks)
-        if remaining > 0:
-            rest = await self._get_random_songs(low, high, ("expert", "master"), remaining, exclude_titles=chosen)
-            picks.extend(rest)
+                    if picked is None:
+                        # Fallback: cualquiera en 24–28 Expert/Master que no repita título
+                        fb = await conn.fetch(
+                            """
+                            SELECT title, level, diff, notes_count
+                            FROM songs
+                            WHERE level BETWEEN 24 AND 28
+                              AND diff IN ('expert','master')
+                            ORDER BY random()
+                            LIMIT 10
+                            """
+                        )
+                        for r in fb:
+                            if r["title"] not in chosen_titles:
+                                picked = r
+                                break
 
-        # Si aún faltan por falta de stock, fallback suave (no debería ocurrir)
-        remaining = 5 - len(picks)
-        if remaining > 0:
-            extra = await self._get_random_songs(low, high, ("expert", "master"), remaining)
-            picks.extend(extra)
+                    if picked:
+                        chosen_titles.add(picked["title"])
+                        picks.append((
+                            picked["title"],
+                            int(picked["level"]),
+                            picked["diff"].capitalize(),
+                            int(picked["notes_count"])
+                        ))
+                    # Si ni siquiera el fallback trae algo, simplemente sigue (dejará <5, muy raro)
 
+        # Mezcla para no salir siempre en orden 24→28
         random.shuffle(picks)
         return picks[:5]
+
 
 
 
@@ -364,22 +394,49 @@ class Matchmaking(commands.Cog):
         """
         summary_rows = lista de tuplas:
         (pos_str, name_with_flag, total_points, stats_list, mmr_prev, mmr_delta, mmr_final)
-        Devuelve una tabla monoespaciada lista para enviar.
+
+        Formato requerido:
+        POS | PLAYER | PGGBM | POINTS | MMR (+/-)
         """
-        header = f"RESULTS — Season {season_name} (activa)"
-        colh   = "Pos · Player                      · Points · PGGBM       ·  MMR/+-"
-        sep    = "----+------------------------------+--------+-------------+----------------------"
+        # ——— Config de anchos (ajústalos si lo necesitas) ———
+        W_POS     = 4    
+        W_PLAYER  = 28
+        W_PGGBM   = 13    
+        W_POINTS  = 7
+        # La última columna la dejamos flexible para "prev  +/- = final"
+
+        header  = f"RESULTS — Season {season_name}"
+        colh    = (
+            f"{'POS':<{W_POS}}| "
+            f"{'PLAYER':<{W_PLAYER}}| "
+            f"{'PGGBM':<{W_PGGBM}}| "
+            f"{'POINTS':>{W_POINTS}}| "
+            f"MMR (+/-)"
+        )
+        sep     = (
+            f"{'-'*W_POS}+"
+            f"{'-'*(W_PLAYER+1)}+"
+            f"{'-'*(W_PGGBM+1)}+"
+            f"{'-'*(W_POINTS+1)}+"
+            f"{'-'*9}"
+        )
 
         lines = []
-        for med, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
-            # columnas: Pos (4) · Nombre (30) · Pts (6) · PGGBM (11) · "prev  Δ = final"
+        for pos, name, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
+            # PGGBM como (p,g,gd,b,m)
             pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+            # Fila: POS | PLAYER | PGGBM | POINTS | "prev  +/- = final"
             lines.append(
-                f"{med:>3} | {name:<30} | {pts:>6} | {pggbm:<11} | {mmr_prev:>5} {mmr_delta:+3d} = {mmr_final:<5}"
+                f"{str(pos):<{W_POS}}| "
+                f"{name:<{W_PLAYER}}| "
+                f"{pggbm:<{W_PGGBM}}| "
+                f"{pts:>{W_POINTS}}| "
+                f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
             )
 
         body = "\n".join(lines) if lines else "(sin filas)"
         return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
+
 
     async def _resolve_season_id(self, season_choice: str | None) -> tuple[int | None, str]:
         """
@@ -922,24 +979,28 @@ class Matchmaking(commands.Cog):
 
         # 3) Selección de canciones
         if counts.get("Placement", 0) > 0:
-            # Regla especial: 1 por dificultad + 2 extra (expert/master), Lv 24–28
-            picks = await self._pick_placement_songs()
-            # Forzar visual a 24–28 para claridad
+            # 1 canción por nivel 24–28, solo Expert/Master
+            picks = await self._pick_placement_songs_levels_24_to_28()
+            # Mostrar explícitamente el rango especial
             low, high = 24, 28
         else:
             all_songs = await self._get_9_songs(low, high, allowed_diffs)
             picks = all_songs[:5]
             random.shuffle(picks)
 
-        # 4) Construye el mensaje con notas individuales y total
+
+        # 4) Construir el mensaje
+        total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
+
         song_lines = "\n".join(
-            f"{i+1}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
-            for i, (title, lvl, diff, notes) in enumerate(picks)
+            f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
+            for i, (title, lvl, diff, notes) in enumerate(picks, start=1)
         )
 
         await thread.send(
-            f"Selected songs (Lv {low}–{high}) "
-            f"(Total {total_notes} notes) 🎶\n{song_lines}"
+            f"Selected songs (Lv {low}–{high})\n"
+            f"(Total {total_notes} notes)\n"
+            f"{song_lines}"
         )
 
         # ——— MARCAR INICIO + TIMESTAMP ———
@@ -1054,13 +1115,13 @@ class Matchmaking(commands.Cog):
 
         # — 6.1) Obtener canciones según reglas
         if counts.get("Placement", 0) > 0:
-            # Regla especial Placement
-            picks = await self._pick_placement_songs()
+            picks = await self._pick_placement_songs_levels_24_to_28()
             lo, hi = 24, 28  # Mostrar explícitamente el rango especial
         else:
             all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
             picks = all_songs[:5]
             random.shuffle(picks)
+
 
 
         # — 6.2) Sumar total de notas y guardar en la sala —
