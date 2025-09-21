@@ -23,7 +23,7 @@ ALLOWED_JOIN_CHANNELS = {
 
 # — Mapeo de canal #join → canal #results —
 JOIN_TO_RESULTS = {
-    1371307353437110282: 1371307931294892125,  # pjsk-queue → #results-pjsk 
+    1371307353437110282: 1371307931294892125,  # pjsk-queue → #results-pjsk
     1378215330979254402: 1388515450534494389,  # jp-pjsk   → #results-jp-pjsk
 }
 
@@ -73,7 +73,7 @@ ALLOWED_DIFFS_BY_RANK = {
 
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
-    "Placement":     (24, 28),
+    "Placement":     (25, 28),
     "Iron":          (17, 22),
     "Bronze":        (19, 24),
     "Silver":        (20, 25),
@@ -307,78 +307,6 @@ class Matchmaking(commands.Cog):
 
         body = "\n".join(lines) if lines else "(sin filas)"
         return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
-    
-
-    async def _get_random_songs(self, low: int, high: int, diffs: tuple[str, ...], limit: int, exclude_titles: set[str] | None = None):
-        """
-        Devuelve hasta 'limit' canciones aleatorias (title, level, diff_capitalized, notes) en [low, high] y diffs dadas.
-        """
-        exclude_titles = exclude_titles or set()
-        async with self._songs_lock:
-            async with self.db_pool.acquire() as conn:
-                placeholders = ",".join(f"${i+3}" for i in range(len(diffs)))
-                params = [low, high, *diffs]
-                extra_where = ""
-                if exclude_titles:
-                    notin = ",".join(f"${len(params)+i+1}" for i in range(len(exclude_titles)))
-                    extra_where = f" AND title NOT IN ({notin})"
-                    params.extend(list(exclude_titles))
-
-                rows = await conn.fetch(
-                    f"""
-                    SELECT title, level, diff, notes_count
-                    FROM songs
-                    WHERE level BETWEEN $1 AND $2
-                    AND diff IN ({placeholders})
-                    {extra_where}
-                    ORDER BY random()
-                    LIMIT {int(limit)}
-                    """,
-                    *params
-                )
-
-        out = []
-        for r in rows:
-            out.append((r["title"], int(r["level"]), r["diff"].capitalize(), int(r["notes_count"])))
-        return out
-
-    async def _pick_placement_songs(self) -> list[tuple[str, int, str, int]]:
-        """
-        Regla especial de Placement:
-        - Solo EXPERT/MASTER
-        - Niveles 24–28
-        - 5 canciones en total, intentando incluir al menos 1 de cada (Expert y Master)
-        """
-        low, high = 24, 28
-        picks: list[tuple[str, int, str, int]] = []
-        chosen = set()
-
-        # Intenta garantizar 1 Expert y 1 Master
-        expert_one = await self._get_random_songs(low, high, ("expert",), 1, exclude_titles=chosen)
-        if expert_one:
-            picks.extend(expert_one)
-            chosen.add(expert_one[0][0])
-
-        master_one = await self._get_random_songs(low, high, ("master",), 1, exclude_titles=chosen)
-        if master_one:
-            picks.extend(master_one)
-            chosen.add(master_one[0][0])
-
-        # Completar hasta 5 con expert/master (sin repetir títulos)
-        remaining = 5 - len(picks)
-        if remaining > 0:
-            rest = await self._get_random_songs(low, high, ("expert", "master"), remaining, exclude_titles=chosen)
-            picks.extend(rest)
-
-        # Si aún faltan por falta de stock, fallback suave (no debería ocurrir)
-        remaining = 5 - len(picks)
-        if remaining > 0:
-            extra = await self._get_random_songs(low, high, ("expert", "master"), remaining)
-            picks.extend(extra)
-
-        random.shuffle(picks)
-        return picks[:5]
-
 
     async def _resolve_season_id(self, season_choice: str | None) -> tuple[int | None, str]:
         """
@@ -919,17 +847,14 @@ class Matchmaking(commands.Cog):
             allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
 
 
-        # 3) Selección de canciones
-        if counts.get("Placement", 0) > 0:
-            # Regla especial: 1 por dificultad + 2 extra (expert/master), Lv 24–28
-            picks = await self._pick_placement_songs()
-            # Forzar visual a 24–28 para claridad
-            low, high = 24, 28
-        else:
-            all_songs = await self._get_9_songs(low, high, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
+        # 3) Obtén el pool de canciones
+        all_songs = await self._get_9_songs(low, high, allowed_diffs)
 
+        # 3.1) Suma total de notas para validación posterior
+        picks = all_songs[:5]
+        random.shuffle(picks)
+        total_notes = sum(song[3] for song in picks)  # índice 3 = notes_count
+        room_info["total_notes"] = total_notes
 
         # 4) Construye el mensaje con notas individuales y total
         song_lines = "\n".join(
@@ -1052,16 +977,10 @@ class Matchmaking(commands.Cog):
         if counts.get("Placement", 0) > 0:
             allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-        # — 6.1) Obtener canciones según reglas
-        if counts.get("Placement", 0) > 0:
-            # Regla especial Placement
-            picks = await self._pick_placement_songs()
-            lo, hi = 24, 28  # Mostrar explícitamente el rango especial
-        else:
-            all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
-
+        # — 6.1) Obtener 5 canciones y mezclar —
+        all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
+        picks     = all_songs[:5]
+        random.shuffle(picks)
 
         # — 6.2) Sumar total de notas y guardar en la sala —
         total_notes               = sum(song[3] for song in picks)
@@ -1505,22 +1424,12 @@ class Matchmaking(commands.Cog):
             return 400, "Platinum"
         if 51 <= other <= 100:
             return 300, "Gold"
-        if 101 <= other <= 225:
-            return 226, "Silver"
+        if 101 <= other <= 200:
+            return 200, "Silver"
         if 201 <= other <= 350:
             return 100, "Bronze"
         return 50, "Iron"  # 351 - infinito
 
-    async def _resolve_channel(self, channel_id: int, *, fallback: discord.abc.Messageable) -> discord.abc.Messageable:
-        ch = self.bot.get_channel(channel_id)
-        if ch is not None:
-            return ch
-        try:
-            ch = await self.bot.fetch_channel(channel_id)
-            return ch
-        except Exception:
-            # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
-            return fallback
 
 
 
@@ -1725,31 +1634,11 @@ class Matchmaking(commands.Cog):
                 mmr_final = mmr_prev + mmr_delta
                 role_name = get_rank_from_mmr(mmr_final)
 
-                season_row  = await self.get_current_season()
-                season_id   = season_row["id"]
-
-                # Asegura la tabla con constraint único (solo una vez; puedes moverlo a cog_load si prefieres)
-                await self.db_pool.execute("""
-                    CREATE TABLE IF NOT EXISTS seasonplayers (
-                        season_id   INTEGER NOT NULL,
-                        user_id     BIGINT  NOT NULL,
-                        mmr         INTEGER NOT NULL DEFAULT 0,
-                        role        TEXT    NOT NULL DEFAULT 'Placement',
-                        PRIMARY KEY (season_id, user_id)
-                    );
-                """)
-
-                # UPSERT por temporada
+                # Persistencia de MMR y rol
                 await self.db_pool.execute(
-                    """
-                    INSERT INTO seasonplayers (season_id, user_id, mmr, role)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (season_id, user_id)
-                    DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
-                    """,
-                    season_id, p["member"].id, mmr_final, role_name
+                    "UPDATE players SET mmr=$1, role=$2 WHERE user_id=$3",
+                    mmr_final, role_name, p["member"].id
                 )
-
 
                 # Actualización de roles en Discord
                 role_id = RANK_ROLE_IDS.get(role_name)
@@ -1793,9 +1682,9 @@ class Matchmaking(commands.Cog):
             # Publicar resultados en canal de resultados y en el hilo (como board)
             season_row    = await self.get_current_season()
             season_name   = season_row["name"] if season_row else "N/A"
-            join_parent = ctx.channel.parent
-            result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-            result_chan = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
+            join_parent   = ctx.channel.parent
+            result_chan_id = JOIN_TO_RESULTS.get(join_parent.id)
+            result_chan    = self.bot.get_channel(result_chan_id) if result_chan_id else ctx.channel
 
             board = self._format_results_board(season_name, summary)
             await result_chan.send(board)
