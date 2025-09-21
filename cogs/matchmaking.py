@@ -449,7 +449,7 @@ class Matchmaking(commands.Cog):
                 f"{pts:>{W_POINTS}}| "
                 f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
             )
-            
+
 
         body = "\n".join(lines) if lines else "(sin filas)"
         # Solo retorna el bloque monoespaciado (sin título). El título irá en el Embed.
@@ -1076,9 +1076,9 @@ class Matchmaking(commands.Cog):
             players   = [m for m in join_chan.members if not m.bot]
 
         # — 3) Validar 2–5 jugadores —
-        if not (2 <= len(players) <= 5):
+        if not (3 <= len(players) <= 5):
             return await interaction.response.send_message(
-                "🔸 Room must have between 2-5 players",
+                "Room must have between 3-5 players",
                 ephemeral=True
             )
 
