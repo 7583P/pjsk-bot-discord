@@ -52,6 +52,20 @@ def country_flag(code: str) -> str:
         return ""
     return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
 
+ISO2_SUFFIX_RE = re.compile(r"\b([A-Za-z]{2})$")
+
+def flagify_iso2_suffix(text: str) -> str:
+    """
+    Si el nombre termina con dos letras ISO2 (ej. 'Reimu Hakurei pe'),
+    reemplaza esas letras por la bandera (🇵🇪).
+    """
+    t = text.strip()
+    m = ISO2_SUFFIX_RE.search(t)
+    if not m:
+        return t
+    return t[:m.start(1)] + country_flag(m.group(1).upper())
+
+
 # Prioridad global de dificultades, ahora incluyendo hard
 DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 
@@ -188,7 +202,7 @@ class Top100View(View):
         # construye el embed
         embed = Embed(
             title="PJSK LOUNGE TOP 100",
-            color=0x00B4D8
+            color=0x00fffb
         )
         header    = "TOP| Name                     |   MMR   | Rank\n"
         separator = "---+--------------------------+---------+-----------\n"
@@ -402,7 +416,7 @@ class Matchmaking(commands.Cog):
         """
         # Anchos de columnas (ajústalos si tuvieras nombres larguísimos)
         W_POS    = 4
-        W_PLAYER = 28
+        W_PLAYER = 24
         W_PGGBM  = 13   # "(5553,1,0,0,0)"
         W_POINTS = 7
 
@@ -424,16 +438,18 @@ class Matchmaking(commands.Cog):
 
         lines = []
         for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
-            # PGGBM como (p,g,gd,b,m)
+            # Convierte 'pe', 'jp', 'us' finales → 🇵🇪 🇯🇵 🇺🇸
+            safe_name = flagify_iso2_suffix(name_with_flag)
+
             pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-            # Fila final (usa name_with_flag que ya trae la bandera 🇵🇪 etc.)
             lines.append(
                 f"{str(pos):<{W_POS}}| "
-                f"{name_with_flag:<{W_PLAYER}}| "
+                f"{safe_name:<{W_PLAYER}}| "
                 f"{pggbm:<{W_PGGBM}}| "
                 f"{pts:>{W_POINTS}}| "
                 f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
             )
+            
 
         body = "\n".join(lines) if lines else "(sin filas)"
         # Solo retorna el bloque monoespaciado (sin título). El título irá en el Embed.
@@ -1860,9 +1876,9 @@ class Matchmaking(commands.Cog):
 
             board_block = self._format_results_board(summary)
             embed = discord.Embed(
-                title=f"RESULTS — Season {season_name}",
+                title=f"RESULTS — {season_name}",
                 description=board_block,
-                color=0x00B4D8
+                color=0xff0000
             )
             await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
