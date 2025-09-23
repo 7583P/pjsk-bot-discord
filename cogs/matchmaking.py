@@ -71,7 +71,7 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 
 # Mapeo de rangos a dificultades permitidas
 ALLOWED_DIFFS_BY_RANK = {
-    "Placement":     ("hard", "expert", "master"),
+    "Placement":     ("expert"),
     "Iron":          ("hard", "expert", "master"),
     "Bronze":        ("hard", "expert", "master", "append"),
     "Silver":        ("hard", "expert", "master", "append"),
@@ -1581,11 +1581,11 @@ class Matchmaking(commands.Cog):
             return 500, "Diamond"
         if 31 <= other <= 50:
             return 400, "Platinum"
-        if 51 <= other <= 100:
+        if 51 <= other <= 120:
             return 300, "Gold"
-        if 101 <= other <= 200:
+        if 121 <= other <= 270:
             return 200, "Silver"
-        if 201 <= other <= 350:
+        if 271 <= other <= 550:
             return 100, "Bronze"
         return 50, "Iron"  # 351 - infinito
 
