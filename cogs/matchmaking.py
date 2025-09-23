@@ -338,9 +338,9 @@ class Matchmaking(commands.Cog):
         """
         Regla especial Placement:
         - EXACTAMENTE 1 canción por nivel: 24, 25, 26, 27 y 28
-        - Solo EXPERT/MASTER
+        - Solo EXPERT
         - Evita repetir títulos
-        - Si un nivel no tiene canciones Expert/Master en el catálogo, intenta fallback aleatorio dentro 24–28.
+        - Si un nivel no tiene canciones Expert en el catálogo, intenta fallback aleatorio dentro 24–28.
         """
         levels = [24, 25, 26, 27, 28]
         picks: list[tuple[str, int, str, int]] = []
@@ -355,7 +355,7 @@ class Matchmaking(commands.Cog):
                         SELECT title, level, diff, notes_count
                         FROM songs
                         WHERE level = $1
-                          AND diff IN ('expert','master')
+                          AND diff IN ('expert',)
                         ORDER BY random()
                         LIMIT 5
                         """,
@@ -376,7 +376,7 @@ class Matchmaking(commands.Cog):
                             SELECT title, level, diff, notes_count
                             FROM songs
                             WHERE level BETWEEN 24 AND 28
-                              AND diff IN ('expert','master')
+                              AND diff IN ('expert',)
                             ORDER BY random()
                             LIMIT 10
                             """
