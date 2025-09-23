@@ -355,7 +355,7 @@ class Matchmaking(commands.Cog):
                         SELECT title, level, diff, notes_count
                         FROM songs
                         WHERE level = $1
-                          AND diff IN ('expert',)
+                          AND diff IN ('expert')
                         ORDER BY random()
                         LIMIT 5
                         """,
@@ -376,7 +376,7 @@ class Matchmaking(commands.Cog):
                             SELECT title, level, diff, notes_count
                             FROM songs
                             WHERE level BETWEEN 24 AND 28
-                              AND diff IN ('expert',)
+                              AND diff IN ('expert')
                             ORDER BY random()
                             LIMIT 10
                             """
