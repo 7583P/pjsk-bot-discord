@@ -1579,15 +1579,15 @@ class Matchmaking(commands.Cog):
             return 600, "Crystal"
         if 16 <= other <= 30:
             return 500, "Diamond"
-        if 31 <= other <= 50:
+        if 31 <= other <= 70:
             return 400, "Platinum"
-        if 51 <= other <= 120:
+        if 71 <= other <= 150:
             return 300, "Gold"
-        if 121 <= other <= 270:
+        if 151 <= other <= 500:
             return 200, "Silver"
-        if 271 <= other <= 550:
+        if 501 <= other <= 1000:
             return 100, "Bronze"
-        return 50, "Iron"  # 351 - infinito
+        return 50, "Iron"  # 1000 - infinito
 
     async def _resolve_channel(self, channel_id: int, *, fallback: discord.abc.Messageable) -> discord.abc.Messageable:
         ch = self.bot.get_channel(channel_id)
