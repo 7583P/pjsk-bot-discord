@@ -65,6 +65,25 @@ def flagify_iso2_suffix(text: str) -> str:
         return t
     return t[:m.start(1)] + country_flag(m.group(1).upper())
 
+# — Rango especial para canciones Append por rango alto —
+APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master", "Crystal", "Diamond"]
+
+APPEND_RANGES = {
+    "Diamond":       (24, 27),
+    "Crystal":       (25, 28),
+    "Master":        (27, 30),
+    "Champion":      (29, 32),
+    "Grand Champion":(31, 35),
+    "Legend":        (32, 37),
+}
+
+def _highest_high_rank(counts: dict[str, int]) -> str | None:
+    """Devuelve el rango más alto presente (Diamond..Legend) o None."""
+    for r in APPEND_RANKS_ORDER:
+        if counts.get(r, 0) > 0:
+            return r
+    return None
+
 
 # Prioridad global de dificultades, ahora incluyendo hard
 DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
@@ -73,10 +92,10 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 ALLOWED_DIFFS_BY_RANK = {
     "Placement":     ("expert",),
     "Iron":          ("hard", "expert", "master"),
-    "Bronze":        ("hard", "expert", "master", "append"),
-    "Silver":        ("hard", "expert", "master", "append"),
-    "Gold":          ("hard", "expert", "master", "append"),
-    "Platinum":      ("hard", "expert", "master", "append"),
+    "Bronze":        ("hard", "expert", "master"),
+    "Silver":        ("hard", "expert", "master"),
+    "Gold":          ("hard", "expert", "master"),
+    "Platinum":      ("hard", "expert", "master"),
     "Diamond":       ("expert", "master", "append"),
     "Crystal":       ("expert", "master", "append"),
     "Master":        ("expert", "master", "append"),
@@ -94,7 +113,7 @@ BRACKET_RANGES = {
     "Gold":          (22, 27),
     "Platinum":      (23, 28),
     "Diamond":       (25, 30),
-    "Crystal":       (28, 31),
+    "Crystal":       (28, 31), 
     "Master":        (29, 33),
     "Champion":      (30, 34),
     "Grand Champion": (31, 35),
@@ -990,9 +1009,10 @@ class Matchmaking(commands.Cog):
                 break
 
         # 🚫 Regla adicional: si hay al menos un Placement en la sala, quitar "append"
-        if counts.get("Placement", 0) > 0:
-            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
-
+        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
+            hr = _highest_high_rank(counts)
+            if hr is not None:
+                lo, hi = APPEND_RANGES[hr]
 
         # 3) Selección de canciones
         if counts.get("Placement", 0) > 0:
@@ -1127,8 +1147,10 @@ class Matchmaking(commands.Cog):
 
 
         # 🚫 Regla adicional: si hay Placement en la sala, quitar "append"
-        if counts.get("Placement", 0) > 0:
-            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
+        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
+            hr = _highest_high_rank(counts)
+            if hr is not None:
+                lo, hi = APPEND_RANGES[hr]
 
         # — 6.1) Obtener canciones según reglas
         if counts.get("Placement", 0) > 0:
