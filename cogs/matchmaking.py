@@ -65,20 +65,20 @@ def flagify_iso2_suffix(text: str) -> str:
         return t
     return t[:m.start(1)] + country_flag(m.group(1).upper())
 
-# — Rango especial para canciones Append por rango alto —
+# ————— Append: solo limita el rango de selección para canciones 'append' —————
 APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master", "Crystal", "Diamond"]
 
 APPEND_RANGES = {
-    "Diamond":       (24, 27),
-    "Crystal":       (25, 28),
-    "Master":        (27, 30),
-    "Champion":      (29, 32),
-    "Grand Champion":(31, 35),
-    "Legend":        (32, 37),
+    "Diamond":        (24, 27),
+    "Crystal":        (25, 28),
+    "Master":         (27, 30),
+    "Champion":       (29, 32),
+    "Grand Champion": (31, 35),
+    "Legend":         (32, 37),
 }
 
 def _highest_high_rank(counts: dict[str, int]) -> str | None:
-    """Devuelve el rango más alto presente (Diamond..Legend) o None."""
+    """Devuelve el rango más alto presente entre Diamond..Legend, o None si no hay."""
     for r in APPEND_RANKS_ORDER:
         if counts.get(r, 0) > 0:
             return r
@@ -1014,16 +1014,49 @@ class Matchmaking(commands.Cog):
             if hr is not None:
                 lo, hi = APPEND_RANGES[hr]
 
-        # 3) Selección de canciones
+        # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
         if counts.get("Placement", 0) > 0:
-            # 1 canción por nivel 24–28, solo Expert/Master
+            # Regla especial placement: 1 por nivel 24–28, solo Expert; el mensaje mostrará 24–28
             picks = await self._pick_placement_songs_levels_24_to_28()
-            # Mostrar explícitamente el rango especial
             low, high = 24, 28
         else:
-            all_songs = await self._get_9_songs(low, high, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
+            # a) Mantener el gap base para non-append
+            base_lo, base_hi = low, high
+            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
+
+            # b) Determinar (opcional) el gap SOLO para append
+            append_lo_hi = None
+            if "append" in allowed_diffs:
+                hr = _highest_high_rank(counts)  # Diamond..Legend más alto presente
+                if hr is not None:
+                    append_lo_hi = APPEND_RANGES[hr]
+
+            # c) Traer canciones por tipo de diff
+            pool = []
+
+            # Non-append (Expert/Master) en gap base
+            if non_append_diffs:
+                non_append_pool = await self._get_random_songs(
+                    base_lo, base_hi, non_append_diffs, limit=9
+                )
+                pool.extend(non_append_pool)
+                taken_titles = {t for (t, *_ ) in non_append_pool}
+            else:
+                taken_titles = set()
+
+            # Append en su gap especial (si aplica)
+            if append_lo_hi is not None:
+                alo, ahi = append_lo_hi
+                append_pool = await self._get_random_songs(
+                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                )
+                pool.extend(append_pool)
+
+            # d) Barajar y tomar 5
+            random.shuffle(pool)
+            picks = pool[:5]
+            # (IMPORTANTE) Mantener el rango mostrado = gap base
+            low, high = base_lo, base_hi
 
 
         # 4) Construir el mensaje
@@ -1152,14 +1185,47 @@ class Matchmaking(commands.Cog):
             if hr is not None:
                 lo, hi = APPEND_RANGES[hr]
 
-        # — 6.1) Obtener canciones según reglas
+        # — 6.1) Obtener canciones según reglas (gap base vs append-only-range)
         if counts.get("Placement", 0) > 0:
             picks = await self._pick_placement_songs_levels_24_to_28()
             lo, hi = 24, 28  # Mostrar explícitamente el rango especial
         else:
-            all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
+            # a) gap base para Expert/Master
+            base_lo, base_hi = lo, hi
+            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
+
+            # b) gap SOLO para append (si aplica)
+            append_lo_hi = None
+            if "append" in allowed_diffs:
+                hr = _highest_high_rank(counts)
+                if hr is not None:
+                    append_lo_hi = APPEND_RANGES[hr]
+
+            pool = []
+
+            # c) Non-append (Expert/Master) en gap base
+            if non_append_diffs:
+                non_append_pool = await self._get_random_songs(
+                    base_lo, base_hi, non_append_diffs, limit=9
+                )
+                pool.extend(non_append_pool)
+                taken_titles = {t for (t, *_ ) in non_append_pool}
+            else:
+                taken_titles = set()
+
+            # d) Append en su gap especial
+            if append_lo_hi is not None:
+                alo, ahi = append_lo_hi
+                append_pool = await self._get_random_songs(
+                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                )
+                pool.extend(append_pool)
+
+            random.shuffle(pool)
+            picks = pool[:5]
+            # (IMPORTANTE) mantener el rango mostrado = gap base
+            lo, hi = base_lo, base_hi
+
 
 
 
