@@ -98,6 +98,8 @@ ALLOWED_DIFFS_BY_RANK = {
     "Silver ⬆":      ("hard", "expert", "master"),
     "Gold":          ("hard", "expert", "master"),
     "Gold ⬆":        ("hard", "expert", "master"),
+    "Silver":        ("hard", "expert", "master"),
+    "Gold":          ("hard", "expert", "master"),
     "Platinum":      ("hard", "expert", "master"),
     "Diamond":       ("expert", "master", "append"),
     "Crystal":       ("expert", "master", "append"),
@@ -120,6 +122,9 @@ BRACKET_RANGES = {
     "Platinum":      (24, 29),
     "Diamond":       (26, 30), 
     "Crystal":       (28, 31),
+    "Platinum":      (23, 28),
+    "Diamond":       (25, 30),
+    "Crystal":       (28, 31), 
     "Master":        (29, 33),
     "Champion":      (30, 34),
     "Grand Champion": (31, 35),
@@ -1024,8 +1029,12 @@ class Matchmaking(commands.Cog):
                 break
 
         # 🚫 Regla adicional: si hay al menos un Placement en la sala, quitar "append"
-        if counts.get("Placement", 0) > 0:
-            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
+        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
+            hr = _highest_high_rank(counts)
+            if hr is not None:
+                lo, hi = APPEND_RANGES[hr]
+
+
 
 
         # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
@@ -1194,8 +1203,10 @@ class Matchmaking(commands.Cog):
 
 
         # 🚫 Regla adicional: si hay Placement en la sala, quitar "append"
-        if counts.get("Placement", 0) > 0:
-            allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
+        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
+            hr = _highest_high_rank(counts)
+            if hr is not None:
+                lo, hi = APPEND_RANGES[hr]
 
         # — 6.1) Obtener canciones según reglas (gap base vs append-only-range)
         if counts.get("Placement", 0) > 0:
@@ -1237,6 +1248,7 @@ class Matchmaking(commands.Cog):
             picks = pool[:5]
             # (IMPORTANTE) mantener el rango mostrado = gap base
             lo, hi = base_lo, base_hi
+
 
 
 
@@ -2015,4 +2027,4 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
- #ed
+ #e
