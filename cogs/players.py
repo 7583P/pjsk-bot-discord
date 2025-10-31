@@ -15,19 +15,22 @@ DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port
 
 # Diccionario con todos los roles de rango (Discord Role IDs)
 RANK_ROLE_IDS = {
-    "Placement":      1371321594068336811,
-    "Iron":           1394444407536881845,        
-    "Bronze":         1371324225838645339,
-    "Silver":         1389343997100560514,
-    "Gold":           1371324328708149328,
-    "Platinum":       1389343805521789098,
-    "Diamond":        1371324561542484108,
-    "Crystal":        1394445724703527012,
-    "Master":         1394635883466199110,
-    "Champion":       1371323543501144115,
+    "Iron":        1394444407536881845,        
+    "Bronze":        1371324225838645339,
+    "Bronze ⬆":        1433827677713858732,
+    "Silver":        1389343997100560514,
+    "Silver ⬆":        1433827565222494383,
+    "Gold":          1371324328708149328,
+    "Gold ⬆":          1433827466744561720,
+    "Platinum":      1389343805521789098,
+    "Diamond":      1371324561542484108,
+    "Crystal":       1394445724703527012,
+    "Master":       1394635883466199110,
+    "Champion":      1371323543501144115,
     "Grand Champion": 1394444744892874832,
-    "Legend":         1371323380510363749,
+    "Legend":        1371323380510363749,
 }
+
 
 
 # Crea una conexión temporal a PostgreSQL (usa un pool en producción)

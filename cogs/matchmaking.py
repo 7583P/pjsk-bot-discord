@@ -65,6 +65,25 @@ def flagify_iso2_suffix(text: str) -> str:
         return t
     return t[:m.start(1)] + country_flag(m.group(1).upper())
 
+# ————— Append: solo limita el rango de selección para canciones 'append' —————
+APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master", "Crystal", "Diamond"]
+
+APPEND_RANGES = {
+    "Diamond":        (24, 27),
+    "Crystal":        (25, 28),
+    "Master":         (27, 30),
+    "Champion":       (29, 32),
+    "Grand Champion": (31, 35),
+    "Legend":         (32, 37),
+}
+
+def _highest_high_rank(counts: dict[str, int]) -> str | None:
+    """Devuelve el rango más alto presente entre Diamond..Legend, o None si no hay."""
+    for r in APPEND_RANKS_ORDER:
+        if counts.get(r, 0) > 0:
+            return r
+    return None
+
 
 # Prioridad global de dificultades, ahora incluyendo hard
 DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
@@ -73,10 +92,13 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 ALLOWED_DIFFS_BY_RANK = {
     "Placement":     ("expert",),
     "Iron":          ("hard", "expert", "master"),
-    "Bronze":        ("hard", "expert", "master", "append"),
-    "Silver":        ("hard", "expert", "master", "append"),
-    "Gold":          ("hard", "expert", "master", "append"),
-    "Platinum":      ("hard", "expert", "master", "append"),
+    "Bronze":        ("hard", "expert", "master"),
+    "Bronze ⬆":      ("hard", "expert", "master"),
+    "Silver":        ("hard", "expert", "master"),
+    "Silver ⬆":      ("hard", "expert", "master"),
+    "Gold":          ("hard", "expert", "master"),
+    "Gold ⬆":        ("hard", "expert", "master"),
+    "Platinum":      ("hard", "expert", "master"),
     "Diamond":       ("expert", "master", "append"),
     "Crystal":       ("expert", "master", "append"),
     "Master":        ("expert", "master", "append"),
@@ -89,11 +111,14 @@ ALLOWED_DIFFS_BY_RANK = {
 BRACKET_RANGES = {
     "Placement":     (24, 28),
     "Iron":          (17, 22),
-    "Bronze":        (19, 24),
+    "Bronze":        (18, 23),
+    "Bronze ⬆":      (19, 24),
     "Silver":        (20, 25),
+    "Silver ⬆":      (21, 26),
     "Gold":          (22, 27),
-    "Platinum":      (23, 28),
-    "Diamond":       (25, 30),
+    "Gold ⬆":        (23, 28),
+    "Platinum":      (24, 29),
+    "Diamond":       (26, 30), 
     "Crystal":       (28, 31),
     "Master":        (29, 33),
     "Champion":      (30, 34),
@@ -136,12 +161,18 @@ def get_rank_from_mmr(mmr: int) -> str:
 
     if mmr <= 99:
         return "Iron"
-    elif mmr <= 199:
+    elif mmr <= 149:
         return "Bronze"
-    elif mmr <= 299:
+    elif mmr <= 199:
+        return "Bronze ⬆"
+    elif mmr <= 249:
         return "Silver"
-    elif mmr <= 399:
+    elif mmr <= 299:
+        return "Silver ⬆"
+    elif mmr <= 349:
         return "Gold"
+    elif mmr <= 399:
+        return "Gold ⬆"
     elif mmr <= 499:
         return "Platinum"
     elif mmr <= 599:
@@ -160,8 +191,11 @@ def get_rank_from_mmr(mmr: int) -> str:
 RANK_ROLE_IDS = {
     "Iron":        1394444407536881845,        
     "Bronze":        1371324225838645339,
+    "Bronze ⬆":        1433827677713858732,
     "Silver":        1389343997100560514,
+    "Silver ⬆":        1433827565222494383,
     "Gold":          1371324328708149328,
+    "Gold ⬆":          1433827466744561720,
     "Platinum":      1389343805521789098,
     "Diamond":      1371324561542484108,
     "Crystal":       1394445724703527012,
@@ -994,16 +1028,49 @@ class Matchmaking(commands.Cog):
             allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
 
 
-        # 3) Selección de canciones
+        # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
         if counts.get("Placement", 0) > 0:
-            # 1 canción por nivel 24–28, solo Expert/Master
+            # Regla especial placement: 1 por nivel 24–28, solo Expert; el mensaje mostrará 24–28
             picks = await self._pick_placement_songs_levels_24_to_28()
-            # Mostrar explícitamente el rango especial
             low, high = 24, 28
         else:
-            all_songs = await self._get_9_songs(low, high, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
+            # a) Mantener el gap base para non-append
+            base_lo, base_hi = low, high
+            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
+
+            # b) Determinar (opcional) el gap SOLO para append
+            append_lo_hi = None
+            if "append" in allowed_diffs:
+                hr = _highest_high_rank(counts)  # Diamond..Legend más alto presente
+                if hr is not None:
+                    append_lo_hi = APPEND_RANGES[hr]
+
+            # c) Traer canciones por tipo de diff
+            pool = []
+
+            # Non-append (Expert/Master) en gap base
+            if non_append_diffs:
+                non_append_pool = await self._get_random_songs(
+                    base_lo, base_hi, non_append_diffs, limit=9
+                )
+                pool.extend(non_append_pool)
+                taken_titles = {t for (t, *_ ) in non_append_pool}
+            else:
+                taken_titles = set()
+
+            # Append en su gap especial (si aplica)
+            if append_lo_hi is not None:
+                alo, ahi = append_lo_hi
+                append_pool = await self._get_random_songs(
+                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                )
+                pool.extend(append_pool)
+
+            # d) Barajar y tomar 5
+            random.shuffle(pool)
+            picks = pool[:5]
+            # (IMPORTANTE) Mantener el rango mostrado = gap base
+            low, high = base_lo, base_hi
 
 
         # 4) Construir el mensaje
@@ -1130,14 +1197,46 @@ class Matchmaking(commands.Cog):
         if counts.get("Placement", 0) > 0:
             allowed_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-        # — 6.1) Obtener canciones según reglas
+        # — 6.1) Obtener canciones según reglas (gap base vs append-only-range)
         if counts.get("Placement", 0) > 0:
             picks = await self._pick_placement_songs_levels_24_to_28()
             lo, hi = 24, 28  # Mostrar explícitamente el rango especial
         else:
-            all_songs = await self._get_9_songs(lo, hi, allowed_diffs)
-            picks = all_songs[:5]
-            random.shuffle(picks)
+            # a) gap base para Expert/Master
+            base_lo, base_hi = lo, hi
+            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
+
+            # b) gap SOLO para append (si aplica)
+            append_lo_hi = None
+            if "append" in allowed_diffs:
+                hr = _highest_high_rank(counts)
+                if hr is not None:
+                    append_lo_hi = APPEND_RANGES[hr]
+
+            pool = []
+
+            # c) Non-append (Expert/Master) en gap base
+            if non_append_diffs:
+                non_append_pool = await self._get_random_songs(
+                    base_lo, base_hi, non_append_diffs, limit=9
+                )
+                pool.extend(non_append_pool)
+                taken_titles = {t for (t, *_ ) in non_append_pool}
+            else:
+                taken_titles = set()
+
+            # d) Append en su gap especial
+            if append_lo_hi is not None:
+                alo, ahi = append_lo_hi
+                append_pool = await self._get_random_songs(
+                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                )
+                pool.extend(append_pool)
+
+            random.shuffle(pool)
+            picks = pool[:5]
+            # (IMPORTANTE) mantener el rango mostrado = gap base
+            lo, hi = base_lo, base_hi
 
 
 
@@ -1561,7 +1660,7 @@ class Matchmaking(commands.Cog):
         perfect, great, good, bad, miss = stats
         other = great + good + bad + miss
 
-        if other == 0:                # All perfect (5 songs)
+        if other == 0:  # All perfect (5 songs)
             return 800, "Champion"
         if other == 1:
             return 750, "Master"
@@ -1576,18 +1675,25 @@ class Matchmaking(commands.Cog):
         if 6 <= other <= 10:
             return 700, "Master"
         if 11 <= other <= 15:
-            return 600, "Crystal"
+            return 601, "Crystal"
         if 16 <= other <= 30:
-            return 500, "Diamond"
+            return 501, "Diamond"
         if 31 <= other <= 70:
-            return 400, "Platinum"
+            return 401, "Platinum"
         if 71 <= other <= 150:
+            return 350, "Gold ⬆"
+        if 151 <= other <= 300:
             return 300, "Gold"
-        if 151 <= other <= 500:
+        if 301 <= other <= 450:
+            return 250, "Silver ⬆"
+        if 451 <= other <= 600:
             return 200, "Silver"
-        if 501 <= other <= 1000:
+        if 601 <= other <= 800:
+            return 150, "Bronze ⬆"
+        if 801 <= other <= 999:
             return 100, "Bronze"
-        return 50, "Iron"  # 1000 - infinito
+        return 50, "Iron"  # 1000 - infinite
+
 
     async def _resolve_channel(self, channel_id: int, *, fallback: discord.abc.Messageable) -> discord.abc.Messageable:
         ch = self.bot.get_channel(channel_id)
