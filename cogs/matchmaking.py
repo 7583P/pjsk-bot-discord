@@ -194,6 +194,7 @@ def get_rank_from_mmr(mmr: int) -> str:
         return "Legend"
 
 RANK_ROLE_IDS = {
+    "Placement":    1371321594068336811,
     "Iron":        1394444407536881845,        
     "Bronze":        1371324225838645339,
     "Bronze ⬆":        1433827677713858732,
