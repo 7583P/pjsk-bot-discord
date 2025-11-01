@@ -6,3 +6,5 @@ aiosqlite
 uvicorn
 fastapi
 httpx
+beautifulsoup4
+lxml
