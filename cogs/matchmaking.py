@@ -499,7 +499,7 @@ class Matchmaking(commands.Cog):
         """
         Devuelve (season_id, season_name) según la elección del usuario.
         - None o "actual"  => temporada activa (get_current_season)
-        - "beta"           => busca por nombre 'beta'
+        - "beta, preseaspm"           => busca por nombre 'beta, preseason'
         """
         if (season_choice or "actual").lower() in ("actual", "current"):
             row = await self.get_current_season()
@@ -508,9 +508,9 @@ class Matchmaking(commands.Cog):
         # Beta por nombre (case-insensitive)
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, name FROM seasons WHERE LOWER(name) = 'beta' ORDER BY startdate LIMIT 1"
+                "SELECT id, name FROM seasons WHERE LOWER(name) = 'beta, preseason' ORDER BY startdate LIMIT 1"
             )
-        return (row["id"], row["name"]) if row else (None, "Beta")
+        return (row["id"], row["name"]) if row else (None, "Beta,PreSeason")
 
     async def _fetch_user_stats(self, user_id: int, season_id: int):
         """
