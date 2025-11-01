@@ -1447,10 +1447,11 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Season: Current or Beta")
+    @app_commands.describe(season="Season: Current, Beta or PreSeason")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="PreSeason",   value="preseason"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
@@ -1479,10 +1480,11 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(user="Player", season="Season: Current or Beta")
+    @app_commands.describe(user="Player", season="Season: Current, Beta or PreSeason")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="PreSeason",   value="preseason"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
@@ -1513,10 +1515,11 @@ class Matchmaking(commands.Cog):
         description="Shows the MMR Cutoff of T10, T20, T30, T40, T50 y T100 for the selected season"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Temporada: Current or Beta")
+    @app_commands.describe(season="Temporada: Current, Beta or PreSeason")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="Current"),
+            app_commands.Choice(name="PreSeason",   value="preseason"),
             app_commands.Choice(name="Beta",   value="beta"),
         ]
     )
@@ -1997,7 +2000,7 @@ class Matchmaking(commands.Cog):
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
                 description=board_block,
-                color=0xff0000
+                color=0x00f7ff
             )
             await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
