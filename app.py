@@ -9,7 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse, JSONResponse
 import asyncpg
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup # type: ignore
 from dotenv import load_dotenv
 
 load_dotenv()
