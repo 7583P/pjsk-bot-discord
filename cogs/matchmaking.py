@@ -98,9 +98,8 @@ ALLOWED_DIFFS_BY_RANK = {
     "Silver ⬆":      ("hard", "expert", "master"),
     "Gold":          ("hard", "expert", "master"),
     "Gold ⬆":        ("hard", "expert", "master"),
-    "Silver":        ("hard", "expert", "master"),
-    "Gold":          ("hard", "expert", "master"),
     "Platinum":      ("hard", "expert", "master"),
+    "Platinum ⬆":      ("hard", "expert", "master"),
     "Diamond":       ("expert", "master", "append"),
     "Crystal":       ("expert", "master", "append"),
     "Master":        ("expert", "master", "append"),
@@ -120,11 +119,9 @@ BRACKET_RANGES = {
     "Gold":          (22, 27),
     "Gold ⬆":        (23, 28),
     "Platinum":      (24, 29),
+    "Platinum ⬆":    (25, 29),
     "Diamond":       (26, 30), 
     "Crystal":       (28, 31),
-    "Platinum":      (23, 28),
-    "Diamond":       (25, 30),
-    "Crystal":       (28, 31), 
     "Master":        (29, 33),
     "Champion":      (30, 34),
     "Grand Champion": (31, 35),
@@ -178,8 +175,10 @@ def get_rank_from_mmr(mmr: int) -> str:
         return "Gold"
     elif mmr <= 399:
         return "Gold ⬆"
-    elif mmr <= 499:
+    elif mmr <= 449:
         return "Platinum"
+    elif mmr <= 499:
+        return "Platinum ⬆"
     elif mmr <= 599:
         return "Diamond"
     elif mmr <= 699:
@@ -203,6 +202,7 @@ RANK_ROLE_IDS = {
     "Gold":          1371324328708149328,
     "Gold ⬆":          1433827466744561720,
     "Platinum":      1389343805521789098,
+    "Platinum ⬆":    1434564540619554960,
     "Diamond":      1371324561542484108,
     "Crystal":       1394445724703527012,
     "Master":       1394635883466199110,
@@ -1694,7 +1694,9 @@ class Matchmaking(commands.Cog):
             return 600, "Crystal"
         if 16 <= other <= 30:
             return 500, "Diamond"
-        if 31 <= other <= 70:
+        if 31 <= other <= 50:
+            return 450, "Platinum ⬆"
+        if 51 <= other <= 70:
             return 400, "Platinum"
         if 71 <= other <= 150:
             return 350, "Gold ⬆"
