@@ -1691,11 +1691,11 @@ class Matchmaking(commands.Cog):
         if 6 <= other <= 10:
             return 700, "Master"
         if 11 <= other <= 15:
-            return 601, "Crystal"
+            return 600, "Crystal"
         if 16 <= other <= 30:
-            return 501, "Diamond"
+            return 500, "Diamond"
         if 31 <= other <= 70:
-            return 401, "Platinum"
+            return 400, "Platinum"
         if 71 <= other <= 150:
             return 350, "Gold ⬆"
         if 151 <= other <= 300:
