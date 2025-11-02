@@ -2,6 +2,8 @@ import os
 import re
 import secrets
 import traceback
+import asyncio
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 
@@ -27,16 +29,21 @@ DISCORD_REDIRECT_URI  = os.getenv(
 FRONT_URL   = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", FRONT_URL)
 COOKIE_NAME = os.getenv("COOKIE_NAME", "sid")
-
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# ===================== FastAPI + CORS =====================
+# ===================== FastAPI =====================
 app = FastAPI()
 
-# Importante: cuando allow_credentials=True no se debe usar "*" en origins
+# ============== CORS robusto (preview URLs Vercel) ==============
+# Si prefieres fijar un solo front, cambia a allow_origins=[FRONT_URL]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONT_URL, CORS_ORIGIN],
+    allow_origin_regex=(
+        r"^https:\/\/([a-z0-9-]+\.)*pjsk-page\.vercel\.app$|"
+        r"^https:\/\/unique-education-production\.up\.railway\.app$|"
+        rf"^{re.escape(FRONT_URL)}$|"
+        rf"^{re.escape(CORS_ORIGIN)}$"
+    ),
     allow_credentials=True,          # necesario para cookies cross-site
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -46,8 +53,18 @@ app.add_middleware(
 # En producción reemplazar por Redis/DB
 SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
 
+def _cookie_domain_from(url: str) -> Optional[str]:
+    try:
+        host = urlparse(url).hostname
+        # No sets Domain para localhost
+        if host and host not in ("localhost", "127.0.0.1", "0.0.0.0"):
+            return host
+    except Exception:
+        pass
+    return None
+
 def set_session_cookie(resp: Response, sid: str):
-    resp.set_cookie(
+    kwargs = dict(
         key=COOKIE_NAME,
         value=sid,
         httponly=True,
@@ -56,6 +73,10 @@ def set_session_cookie(resp: Response, sid: str):
         path="/",
         max_age=60 * 60 * 24 * 7   # 7 días
     )
+    dom = _cookie_domain_from(FRONT_URL)
+    if dom:
+        kwargs["domain"] = dom
+    resp.set_cookie(**kwargs)
 
 # =========================== DB ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
@@ -64,7 +85,13 @@ db_pool: Optional[asyncpg.pool.Pool] = None
 async def startup():
     global db_pool
     if DATABASE_URL:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            timeout=10.0,
+            command_timeout=30.0,
+        )
         print("✅ DB pool initialized")
     else:
         print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
@@ -77,9 +104,13 @@ async def shutdown():
 
 # ======================= API: Seasons/Players =======================
 @app.get("/api/players")
-async def get_players(season_id: int = Query(..., description="Season ID")):
+async def get_players(
+    season_id: int = Query(..., description="Season ID"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
     """
-    Devuelve jugadores de una season ordenados por MMR.
+    Devuelve jugadores de una season ordenados por MMR (paginado).
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
@@ -88,11 +119,12 @@ async def get_players(season_id: int = Query(..., description="Season ID")):
       SELECT p.user_id as id, p.name, sp.mmr, p.country, sp.role as rank
       FROM players p INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
       WHERE sp.season_id = $1
-      ORDER BY sp.mmr DESC;
+      ORDER BY sp.mmr DESC
+      LIMIT $2 OFFSET $3;
     """
     try:
         async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query, season_id)
+            rows = await conn.fetch(query, season_id, limit, offset)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
@@ -113,6 +145,7 @@ async def get_players(season_id: int = Query(..., description="Season ID")):
 async def get_seasons():
     """
     Devuelve la season activa como 'Current' + el histórico.
+    Activas primero; luego inactivas desde las más recientes.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
@@ -128,7 +161,7 @@ async def get_seasons():
            FROM seasons
            WHERE active = false
        ) s
-       ORDER BY s.active DESC, s.startdate ASC
+       ORDER BY s.active DESC, s.enddate DESC NULLS LAST, s.startdate DESC NULLS LAST;
     """
     try:
         async with db_pool.acquire() as conn:
@@ -152,32 +185,52 @@ async def get_seasons():
 PFP_BY_NAME: Dict[str, str] = {}  # nameLower -> url
 PFP_BY_ID:   Dict[str, str] = {}  # userId/discordId -> url
 
+# Anti-CSRF state
+STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
+STATE_TTL = timedelta(minutes=10)
+
 @app.get("/health")
 async def health():
-    return {"ok": True, "tip": "auth02 up"}
+    db_ok = False
+    try:
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                await conn.execute("SELECT 1;")
+                db_ok = True
+    except Exception:
+        db_ok = False
+    return {"ok": True, "tip": "auth02 up", "db": db_ok}
 
 @app.get("/auth02")
 async def auth02_start():
     """
-    Redirige a la pantalla de autorización de Discord.
+    Redirige a la pantalla de autorización de Discord con state anti-CSRF.
     """
+    state = secrets.token_urlsafe(24)
+    STATE_STORE[state] = datetime.utcnow() + STATE_TTL
+
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
         "scope": "identify email",
+        "state": state,
     }
-    # encode seguro
-    q = "&".join(f"{k}={httpx.QueryParams({k: v})[k]}" for k, v in params.items())
+    q = str(httpx.QueryParams(params))
     return RedirectResponse(url=f"https://discord.com/oauth2/authorize?{q}")
 
 @app.get("/auth02/callback")
-async def auth02_callback(code: Optional[str] = None):
+async def auth02_callback(code: Optional[str] = None, state: Optional[str] = None):
     """
     Intercambia code por token y crea sesión + cookie.
     """
     if not code:
         raise HTTPException(400, "Missing code")
+
+    # Validar state
+    exp = STATE_STORE.pop(state or "", None)
+    if not exp or datetime.utcnow() > exp:
+        raise HTTPException(400, "Invalid or expired state")
 
     async with httpx.AsyncClient() as client:
         token_res = await client.post(
@@ -209,7 +262,7 @@ async def auth02_callback(code: Optional[str] = None):
     # Crear sesión + setear cookie
     sid = secrets.token_hex(24)
     SESSIONS[sid] = {"id": str(user.get("id")), "username": user.get("username")}
-    resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=307)
+    resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=303)  # 303 = GET
     set_session_cookie(resp, sid)
     return resp
 
@@ -222,6 +275,25 @@ async def auth02_me(request: Request):
     if not sid or sid not in SESSIONS:
         raise HTTPException(status_code=401, detail="no-session")
     return SESSIONS[sid]
+
+@app.post("/auth02/logout")
+async def auth02_logout(request: Request):
+    """
+    Cierra sesión y borra cookie.
+    """
+    sid = request.cookies.get(COOKIE_NAME)
+    if sid:
+        SESSIONS.pop(sid, None)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(
+        COOKIE_NAME, path="/",
+        domain=_cookie_domain_from(FRONT_URL)
+    )
+    return resp
+
+# =================== /auth02/pfps ===================
+MAX_PFPS = 5000
+URL_RE = re.compile(r"^https:\/\/[a-z0-9\.\-\/_%\?\=&]+$", re.I)
 
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
@@ -258,7 +330,12 @@ async def set_pfp(request: Request):
     if not (user_id or name_lower):
         raise HTTPException(400, "missing userId or nameLower")
 
-    # Guardado
+    # Validar URL y cap de memoria
+    if not URL_RE.match(url):
+        raise HTTPException(400, "invalid url")
+    if len(PFP_BY_ID) + len(PFP_BY_NAME) > MAX_PFPS:
+        raise HTTPException(429, "pfp store is full")
+
     if user_id:
         PFP_BY_ID[user_id] = url
     if name_lower:
@@ -279,6 +356,7 @@ async def list_pfps():
 SEKAIPEDIA_LIST = "https://www.sekaipedia.org/wiki/List_of_cards"
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 CARDS_TTL = timedelta(hours=6)
+_cards_lock = asyncio.Lock()
 
 def _abs_url(u: str) -> str:
     if not u: return ""
@@ -333,15 +411,21 @@ async def auth02_cards():
     now = datetime.utcnow()
     if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
         return _cards_cache["items"]
-    try:
-        items = await _scrape_cards_from_sekaipedia()
-        _cards_cache["items"] = items
-        _cards_cache["ts"] = now
-        return items
-    except Exception:
-        traceback.print_exc()
-        # devuelve cache (aunque esté vacío) si falla scrape
-        return _cards_cache["items"]
+
+    async with _cards_lock:
+        # double-check dentro del lock
+        now = datetime.utcnow()
+        if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
+            return _cards_cache["items"]
+        try:
+            items = await _scrape_cards_from_sekaipedia()
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = datetime.utcnow()
+            return items
+        except Exception:
+            traceback.print_exc()
+            # devuelve cache (aunque esté vacío) si falla scrape
+            return _cards_cache["items"]
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
