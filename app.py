@@ -1,8 +1,9 @@
 import os
 import re
+import secrets
 import traceback
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 import asyncpg
 import httpx
@@ -27,20 +28,22 @@ FRONT_URL   = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", FRONT_URL)
 COOKIE_NAME = os.getenv("COOKIE_NAME", "sid")
 
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ===================== FastAPI + CORS =====================
 app = FastAPI()
 
+# Importante: cuando allow_credentials=True no se debe usar "*" en origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CORS_ORIGIN, FRONT_URL],
+    allow_origins=[FRONT_URL, CORS_ORIGIN],
     allow_credentials=True,          # necesario para cookies cross-site
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ================ Sesiones simples en memoria ================
+# En producción reemplazar por Redis/DB
 SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
 
 def set_session_cookie(resp: Response, sid: str):
@@ -49,24 +52,28 @@ def set_session_cookie(resp: Response, sid: str):
         value=sid,
         httponly=True,
         secure=True,           # requerido para SameSite=None
-        samesite="none",
+        samesite="none",       # para cross-site (Vercel -> Railway)
         path="/",
         max_age=60 * 60 * 24 * 7   # 7 días
     )
 
 # =========================== DB ===========================
-db_pool: asyncpg.pool.Pool | None = None
+db_pool: Optional[asyncpg.pool.Pool] = None
 
 @app.on_event("startup")
 async def startup():
     global db_pool
     if DATABASE_URL:
         db_pool = await asyncpg.create_pool(DATABASE_URL)
+        print("✅ DB pool initialized")
+    else:
+        print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
 
 @app.on_event("shutdown")
 async def shutdown():
     if db_pool:
         await db_pool.close()
+        print("🛑 DB pool closed")
 
 # ======================= API: Seasons/Players =======================
 @app.get("/api/players")
@@ -141,7 +148,9 @@ async def get_seasons():
     ]
 
 # ======================= AUTH02 (Discord OAuth) =======================
-pfp_map: dict[str, str] = {}
+# Guardamos PFPs tanto por userId como por nombre normalizado
+PFP_BY_NAME: Dict[str, str] = {}  # nameLower -> url
+PFP_BY_ID:   Dict[str, str] = {}  # userId/discordId -> url
 
 @app.get("/health")
 async def health():
@@ -163,7 +172,7 @@ async def auth02_start():
     return RedirectResponse(url=f"https://discord.com/oauth2/authorize?{q}")
 
 @app.get("/auth02/callback")
-async def auth02_callback(code: str | None = None):
+async def auth02_callback(code: Optional[str] = None):
     """
     Intercambia code por token y crea sesión + cookie.
     """
@@ -198,7 +207,6 @@ async def auth02_callback(code: str | None = None):
         print("OAuth OK user:", user.get("id"), user.get("username"))
 
     # Crear sesión + setear cookie
-    import secrets
     sid = secrets.token_hex(24)
     SESSIONS[sid] = {"id": str(user.get("id")), "username": user.get("username")}
     resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=307)
@@ -219,34 +227,53 @@ async def auth02_me(request: Request):
 async def set_pfp(request: Request):
     """
     Guarda o borra la PFP asociada.
-    - Si url == '' → se BORRA la PFP.
-    - nameLower: si no se envía, intenta usar el username del usuario verificado.
+    Prioridad de llave: userId (Discord ID) > nameLower.
+    - Si url == '' → borra.
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
     name_lower = (body.get("nameLower") or "").strip().lower()
+    user_id = (body.get("userId") or "").strip()
 
-    # Fallback al usuario verificado si no llega nameLower
+    # Si no viene userId en body, intenta leerlo de la sesión
+    if not user_id:
+        sid = request.cookies.get(COOKIE_NAME)
+        if sid and sid in SESSIONS:
+            user_id = str(SESSIONS[sid].get("id") or "")
+
+    # Si no viene nameLower, intenta usar username de sesión
     if not name_lower:
         sid = request.cookies.get(COOKIE_NAME)
         if sid and sid in SESSIONS:
             name_lower = (SESSIONS[sid].get("username") or "").lower()
 
-    if not name_lower:
-        raise HTTPException(400, "missing nameLower")
-
-    # Borrar
+    # Borrado
     if url == "":
-        pfp_map.pop(name_lower, None)
+        if user_id:
+            PFP_BY_ID.pop(user_id, None)
+        if name_lower:
+            PFP_BY_NAME.pop(name_lower, None)
         return {"ok": True, "deleted": True}
 
-    # Guardar/actualizar
-    pfp_map[name_lower] = url
+    if not (user_id or name_lower):
+        raise HTTPException(400, "missing userId or nameLower")
+
+    # Guardado
+    if user_id:
+        PFP_BY_ID[user_id] = url
+    if name_lower:
+        PFP_BY_NAME[name_lower] = url
+
     return {"ok": True}
 
 @app.get("/auth02/pfps")
 async def list_pfps():
-    return JSONResponse(pfp_map)
+    """
+    Devuelve ambos mapas de PFPs:
+    - byId:   { userId: url }
+    - byName: { nameLower: url }
+    """
+    return JSONResponse({"byId": PFP_BY_ID, "byName": PFP_BY_NAME})
 
 # =================== /auth02/cards (Sekaipedia) ===================
 SEKAIPEDIA_LIST = "https://www.sekaipedia.org/wiki/List_of_cards"
