@@ -78,32 +78,30 @@ async def shutdown():
 # ======================= API: Seasons/Players =======================
 @app.get("/api/players")
 async def get_players(season_id: int = Query(..., description="Season ID")):
-    """
-    Devuelve jugadores de una season ordenados por MMR.
-    """
-    if not db_pool:
-        raise HTTPException(500, "DB pool not initialized")
-
     query = """
-      SELECT p.user_id as id, p.name, sp.mmr, p.country, sp.role as rank
-      FROM players p INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
+      SELECT 
+        p.user_id       AS id,          -- id interno (si lo necesitas)
+        p.discord_id    AS discord_id,  -- 🔴 agrega esta columna
+        p.name,
+        sp.mmr,
+        p.country,
+        sp.role         AS rank
+      FROM players p 
+      INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
       WHERE sp.season_id = $1
       ORDER BY sp.mmr DESC;
     """
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query, season_id)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(query, season_id)
 
     return [
         {
-            "id": r["id"],
-            "name": r["name"],
-            "mmr": r["mmr"],
-            "country": r["country"],
-            "rank": r["rank"],
+          "id": r["id"],                         # interno (opcional)
+          "discord_id": r["discord_id"],         # 🔴 nuevo
+          "name": r["name"],
+          "mmr": r["mmr"],
+          "country": r["country"],
+          "rank": r["rank"]
         }
         for r in rows
     ]
