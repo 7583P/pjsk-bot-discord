@@ -34,37 +34,27 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # ===================== FastAPI =====================
 app = FastAPI()
 
-# ============== CORS robusto (preview URLs Vercel) ==============
-# Si prefieres fijar un solo front, cambia a allow_origins=[FRONT_URL]
+# ============== CORS (con credenciales) ==============
+# Mantén la lista concreta para evitar sorpresas con cookies cross-site.
+# Puedes agregar previews de Vercel aquí si las usas.
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=(
-        r"^https:\/\/([a-z0-9-]+\.)*pjsk-page\.vercel\.app$|"
-        r"^https:\/\/unique-education-production\.up\.railway\.app$|"
-        rf"^{re.escape(FRONT_URL)}$|"
-        rf"^{re.escape(CORS_ORIGIN)}$"
-    ),
-    allow_credentials=True,          # necesario para cookies cross-site
+    allow_origins=[FRONT_URL],        # añade más orígenes si corresponde
+    allow_credentials=True,           # necesario para cookies cross-site
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ================ Sesiones simples en memoria ================
-# En producción reemplazar por Redis/DB
+# En producción reemplazar por Redis/DB o cookies firmadas/JWT
 SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
 
-def _cookie_domain_from(url: str) -> Optional[str]:
-    try:
-        host = urlparse(url).hostname
-        # No sets Domain para localhost
-        if host and host not in ("localhost", "127.0.0.1", "0.0.0.0"):
-            return host
-    except Exception:
-        pass
-    return None
-
 def set_session_cookie(resp: Response, sid: str):
-    kwargs = dict(
+    """
+    Cookie sin 'domain' para que el navegador la asocie al dominio del backend (Railway).
+    Requisitos para cross-site: Secure + SameSite=None + HTTPS.
+    """
+    resp.set_cookie(
         key=COOKIE_NAME,
         value=sid,
         httponly=True,
@@ -73,10 +63,6 @@ def set_session_cookie(resp: Response, sid: str):
         path="/",
         max_age=60 * 60 * 24 * 7   # 7 días
     )
-    dom = _cookie_domain_from(FRONT_URL)
-    if dom:
-        kwargs["domain"] = dom
-    resp.set_cookie(**kwargs)
 
 # =========================== DB ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
@@ -259,10 +245,10 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
         user = user_res.json()
         print("OAuth OK user:", user.get("id"), user.get("username"))
 
-    # Crear sesión + setear cookie
+    # Crear sesión + setear cookie (sin domain)
     sid = secrets.token_hex(24)
     SESSIONS[sid] = {"id": str(user.get("id")), "username": user.get("username")}
-    resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=303)  # 303 = GET
+    resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=303)  # 303 => GET al front
     set_session_cookie(resp, sid)
     return resp
 
@@ -279,16 +265,13 @@ async def auth02_me(request: Request):
 @app.post("/auth02/logout")
 async def auth02_logout(request: Request):
     """
-    Cierra sesión y borra cookie.
+    Cierra sesión y borra cookie (sin domain).
     """
     sid = request.cookies.get(COOKIE_NAME)
     if sid:
         SESSIONS.pop(sid, None)
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(
-        COOKIE_NAME, path="/",
-        domain=_cookie_domain_from(FRONT_URL)
-    )
+    resp.delete_cookie(COOKIE_NAME, path="/")
     return resp
 
 # =================== /auth02/pfps ===================
