@@ -336,15 +336,24 @@ async def list_pfps():
     return JSONResponse({"byId": PFP_BY_ID, "byName": PFP_BY_NAME})
 
 # =================== /auth02/cards (Sekaipedia) ===================
-SEKAIPEDIA_LIST = "https://www.sekaipedia.org/wiki/List_of_cards"
+SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
+SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
+
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
 
+_HTTP_HEADERS = {
+    "User-Agent": "pjsk-lounge/1.1 (+worker; contact: admin@pjsk-lounge)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Referer": "https://sekaipedia.org/",
+}
+
 def _abs_url(u: str) -> str:
     if not u: return ""
     if u.startswith("//"): return "https:" + u
-    if u.startswith("/"):  return "https://www.sekaipedia.org" + u
+    if u.startswith("/"):  return "https://sekaipedia.org" + u
     return u
 
 def _guess_id(name: str, href: str) -> str:
@@ -352,39 +361,43 @@ def _guess_id(name: str, href: str) -> str:
     if m: return m.group(1)
     return (href or "").rstrip("/").split("/")[-1] or (name or "")
 
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.get(SEKAIPEDIA_LIST, headers={"User-Agent": "pjsk-lounge/1.0"})
-        r.raise_for_status()
-        html = r.text
-
+def _parse_cards_from_html(html: str) -> List[Dict]:
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
 
     root = soup.select_one("#mw-content-text") or soup
-
     items: List[Dict] = []
-    for a in root.select('a[href*="/wiki/Card:"]'):
+
+    # 1) Enlaces al namespace Card:
+    for a in root.select('a[href^="/wiki/Card:"]'):
         href = a.get("href") or ""
         href_abs = _abs_url(href)
         name = a.get_text(strip=True) or ""
-        img = a.find("img")
+
+        # Intenta conseguir thumbnail de forma laxa (opcional)
         thumb = None
+        img = a.find("img")
+        if not img and a.parent:         # a veces la imagen está en el padre
+            img = a.parent.find("img")
+        if not img:                       # o en un hermano cercano
+            sib = a.find_next_sibling("img")
+            if sib:
+                img = sib
+
         if img:
             thumb = img.get("data-src") or img.get("src")
             thumb = _abs_url(thumb)
-        if not thumb:
-            continue
+
         items.append({
             "id": _guess_id(name, href_abs),
             "name": name,
-            "thumb": thumb,
+            "thumb": thumb,               # puede ser None
             "href": href_abs
         })
 
-    # de-dup
+    # 2) De-dup por href o nombre
     seen, dedup = set(), []
     for it in items:
         key = it["href"] or it["name"]
@@ -392,6 +405,46 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             seen.add(key)
             dedup.append(it)
     return dedup
+
+async def _fetch_list_html_via_http() -> str:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(SEKAIPEDIA_LIST, headers=_HTTP_HEADERS)
+        r.raise_for_status()
+        html = r.text
+        print(f"[cards] GET List_of_cards status={r.status_code} len(html)={len(html)} url={r.url}")
+        return html
+
+async def _fetch_list_html_via_api() -> str:
+    params = {
+        "action": "parse",
+        "page": "List_of_cards",
+        "prop": "text",
+        "format": "json",
+        "formatversion": "2",
+    }
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
+        r.raise_for_status()
+        data = r.json()
+        html = (data.get("parse") or {}).get("text") or ""
+        print(f"[cards] API parse len(html)={len(html)}")
+        if not html:
+            raise RuntimeError("MediaWiki API returned empty html")
+        return html
+
+async def _scrape_cards_from_sekaipedia() -> List[Dict]:
+    # 1) HTML directo
+    html = await _fetch_list_html_via_http()
+    items = _parse_cards_from_html(html)
+    print(f"[cards] parsed_count (http) = {len(items)}")
+    if items:
+        return items
+
+    # 2) Fallback a API si no encontró nada (Cloudflare/estructura cambió)
+    html_api = await _fetch_list_html_via_api()
+    items_api = _parse_cards_from_html(html_api)
+    print(f"[cards] parsed_count (api) = {len(items_api)}")
+    return items_api
 
 @app.get("/auth02/cards")
 async def auth02_cards():
@@ -406,13 +459,18 @@ async def auth02_cards():
             return _cards_cache["items"]
         try:
             items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                # Si después de todo no hay items, expón el problema.
+                raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
             _cards_cache["items"] = items
             _cards_cache["ts"] = datetime.utcnow()
             return items
-        except Exception:
+        except HTTPException:
+            raise
+        except Exception as e:
             traceback.print_exc()
-            # devuelve cache (aunque esté vacío) si falla scrape
-            return _cards_cache["items"]
+            raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
+
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
