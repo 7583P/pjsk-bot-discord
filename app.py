@@ -102,7 +102,7 @@ async def get_players(
         raise HTTPException(500, "DB pool not initialized")
 
     query = """
-      SELECT p.user_id as id, p.name, sp.mmr, p.country, sp.role as rank
+      SELECT p.user_id as discordId,, p.name, sp.mmr, p.country, sp.role as rank
       FROM players p INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
       WHERE sp.season_id = $1
       ORDER BY sp.mmr DESC
