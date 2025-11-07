@@ -433,18 +433,50 @@ async def _fetch_list_html_via_api() -> str:
         return html
 
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    # 1) HTML directo
-    html = await _fetch_list_html_via_http()
-    items = _parse_cards_from_html(html)
-    print(f"[cards] parsed_count (http) = {len(items)}")
-    if items:
-        return items
+    """
+    Obtiene la lista de cartas desde la categoría 'Cards' usando la API de MediaWiki,
+    en vez de parsear HTML (más estable).
+    """
+    items: List[Dict] = []
 
-    # 2) Fallback a API si no encontró nada (Cloudflare/estructura cambió)
-    html_api = await _fetch_list_html_via_api()
-    items_api = _parse_cards_from_html(html_api)
-    print(f"[cards] parsed_count (api) = {len(items_api)}")
-    return items_api
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        apcontinue = None
+        while True:
+            params = {
+                "action": "query",
+                "list": "categorymembers",
+                "cmtitle": "Category:Cards",
+                "cmlimit": "500",
+                "format": "json",
+            }
+            if apcontinue:
+                params["cmcontinue"] = apcontinue
+
+            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
+            r.raise_for_status()
+            data = r.json()
+
+            members = data.get("query", {}).get("categorymembers", [])
+            for m in members:
+                title = m.get("title", "")
+                pageid = m.get("pageid", "")
+
+                # Construir URL a la card
+                href = f"https://sekaipedia.org/wiki/{title.replace(' ', '_')}"
+                items.append({
+                    "id": str(pageid),
+                    "name": title,
+                    "href": href,
+                    "thumb": None,  # luego agregamos thumbnails opcionalmente
+                })
+
+            apcontinue = data.get("continue", {}).get("cmcontinue")
+            if not apcontinue:
+                break
+
+    print(f"[cards] parsed_count (category api) = {len(items)}")
+    return items
+
 
 @app.get("/auth02/cards")
 async def auth02_cards():
