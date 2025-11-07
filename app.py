@@ -101,34 +101,39 @@ async def shutdown():
 # ======================= Helpers de Seasons =======================
 async def _pick_effective_season(conn: asyncpg.Connection) -> Optional[int]:
     """
-    Devuelve la season 'activa' si existe; si no, la más reciente (id desc).
-    Asume tabla public.seasons con columnas estándar:
-      - id (PK)
-      - name (opcional)
-      - active (bool) o is_active (bool)
-      - starts_at/ends_at (opcionales)
+    Devuelve la season activa si existe (columna active).
+    Si no hay activa, devuelve la última (mayor id).
     """
-    # 1) Activa (active o is_active)
-    row = await conn.fetchrow("""
-        SELECT id
-        FROM public.seasons
-        WHERE COALESCE(active, is_active, FALSE) = TRUE
-        ORDER BY id DESC
-        LIMIT 1
+    # 1) Verificar si existe la columna 'active'
+    has_active = await conn.fetchval("""
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name='seasons'
+              AND column_name='active'
+        );
     """)
-    if row:
-        return row["id"]
 
-    # 2) Última por id
+    if has_active:
+        row = await conn.fetchrow("""
+            SELECT id
+            FROM public.seasons
+            WHERE active = TRUE
+            ORDER BY id DESC
+            LIMIT 1;
+        """)
+        if row:
+            return row["id"]
+
+    # 2) Fallback: última season por id
     row = await conn.fetchrow("""
         SELECT id
         FROM public.seasons
         ORDER BY id DESC
-        LIMIT 1
+        LIMIT 1;
     """)
-    if row:
-        return row["id"]
-    return None
+    return row["id"] if row else None
 
 # ======================= API: Seasons =======================
 @app.get("/api/seasons")
