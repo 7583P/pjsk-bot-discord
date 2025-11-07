@@ -617,8 +617,9 @@ async def _scrape_card_variants(href: str) -> Dict:
     }
 
 @app.get("/auth02/card-variants")
-async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:"))
-    -> Dict:
+async def get_card_variants(
+    href: str = Query(..., description="URL absoluta de la Card:")
+) -> Dict:
     """
     Dado el enlace de una Card (p.ej. https://sekaipedia.org/wiki/Card:xxx),
     devuelve posibles variantes: Untrained / Trained.
