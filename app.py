@@ -433,10 +433,7 @@ async def _fetch_list_html_via_api() -> str:
         return html
 
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    """
-    Obtiene la lista de cartas desde la categoría 'Cards' usando la API de MediaWiki,
-    en vez de parsear HTML (más estable).
-    """
+    # 1) Obtener lista base desde Category:Cards
     items: List[Dict] = []
 
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
@@ -456,26 +453,51 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             r.raise_for_status()
             data = r.json()
 
-            members = data.get("query", {}).get("categorymembers", [])
-            for m in members:
+            for m in data.get("query", {}).get("categorymembers", []):
                 title = m.get("title", "")
-                pageid = m.get("pageid", "")
-
-                # Construir URL a la card
+                pageid = str(m.get("pageid", ""))
                 href = f"https://sekaipedia.org/wiki/{title.replace(' ', '_')}"
                 items.append({
-                    "id": str(pageid),
+                    "id": pageid,
                     "name": title,
                     "href": href,
-                    "thumb": None,  # luego agregamos thumbnails opcionalmente
+                    "thumb": None,
                 })
 
             apcontinue = data.get("continue", {}).get("cmcontinue")
             if not apcontinue:
                 break
 
-    print(f"[cards] parsed_count (category api) = {len(items)}")
+    print(f"[cards] base count = {len(items)}")
+
+    # 2) Obtener thumbnails por lotes de 50
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        for i in range(0, len(items), 50):
+            chunk = items[i:i+50]
+            pageids = "|".join(c["id"] for c in chunk)
+
+            params = {
+                "action": "query",
+                "pageids": pageids,
+                "prop": "pageimages",
+                "piprop": "thumbnail",
+                "pithumbsize": "256",
+                "format": "json",
+            }
+
+            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
+            r.raise_for_status()
+
+            for pid, pinfo in (r.json().get("query", {}).get("pages", {})).items():
+                thumb = (pinfo.get("thumbnail") or {}).get("source")
+                if thumb:
+                    for c in chunk:
+                        if c["id"] == pid:
+                            c["thumb"] = thumb
+
+    print("[cards] thumbnails applied ✅")
     return items
+
 
 
 @app.get("/auth02/cards")
