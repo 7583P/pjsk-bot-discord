@@ -131,14 +131,15 @@ app.post('/auth02/set-pfp', corsCreds, (req, res) => {
 });
 
 // Mock de cartas (PÚBLICO). Reemplaza por tu fuente real (Sekaipedia, etc.)
-app.get('/auth02/cards', corsPublic, (req, res) => {
+app.get('/auth02/cards', (req, res) => {
   const cards = [
-    { id: 1, name: 'Miku 01',   thumb:'https://via.placeholder.com/512?text=Miku01',   href:'https://example.com/miku01' },
-    { id: 2, name: 'Mafuyu 02', thumb:'https://via.placeholder.com/512?text=Mafuyu02', href:'https://example.com/mafuyu02' },
-    { id: 3, name: 'Ichika 03', thumb:'https://via.placeholder.com/512?text=Ichika03', href:'https://example.com/ichika03' },
+    { id: 1, name: 'Miku 01',   thumb:'https://via.placeholder.com/512?text=Miku01' },
+    { id: 2, name: 'Mafuyu 02', thumb:'https://via.placeholder.com/512?text=Mafuyu02' },
+    { id: 3, name: 'Ichika 03', thumb:'https://via.placeholder.com/512?text=Ichika03' },
   ];
   res.json(cards);
 });
+
 
 // Preflight (OPTIONS) explícito para ambas políticas
 app.options(['/auth02/me','/auth02/set-pfp','/auth02/callback'], corsCreds);
