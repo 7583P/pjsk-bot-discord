@@ -11,7 +11,7 @@ import asyncpg
 import httpx
 from bs4 import BeautifulSoup  # type: ignore
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -49,7 +49,7 @@ app.add_middleware(
 # En producción reemplazar por Redis/DB o cookies firmadas/JWT
 SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
 
-def set_session_cookie(resp: Response, sid: str):
+def set_session_cookie(resp, sid: str):
     """
     Cookie sin 'domain' para que el navegador la asocie al dominio del backend (Railway).
     Requisitos para cross-site: Secure + SameSite=None + HTTPS.
@@ -66,6 +66,28 @@ def set_session_cookie(resp: Response, sid: str):
 
 # =========================== DB ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
+HAS_DISCORD_ID_COL: bool = False  # detectado en startup
+
+async def _detect_schema_features(conn: asyncpg.Connection) -> None:
+    """
+    Detecta si players.discord_id existe para construir el SELECT dinámicamente.
+    """
+    global HAS_DISCORD_ID_COL
+    try:
+        row = await conn.fetchrow(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name   = 'players'
+              AND column_name  = 'discord_id'
+            """
+        )
+        HAS_DISCORD_ID_COL = bool(row)
+        print(f"🔎 Schema: players.discord_id = {HAS_DISCORD_ID_COL}")
+    except Exception:
+        traceback.print_exc()
+        HAS_DISCORD_ID_COL = False
 
 @app.on_event("startup")
 async def startup():
@@ -79,6 +101,9 @@ async def startup():
             command_timeout=30.0,
         )
         print("✅ DB pool initialized")
+        # Detectar schema
+        async with db_pool.acquire() as conn:
+            await _detect_schema_features(conn)
     else:
         print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
 
@@ -98,14 +123,20 @@ async def get_players(
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    query = """
+    # Construye el SELECT según disponibilidad de players.discord_id
+    select_cols = [
+        "p.user_id  AS user_id",
+        "p.name     AS name",
+        "p.country  AS country",
+        "sp.mmr     AS mmr",
+        "sp.role    AS rank",
+    ]
+    if HAS_DISCORD_ID_COL:
+        select_cols.insert(1, "p.discord_id AS discord_id")
+
+    query = f"""
       SELECT
-        p.user_id    AS user_id,
-        p.discord_id AS discord_id,   -- quita esta línea si tu tabla no la tiene
-        p.name       AS name,
-        p.country    AS country,
-        sp.mmr       AS mmr,
-        sp.role      AS rank
+        {', '.join(select_cols)}
       FROM players p
       INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
       WHERE sp.season_id = $1
@@ -121,11 +152,10 @@ async def get_players(
 
     out = []
     for r in rows:
-        # asyncpg.Record soporta .get()
         pid = r.get("user_id") or r.get("id")
         out.append({
-            "id": pid,                               # el front lo usa como llave
-            "discordId": r.get("discord_id"),        # el front lo usa pfpById
+            "id": pid,                                # el front lo usa como llave
+            "discordId": r.get("discord_id"),         # solo presente si existe la col
             "name": r.get("name"),
             "mmr": r.get("mmr"),
             "country": r.get("country"),
@@ -465,8 +495,6 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     print("[cards] thumbnails applied ✅")
     return items
 
-
-
 @app.get("/auth02/cards")
 async def auth02_cards():
     now = datetime.utcnow()
@@ -491,10 +519,8 @@ async def auth02_cards():
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
-        
-        # =================== /auth02/card-variants ===================
-from urllib.parse import urljoin
 
+# =================== /auth02/card-variants ===================
 def _abs_sekaipedia(u: str) -> str:
     if not u:
         return ""
@@ -513,10 +539,8 @@ def _is_untrained(filename: str) -> bool:
     s = filename.lower()
     return ("untrained" in s) or ("before training" in s) or ("base" in s)
 
-def _prefer_square(links: list[str]) -> list[str]:
-    # mantienen orden pero preferimos thumbs (suelen ser cuadradas)
-    # si la URL tiene /thumb/ mantenla; si no, igual sirve
-    # dedup básico:
+def _prefer_square(links: List[str]) -> List[str]:
+    # mantén orden, dedup básico
     seen, out = set(), []
     for u in links:
         if u and u not in seen:
@@ -542,15 +566,16 @@ async def _scrape_card_variants(href: str) -> Dict:
     root = soup.select_one("#mw-content-text") or soup
     imgs = root.select("img")
 
-    trained_links, untrained_links, unknown_links = [], [], []
+    trained_links: List[str] = []
+    untrained_links: List[str] = []
+    unknown_links: List[str] = []
 
     for img in imgs:
         src = img.get("data-src") or img.get("src") or ""
         alt = (img.get("alt") or "").strip()
         src = _abs_sekaipedia(src)
 
-        if not src or "sekaipedia" not in src and "wikipedia" not in src:
-            # En general serán de sekaipedia / wikimg
+        if not src or ("sekaipedia" not in src and "wikimg" not in src and "wikipedia" not in src):
             continue
 
         filename = alt or src
@@ -564,9 +589,8 @@ async def _scrape_card_variants(href: str) -> Dict:
     trained_links   = _prefer_square(trained_links)
     untrained_links = _prefer_square(untrained_links)
 
-    # si no encontramos nada por alt/filename, intentamos inferir por orden:
-    # muchas páginas listan primero 'untrained icon', luego 'trained icon'
-    if not untrained_links and len(unknown_links) >= 2:
+    # fallback por orden: muchas páginas listan untrained, luego trained
+    if not untrained_links and len(unknown_links) >= 1:
         untrained_links.append(unknown_links[0])
     if not trained_links and len(unknown_links) >= 2:
         trained_links.append(unknown_links[1])
@@ -577,11 +601,7 @@ async def _scrape_card_variants(href: str) -> Dict:
     if trained_links:
         variants.append({"label": "Trained", "url": trained_links[0]})
 
-    # fallback duro: si aún así nada, devolvemos vacío
-    return {
-        "name": card_name,
-        "variants": variants
-    }
+    return {"name": card_name, "variants": variants}
 
 @app.get("/auth02/card-variants")
 async def get_card_variants(
@@ -598,8 +618,6 @@ async def get_card_variants(
         traceback.print_exc()
         # devolvemos estructura sin variantes para que el front haga fallback al thumb
         return {"name": "", "variants": []}
-
-
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
