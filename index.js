@@ -1,4 +1,3 @@
-
 // index.js
 import 'dotenv/config';
 import express from 'express';
@@ -28,7 +27,7 @@ app.use(express.json());
 app.use(cookieParser());
 
 // --- CORS middlewares ---
-// Público (no cookies, gratuito)
+// Público (no cookies, libre lectura desde cualquier origen)
 const corsPublic = cors({
   origin: '*',
   credentials: false,
@@ -36,9 +35,9 @@ const corsPublic = cors({
   allowedHeaders: ['Content-Type'],
 });
 
-// Protegido (cookies cross-site)
+// Protegido (con cookies cross-site; SOLO tu frontend)
 const corsCreds = cors({
-  origin: APP_ORIGIN,   // <— tu frontend (no * aquí)
+  origin: APP_ORIGIN,   // tu frontend (no uses '*')
   credentials: true,
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type'],
@@ -49,15 +48,15 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ====== Sesión simple (usa DB/Redis en prod) ======
 const sessionStore = new Map();   // sid -> { discordId, username }
-const pfpById      = new Map();   // "<someUserId>" -> url
-const pfpByName    = new Map();   // "nameLower"    -> url
+const pfpById      = new Map();   // "discordId" -> url
+const pfpByName    = new Map();   // "nameLower" -> url
 
 function cryptoRandom(){ return crypto.randomBytes(24).toString('hex'); }
 
 function setSessionCookie(res, sid){
   res.cookie(COOKIE_NAME, sid, {
     httpOnly: true,
-    secure: true,        // obligatorio con SameSite=None
+    secure: true,        // obligatorio con SameSite=None en HTTPS
     sameSite: 'none',
     path: '/',
     maxAge: 1000 * 60 * 60 * 24 * 7, // 7 días
@@ -70,6 +69,12 @@ function getSession(req){
 }
 
 // ========= RUTAS auth02 =========
+
+// Iniciar el flujo (mock). En prod, aquí rediriges a Discord OAuth.
+app.get('/auth02', corsCreds, (req, res) => {
+  // Para el mock redirigimos directo al callback para crear sesión
+  return res.redirect(302, '/auth02/callback');
+});
 
 // Simula callback OAuth (reemplaza por tu flujo real con Discord)
 app.get('/auth02/callback', corsCreds, (req, res) => {
@@ -115,6 +120,7 @@ app.post('/auth02/set-pfp', corsCreds, (req, res) => {
 
   // Normaliza llaves
   const nameKey = (nameLower ? String(nameLower).toLowerCase() : null);
+  // si no envían userId, usamos el discordId de la sesión
   const idKey   = (userId ? String(userId) : String(sess.discordId));
 
   if (url === '') {
@@ -131,7 +137,7 @@ app.post('/auth02/set-pfp', corsCreds, (req, res) => {
 });
 
 // Mock de cartas (PÚBLICO). Reemplaza por tu fuente real (Sekaipedia, etc.)
-app.get('/auth02/cards', (req, res) => {
+app.get('/auth02/cards', corsPublic, (req, res) => {
   const cards = [
     { id: 1, name: 'Miku 01',   thumb:'https://via.placeholder.com/512?text=Miku01' },
     { id: 2, name: 'Mafuyu 02', thumb:'https://via.placeholder.com/512?text=Mafuyu02' },
@@ -140,9 +146,8 @@ app.get('/auth02/cards', (req, res) => {
   res.json(cards);
 });
 
-
 // Preflight (OPTIONS) explícito para ambas políticas
-app.options(['/auth02/me','/auth02/set-pfp','/auth02/callback'], corsCreds);
+app.options(['/auth02','/auth02/me','/auth02/set-pfp','/auth02/callback'], corsCreds);
 app.options(['/auth02/cards','/auth02/pfps'], corsPublic);
 
 // ===== (Opcional) APIs que ya tenías (/api/players, /api/seasons, etc.) =====
@@ -157,6 +162,7 @@ const client = new Client({ intents: [ GatewayIntentBits.Guilds ] });
 
 let rankColors = {};
 async function loadRankColors() {
+  if (!GUILD_ID) return;
   const guild = await client.guilds.fetch(GUILD_ID);
   const roles = await guild.roles.fetch();
   const map = {};
@@ -180,6 +186,7 @@ app.post('/api/assign-rank', corsCreds, async (req, res) => {
     return res.status(400).json({ error: 'userId o newRank inválido' });
   }
   try {
+    if (!GUILD_ID) throw new Error('Falta GUILD_ID');
     const guild  = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(userId);
     const allRoles = await guild.roles.fetch();
@@ -196,19 +203,24 @@ app.post('/api/assign-rank', corsCreds, async (req, res) => {
   }
 });
 
-// Arranque: primero el bot, luego el server
-client.once('ready', async () => {
-  console.log(`🤖 Bot listo: ${client.user.tag}`);
-  await loadRankColors();
-  client.on('roleCreate', r => wanted.includes(r.name) && loadRankColors());
-  client.on('roleUpdate', (_, r) => wanted.includes(r.name) && loadRankColors());
-});
-
 // Healthcheck (útil para Railway)
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-// Inicia ambos
+// Arranque bot (si hay token) y server
+if (DISCORD_TOKEN) {
+  client.once('ready', async () => {
+    console.log(`🤖 Bot listo: ${client.user.tag}`);
+    await loadRankColors();
+    client.on('roleCreate', r => wanted.includes(r.name) && loadRankColors());
+    client.on('roleUpdate', (_, r) => wanted.includes(r.name) && loadRankColors());
+  });
+  client.login(DISCORD_TOKEN).catch(err => {
+    console.error('Error al iniciar el bot de Discord:', err.message);
+  });
+} else {
+  console.warn('⚠️ DISCORD_TOKEN no definido. El bot no se iniciará.');
+}
+
 app.listen(PORT, () => {
   console.log(`🌐 Server listening on :${PORT}`);
 });
-client.login(DISCORD_TOKEN);
