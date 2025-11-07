@@ -14,6 +14,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -32,14 +33,14 @@ app = FastAPI()
 # ============== CORS (con credenciales) ==============
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONT_URL],  # agrega otros orígenes si corresponde
+    allow_origins=[FRONT_URL],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
 # ================ Sesiones simples en memoria ================
-SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
+SESSIONS: Dict[str, Dict] = {}  # sid -> {"id": "<discord_id>", "username": "..."}
 
 def set_session_cookie(resp, sid: str):
     resp.set_cookie(
@@ -49,7 +50,7 @@ def set_session_cookie(resp, sid: str):
         secure=True,
         samesite="none",
         path="/",
-        max_age=60 * 60 * 24 * 7   # 7 días
+        max_age=60 * 60 * 24 * 7  # 7 días
     )
 
 # =========================== DB & Schema Flags ===========================
@@ -77,14 +78,12 @@ async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
 
 async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT
-
     try:
         HAS_DISCORD_ID_COL   = await _has_col(conn, "players", "discord_id")
         SEASONS_HAS_ACTIVE   = await _has_col(conn, "seasons", "active")
         SEASONS_HAS_NAME     = await _has_col(conn, "seasons", "name")
         SEASONS_HAS_STARTS_AT= await _has_col(conn, "seasons", "starts_at")
         SEASONS_HAS_ENDS_AT  = await _has_col(conn, "seasons", "ends_at")
-
         print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} | seasons.active={SEASONS_HAS_ACTIVE} name={SEASONS_HAS_NAME} starts_at={SEASONS_HAS_STARTS_AT} ends_at={SEASONS_HAS_ENDS_AT}")
     except Exception:
         traceback.print_exc()
@@ -119,17 +118,11 @@ async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     return bool(row)
 
 async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: int) -> int:
-    """
-    Lógica histórica/actual:
-      - requested_season_id == 0  -> usa season activa (active=TRUE). Si no hay, usa MAX(id).
-      - requested_season_id  > 0  -> valida que exista y úsala tal cual.
-    """
     if requested_season_id > 0:
         if await _season_exists(conn, requested_season_id):
             return requested_season_id
         raise HTTPException(404, f"season {requested_season_id} not found")
 
-    # requested_season_id == 0 => actual
     if SEASONS_HAS_ACTIVE:
         row = await conn.fetchrow("""
             SELECT id
@@ -141,7 +134,6 @@ async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: 
         if row and row["id"]:
             return int(row["id"])
 
-    # Fallback: última por id
     row = await conn.fetchrow("SELECT id FROM public.seasons ORDER BY id DESC LIMIT 1")
     if row and row["id"]:
         return int(row["id"])
@@ -175,7 +167,7 @@ async def list_seasons():
         out.append(item)
     return out
 
-# ======================= API: Players (histórico/actual) =======================
+# ======================= API: Players =======================
 @app.get("/api/players")
 async def get_players(
     season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
@@ -187,7 +179,6 @@ async def get_players(
 
     try:
         async with db_pool.acquire() as conn:
-            # Resolver season efectiva (0=actual, >0=hst específica)
             picked = await _pick_effective_season(conn, season_id)
 
             select_cols = [
@@ -230,10 +221,39 @@ async def get_players(
 
 # ======================= AUTH02 (Discord OAuth) =======================
 PFP_BY_NAME: Dict[str, str] = {}  # nameLower -> url
-PFP_BY_ID:   Dict[str, str] = {}  # userId/discordId -> url
+PFP_BY_ID:   Dict[str, str] = {}  # userId (players.user_id) -> url
 
 STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
 STATE_TTL = timedelta(minutes=10)
+
+async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
+    """
+    Si existe players.discord_id, mapear discord_id -> players.user_id
+    """
+    if not (db_pool and HAS_DISCORD_ID_COL and discord_id):
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM public.players WHERE discord_id = $1 LIMIT 1",
+            discord_id
+        )
+        if row:
+            return str(row["user_id"])
+    return None
+
+def _valid_https_url(u: str) -> bool:
+    try:
+        p = urlparse(u)
+        if p.scheme != "https":
+            return False
+        if not p.netloc:
+            return False
+        # Evita espacios y comillas
+        if any(c.isspace() for c in u) or '"' in u or "'" in u:
+            return False
+        return True
+    except Exception:
+        return False
 
 @app.get("/health")
 async def health():
@@ -309,7 +329,11 @@ async def auth02_me(request: Request):
     sid = request.cookies.get(COOKIE_NAME)
     if not sid or sid not in SESSIONS:
         raise HTTPException(status_code=401, detail="no-session")
-    return SESSIONS[sid]
+
+    payload = dict(SESSIONS[sid])
+    # Intentar resolver user_id (celda del leaderboard) desde discord_id
+    payload["resolvedUserId"] = await _resolve_user_id_from_discord(payload.get("id", ""))
+    return payload
 
 @app.post("/auth02/logout")
 async def auth02_logout(request: Request):
@@ -322,41 +346,59 @@ async def auth02_logout(request: Request):
 
 # =================== /auth02/pfps ===================
 MAX_PFPS = 5000
-URL_RE = re.compile(r"^https:\/\/[a-z0-9\.\-\/_%\?\=&]+$", re.I)
 
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
+    """
+    Permite guardar/actualizar el PFP del usuario:
+    - Si no mandan userId, intenta con cookie de sesión -> discord_id -> players.user_id
+    - Guarda por userId (PFP_BY_ID) y opcionalmente por nameLower (PFP_BY_NAME)
+    """
     body = await request.json()
     url = (body.get("url") or "").strip()
     name_lower = (body.get("nameLower") or "").strip().lower()
     user_id = (body.get("userId") or "").strip()
 
+    # Rellenos desde sesión OAuth
+    sid = request.cookies.get(COOKIE_NAME)
+    session = SESSIONS.get(sid or "", {})
+
     if not user_id:
-        sid = request.cookies.get(COOKIE_NAME)
-        if sid and sid in SESSIONS:
-            user_id = str(SESSIONS[sid].get("id") or "")
+        # Resolver por discord_id -> players.user_id
+        discord_id = str(session.get("id") or "")
+        resolved = await _resolve_user_id_from_discord(discord_id)
+        if resolved:
+            user_id = resolved
 
     if not name_lower:
-        sid = request.cookies.get(COOKIE_NAME)
-        if sid and sid in SESSIONS:
-            name_lower = (SESSIONS[sid].get("username") or "").lower()
+        if session:
+            name_lower = (session.get("username") or "").lower()
 
+    # Borrado
     if url == "":
-        if user_id:   PFP_BY_ID.pop(user_id, None)
-        if name_lower:PFP_BY_NAME.pop(name_lower, None)
+        if user_id:
+            PFP_BY_ID.pop(user_id, None)
+        if name_lower:
+            PFP_BY_NAME.pop(name_lower, None)
         return {"ok": True, "deleted": True}
 
-    if not (user_id or name_lower):
-        raise HTTPException(400, "missing userId or nameLower")
-
-    if not URL_RE.match(url):
+    # Validación mínima
+    if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
+
+    # Debe existir al menos un identificador para asignar
+    if not (user_id or name_lower):
+        raise HTTPException(400, "missing userId or nameLower (and no session mapping)")
+
     if len(PFP_BY_ID) + len(PFP_BY_NAME) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    if user_id:   PFP_BY_ID[user_id] = url
-    if name_lower:PFP_BY_NAME[name_lower] = url
-    return {"ok": True}
+    if user_id:
+        PFP_BY_ID[user_id] = url
+    if name_lower:
+        PFP_BY_NAME[name_lower] = url
+
+    return {"ok": True, "byId": bool(user_id), "byName": bool(name_lower)}
 
 @app.get("/auth02/pfps")
 async def list_pfps():
@@ -389,7 +431,6 @@ def _guess_id(name: str, href: str) -> str:
     return (href or "").rstrip("/").split("/")[-1] or (name or "")
 
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    # 1) Base por categoría
     items: List[Dict] = []
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         apcontinue = None
@@ -413,7 +454,6 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             apcontinue = data.get("continue", {}).get("cmcontinue")
             if not apcontinue: break
 
-    # 2) Thumbnails por lotes
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         for i in range(0, len(items), 50):
             chunk = items[i:i+50]

@@ -498,19 +498,44 @@ class Matchmaking(commands.Cog):
     async def _resolve_season_id(self, season_choice: str | None) -> tuple[int | None, str]:
         """
         Devuelve (season_id, season_name) según la elección del usuario.
-        - None o "actual"  => temporada activa (get_current_season)
-        - "beta, preseaspm"           => busca por nombre 'beta, preseason'
+        - None o "current/actual" => temporada activa (get_current_season)
+        - "beta"                  => busca por nombre 'beta' (case-insensitive)
+        - "preseason"             => busca por 'preseason'/'pre-season'/'pre season' (case-insensitive)
+        - Si no coincide, intenta buscar por nombre exacto (case-insensitive) o por ID numérico.
         """
-        if (season_choice or "actual").lower() in ("actual", "current"):
+        val = (season_choice or "current").strip()
+        key = val.lower()
+
+        # current / actual → temporada activa
+        if key in ("current", "actual"):
             row = await self.get_current_season()
             return (row["id"], row["name"]) if row else (None, "N/A")
 
-        # Beta por nombre (case-insensitive)
+        # Mapas de alias por conveniencia
+        aliases = {
+            "beta": ["beta"],
+            "preseason": ["preseason", "pre-season", "pre season"],
+        }
+        candidate_names = aliases.get(key, [val])
+
         async with self.db_pool.acquire() as conn:
+            # Intento por nombres (case-insensitive), priorizando la más reciente
+            where = " OR ".join(f"LOWER(name) = ${i+1}" for i in range(len(candidate_names)))
             row = await conn.fetchrow(
-                "SELECT id, name FROM seasons WHERE LOWER(name) = 'beta, preseason' ORDER BY startdate LIMIT 1"
+                f"SELECT id, name FROM seasons WHERE {where} ORDER BY startdate DESC LIMIT 1",
+                *[c.lower() for c in candidate_names]
             )
-        return (row["id"], row["name"]) if row else (None, "Beta,PreSeason")
+
+            if not row:
+                # Si el usuario pasó un ID numérico
+                if key.isdigit():
+                    row = await conn.fetchrow(
+                        "SELECT id, name FROM seasons WHERE id = $1",
+                        int(key)
+                    )
+
+        return (row["id"], row["name"]) if row else (None, val)
+
 
     async def _fetch_user_stats(self, user_id: int, season_id: int):
         """
@@ -1518,11 +1543,12 @@ class Matchmaking(commands.Cog):
     @app_commands.describe(season="Temporada: Current, Beta or PreSeason")
     @app_commands.choices(
         season=[
-            app_commands.Choice(name="Current", value="Current"),
-            app_commands.Choice(name="PreSeason",   value="preseason"),
-            app_commands.Choice(name="Beta",   value="beta"),
+            app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="PreSeason", value="preseason"),
+            app_commands.Choice(name="Beta", value="beta"),
         ]
     )
+
     async def cutoffs(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
