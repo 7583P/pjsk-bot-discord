@@ -5,6 +5,7 @@ import traceback
 import asyncio
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -14,7 +15,6 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from urllib.parse import urlparse
 
 load_dotenv()
 
@@ -118,11 +118,13 @@ async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     return bool(row)
 
 async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: int) -> int:
+    # >0: usa la específica (si existe)
     if requested_season_id > 0:
         if await _season_exists(conn, requested_season_id):
             return requested_season_id
         raise HTTPException(404, f"season {requested_season_id} not found")
 
+    # 0: usa la activa si existe, si no, la última
     if SEASONS_HAS_ACTIVE:
         row = await conn.fetchrow("""
             SELECT id
@@ -248,7 +250,6 @@ def _valid_https_url(u: str) -> bool:
             return False
         if not p.netloc:
             return False
-        # Evita espacios y comillas
         if any(c.isspace() for c in u) or '"' in u or "'" in u:
             return False
         return True
@@ -331,7 +332,6 @@ async def auth02_me(request: Request):
         raise HTTPException(status_code=401, detail="no-session")
 
     payload = dict(SESSIONS[sid])
-    # Intentar resolver user_id (celda del leaderboard) desde discord_id
     payload["resolvedUserId"] = await _resolve_user_id_from_discord(payload.get("id", ""))
     return payload
 
@@ -350,29 +350,28 @@ MAX_PFPS = 5000
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Permite guardar/actualizar el PFP del usuario:
-    - Si no mandan userId, intenta con cookie de sesión -> discord_id -> players.user_id
-    - Guarda por userId (PFP_BY_ID) y opcionalmente por nameLower (PFP_BY_NAME)
+    Guarda/actualiza el PFP:
+    - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
+    - Guarda por userId (celda) y opcionalmente por nameLower.
+    - url="" borra el registro.
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
     name_lower = (body.get("nameLower") or "").strip().lower()
     user_id = (body.get("userId") or "").strip()
 
-    # Rellenos desde sesión OAuth
+    # Desde sesión OAuth
     sid = request.cookies.get(COOKIE_NAME)
     session = SESSIONS.get(sid or "", {})
 
     if not user_id:
-        # Resolver por discord_id -> players.user_id
         discord_id = str(session.get("id") or "")
         resolved = await _resolve_user_id_from_discord(discord_id)
         if resolved:
             user_id = resolved
 
-    if not name_lower:
-        if session:
-            name_lower = (session.get("username") or "").lower()
+    if not name_lower and session:
+        name_lower = (session.get("username") or "").lower()
 
     # Borrado
     if url == "":
@@ -382,11 +381,10 @@ async def set_pfp(request: Request):
             PFP_BY_NAME.pop(name_lower, None)
         return {"ok": True, "deleted": True}
 
-    # Validación mínima
+    # Validación URL
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
 
-    # Debe existir al menos un identificador para asignar
     if not (user_id or name_lower):
         raise HTTPException(400, "missing userId or nameLower (and no session mapping)")
 
@@ -397,7 +395,6 @@ async def set_pfp(request: Request):
         PFP_BY_ID[user_id] = url
     if name_lower:
         PFP_BY_NAME[name_lower] = url
-
     return {"ok": True, "byId": bool(user_id), "byName": bool(name_lower)}
 
 @app.get("/auth02/pfps")
