@@ -42,7 +42,7 @@ app.add_middleware(
 )
 
 # ================ Sesiones simples en memoria ================
-SESSIONS: Dict[str, Dict] = {}  # sid -> {"id": "...", "username": "..."}
+SESSIONS: Dict[str, Dict] = {}     # sid -> {"id": "...", "username": "..."}
 
 def set_session_cookie(resp, sid: str):
     resp.set_cookie(
@@ -52,45 +52,52 @@ def set_session_cookie(resp, sid: str):
         secure=True,
         samesite="none",
         path="/",
-        max_age=60 * 60 * 24 * 7,
+        max_age=60 * 60 * 24 * 7
     )
 
 # =========================== DB ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
-HAS_DISCORD_ID_COL: bool = False  # detectado en startup
+HAS_DISCORD_ID_COL: bool = False   # public.players.discord_id
+HAS_SEASON_NAME_COL: bool = False  # public.seasons.name
+
+async def _has_column(conn: asyncpg.Connection, table: str, column: str, schema: str = "public") -> bool:
+    row = await conn.fetchrow(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+        """,
+        schema, table, column
+    )
+    return bool(row)
 
 async def _detect_schema_features(conn: asyncpg.Connection) -> None:
-    global HAS_DISCORD_ID_COL
+    global HAS_DISCORD_ID_COL, HAS_SEASON_NAME_COL
     try:
-        row = await conn.fetchrow("""
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema='public'
-              AND table_name='players'
-              AND column_name='discord_id'
-        """)
-        HAS_DISCORD_ID_COL = bool(row)
-        print(f"🔎 Schema: players.discord_id = {HAS_DISCORD_ID_COL}")
+        HAS_DISCORD_ID_COL = await _has_column(conn, "players", "discord_id")
+        HAS_SEASON_NAME_COL = await _has_column(conn, "seasons", "name")
+        print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} seasons.name={HAS_SEASON_NAME_COL}")
     except Exception:
         traceback.print_exc()
         HAS_DISCORD_ID_COL = False
+        HAS_SEASON_NAME_COL = False
 
 @app.on_event("startup")
 async def startup():
     global db_pool
-    if not DATABASE_URL:
+    if DATABASE_URL:
+        db_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            timeout=10.0,
+            command_timeout=30.0,
+        )
+        print("✅ DB pool initialized")
+        async with db_pool.acquire() as conn:
+            await _detect_schema_features(conn)
+    else:
         print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
-        return
-    db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=10,
-        timeout=10.0,
-        command_timeout=30.0,
-    )
-    print("✅ DB pool initialized")
-    async with db_pool.acquire() as conn:
-        await _detect_schema_features(conn)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -98,145 +105,104 @@ async def shutdown():
         await db_pool.close()
         print("🛑 DB pool closed")
 
-# ======================= Helpers de Seasons =======================
-async def _pick_effective_season(conn: asyncpg.Connection) -> Optional[int]:
+# ======================= Helpers Seasons =======================
+async def _pick_effective_season(conn: asyncpg.Connection, season_id_param: int) -> int:
     """
-    Devuelve la season activa si existe (columna active).
-    Si no hay activa, devuelve la última (mayor id).
+    Regla:
+    - Si season_id_param > 0  → usar ese (válido aunque no sea active).
+    - Si season_id_param == 0 → usar seasons.active=TRUE más reciente.
+      Si no existe active=TRUE, usar la temporada con mayor id.
+    - Si no hay temporadas → 404.
     """
-    # 1) Verificar si existe la columna 'active'
-    has_active = await conn.fetchval("""
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema='public'
-              AND table_name='seasons'
-              AND column_name='active'
-        );
-    """)
+    if season_id_param and season_id_param > 0:
+        r = await conn.fetchrow("SELECT id FROM public.seasons WHERE id = $1", season_id_param)
+        if not r:
+            raise HTTPException(status_code=404, detail=f"season {season_id_param} not found")
+        return int(r["id"])
 
-    if has_active:
-        row = await conn.fetchrow("""
-            SELECT id
-            FROM public.seasons
-            WHERE active = TRUE
-            ORDER BY id DESC
-            LIMIT 1;
-        """)
-        if row:
-            return row["id"]
-
-    # 2) Fallback: última season por id
-    row = await conn.fetchrow("""
+    # 1) Intentar temporada activa
+    row = await conn.fetchrow(
+        """
         SELECT id
         FROM public.seasons
+        WHERE active = TRUE
         ORDER BY id DESC
-        LIMIT 1;
-    """)
-    return row["id"] if row else None
+        LIMIT 1
+        """
+    )
+    if row:
+        return int(row["id"])
+
+    # 2) Fallback: la última por id
+    row2 = await conn.fetchrow(
+        "SELECT id FROM public.seasons ORDER BY id DESC LIMIT 1"
+    )
+    if row2:
+        return int(row2["id"])
+
+    raise HTTPException(status_code=404, detail="no seasons found")
 
 # ======================= API: Seasons =======================
 @app.get("/api/seasons")
-async def get_seasons():
+async def list_seasons():
     """
-    Devuelve la lista de temporadas ordenadas por id desc.
-    Campos devueltos: id, name, startsAt, endsAt, active
-    (los que no existan salen como null)
+    Devuelve temporadas existentes.
+    Intenta incluir 'name' si la columna existe; siempre incluye id y active.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    query = """
-    SELECT
-      s.id                              AS id,
-      COALESCE(s.name, CONCAT('Season ', s.id::text)) AS name,
-      (CASE WHEN EXISTS (
-         SELECT 1 FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='seasons' AND column_name='starts_at'
-       ) THEN s.starts_at ELSE NULL END)               AS starts_at,
-      (CASE WHEN EXISTS (
-         SELECT 1 FROM information_schema.columns
-          WHERE table_schema='public' AND table_name='seasons' AND column_name='ends_at'
-       ) THEN s.ends_at ELSE NULL END)                 AS ends_at,
-      COALESCE(s.active, s.is_active, FALSE)          AS active
-    FROM public.seasons s
-    ORDER BY s.id DESC
-    """
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"DB error: {e}")
+    select_cols = ["id", "active"]
+    if HAS_SEASON_NAME_COL:
+        select_cols.insert(1, "name")
+
+    q = f"SELECT {', '.join(select_cols)} FROM public.seasons ORDER BY id DESC"
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(q)
 
     out = []
     for r in rows:
-        out.append({
-            "id": r.get("id"),
-            "name": r.get("name"),
-            "startsAt": r.get("starts_at"),
-            "endsAt": r.get("ends_at"),
-            "active": r.get("active"),
-        })
+        item = {"id": r["id"], "active": r.get("active")}
+        if HAS_SEASON_NAME_COL:
+            item["name"] = r.get("name")
+        out.append(item)
     return out
 
 # ======================= API: Players =======================
 @app.get("/api/players")
 async def get_players(
-    season_id: int = Query(..., description="Season ID (0 = usar activa / última)"),
+    season_id: int = Query(..., description="Season ID (0 = activa/última)"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
-    q: Optional[str] = Query(None, description="Filtro por nombre (icontains)"),
-    rank: Optional[str] = Query(None, description="Filtro por rango exacto"),
 ):
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
+    # Columns seguras
+    select_cols = [
+        "p.user_id  AS user_id",
+        "p.name     AS name",
+        "p.country  AS country",
+        "sp.mmr     AS mmr",
+        "sp.role    AS rank",
+    ]
+    if HAS_DISCORD_ID_COL:
+        select_cols.insert(1, "p.discord_id AS discord_id")
+
+    query = f"""
+      SELECT
+        {', '.join(select_cols)}
+      FROM public.players p
+      INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
+      WHERE sp.season_id = $1
+      ORDER BY sp.mmr DESC
+      LIMIT $2 OFFSET $3;
+    """
+
     try:
         async with db_pool.acquire() as conn:
-            effective_season = season_id
-            if season_id == 0:
-                picked = await _pick_effective_season(conn)
-                if not picked:
-                    return []  # no hay seasons
-                effective_season = picked
-
-            # columnas dinámicas
-            select_cols = [
-                "p.user_id  AS user_id",
-                "p.name     AS name",
-                "p.country  AS country",
-                "sp.mmr     AS mmr",
-                "sp.role    AS rank",
-            ]
-            if HAS_DISCORD_ID_COL:
-                select_cols.insert(1, "p.discord_id AS discord_id")
-
-            # filtros dinámicos
-            where = ["sp.season_id = $1"]
-            params = [effective_season, limit, offset]
-            param_i = 4  # $1 season, $2 limit, $3 offset → siguiente es $4
-
-            if q:
-                where.append(f"p.name ILIKE ${param_i}")
-                params.insert(1, f"%{q}%")  # mantenemos limit/offset al final
-                param_i += 1
-            if rank:
-                where.append(f"sp.role = ${param_i}")
-                params.insert(-2, rank)     # antes de limit/offset
-                param_i += 1
-
-            query = f"""
-                SELECT {', '.join(select_cols)}
-                FROM public.players p
-                INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
-                WHERE {' AND '.join(where)}
-                ORDER BY sp.mmr DESC
-                LIMIT $2 OFFSET $3
-            """
-
-            rows = await conn.fetch(query, *params)
-
+            picked = await _pick_effective_season(conn, season_id)
+            rows = await conn.fetch(query, picked, limit, offset)
     except HTTPException:
         raise
     except Exception as e:
@@ -248,7 +214,7 @@ async def get_players(
         pid = r.get("user_id") or r.get("id")
         out.append({
             "id": pid,
-            "discordId": r.get("discord_id"),  # solo si existe la col
+            "discordId": r.get("discord_id"),
             "name": r.get("name"),
             "mmr": r.get("mmr"),
             "country": r.get("country"),
@@ -433,19 +399,19 @@ def _parse_cards_from_html(html: str) -> List[Dict]:
         href = a.get("href") or ""
         href_abs = _abs_url(href)
         name = a.get_text(strip=True) or ""
-
         thumb = None
-        img = a.find("img") or (a.parent.find("img") if a.parent else None) or a.find_next_sibling("img")
+        img = a.find("img")
+        if not img and a.parent:
+            img = a.parent.find("img")
+        if not img:
+            sib = a.find_next_sibling("img")
+            if sib:
+                img = sib
         if img:
             thumb = img.get("data-src") or img.get("src")
             thumb = _abs_url(thumb)
 
-        items.append({
-            "id": _guess_id(name, href_abs),
-            "name": name,
-            "thumb": thumb,
-            "href": href_abs
-        })
+        items.append({"id": _guess_id(name, href_abs), "name": name, "thumb": thumb, "href": href_abs})
 
     seen, dedup = set(), []
     for it in items:
@@ -485,10 +451,13 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             if not apcontinue:
                 break
 
+    print(f"[cards] base count = {len(items)}")
+
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         for i in range(0, len(items), 50):
             chunk = items[i:i+50]
             pageids = "|".join(c["id"] for c in chunk)
+
             params = {
                 "action": "query",
                 "pageids": pageids,
@@ -497,8 +466,10 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                 "pithumbsize": "256",
                 "format": "json",
             }
+
             r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
             r.raise_for_status()
+
             for pid, pinfo in (r.json().get("query", {}).get("pages", {})).items():
                 thumb = (pinfo.get("thumbnail") or {}).get("source")
                 if thumb:
@@ -506,6 +477,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                         if c["id"] == pid:
                             c["thumb"] = thumb
 
+    print("[cards] thumbnails applied ✅")
     return items
 
 @app.get("/auth02/cards")
@@ -533,12 +505,9 @@ async def auth02_cards():
 
 # =================== /auth02/card-variants ===================
 def _abs_sekaipedia(u: str) -> str:
-    if not u:
-        return ""
-    if u.startswith("//"):
-        return "https:" + u
-    if u.startswith("/"):
-        return "https://sekaipedia.org" + u
+    if not u: return ""
+    if u.startswith("//"): return "https:" + u
+    if u.startswith("/"):  return "https://sekaipedia.org" + u
     return u
 
 def _is_trained(filename: str) -> bool:
@@ -570,6 +539,7 @@ async def _scrape_card_variants(href: str) -> Dict:
 
     title = soup.select_one("#firstHeading")
     card_name = title.get_text(strip=True) if title else ""
+
     root = soup.select_one("#mw-content-text") or soup
     imgs = root.select("img")
 
@@ -610,7 +580,9 @@ async def _scrape_card_variants(href: str) -> Dict:
     return {"name": card_name, "variants": variants}
 
 @app.get("/auth02/card-variants")
-async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
+async def get_card_variants(
+    href: str = Query(..., description="URL absoluta de la Card:")
+) -> Dict:
     try:
         data = await _scrape_card_variants(href)
         return data
