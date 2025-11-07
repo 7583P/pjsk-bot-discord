@@ -7,4 +7,4 @@ uvicorn[standard]
 fastapi
 httpx
 beautifulsoup4
-lxml
+html5lib

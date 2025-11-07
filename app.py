@@ -358,7 +358,11 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
         r.raise_for_status()
         html = r.text
 
-    soup = BeautifulSoup(html, "lxml")
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
     root = soup.select_one("#mw-content-text") or soup
 
     items: List[Dict] = []
