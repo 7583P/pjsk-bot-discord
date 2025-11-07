@@ -524,6 +524,113 @@ async def auth02_cards():
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
+        
+        # =================== /auth02/card-variants ===================
+from urllib.parse import urljoin
+
+def _abs_sekaipedia(u: str) -> str:
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return "https://sekaipedia.org" + u
+    return u
+
+def _is_trained(filename: str) -> bool:
+    s = filename.lower()
+    # heurísticas típicas en Sekaipedia
+    return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+
+def _is_untrained(filename: str) -> bool:
+    s = filename.lower()
+    return ("untrained" in s) or ("before training" in s) or ("base" in s)
+
+def _prefer_square(links: list[str]) -> list[str]:
+    # mantienen orden pero preferimos thumbs (suelen ser cuadradas)
+    # si la URL tiene /thumb/ mantenla; si no, igual sirve
+    # dedup básico:
+    seen, out = set(), []
+    for u in links:
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+async def _scrape_card_variants(href: str) -> Dict:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        r = await client.get(href, headers=_HTTP_HEADERS)
+        r.raise_for_status()
+        html = r.text
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.select_one("#firstHeading")
+    card_name = title.get_text(strip=True) if title else ""
+
+    # buscar imágenes en el contenido principal
+    root = soup.select_one("#mw-content-text") or soup
+    imgs = root.select("img")
+
+    trained_links, untrained_links, unknown_links = [], [], []
+
+    for img in imgs:
+        src = img.get("data-src") or img.get("src") or ""
+        alt = (img.get("alt") or "").strip()
+        src = _abs_sekaipedia(src)
+
+        if not src or "sekaipedia" not in src and "wikipedia" not in src:
+            # En general serán de sekaipedia / wikimg
+            continue
+
+        filename = alt or src
+        if _is_trained(filename):
+            trained_links.append(src)
+        elif _is_untrained(filename):
+            untrained_links.append(src)
+        else:
+            unknown_links.append(src)
+
+    trained_links   = _prefer_square(trained_links)
+    untrained_links = _prefer_square(untrained_links)
+
+    # si no encontramos nada por alt/filename, intentamos inferir por orden:
+    # muchas páginas listan primero 'untrained icon', luego 'trained icon'
+    if not untrained_links and len(unknown_links) >= 2:
+        untrained_links.append(unknown_links[0])
+    if not trained_links and len(unknown_links) >= 2:
+        trained_links.append(unknown_links[1])
+
+    variants = []
+    if untrained_links:
+        variants.append({"label": "Untrained", "url": untrained_links[0]})
+    if trained_links:
+        variants.append({"label": "Trained", "url": trained_links[0]})
+
+    # fallback duro: si aún así nada, devolvemos vacío
+    return {
+        "name": card_name,
+        "variants": variants
+    }
+
+@app.get("/auth02/card-variants")
+async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:"))
+    -> Dict:
+    """
+    Dado el enlace de una Card (p.ej. https://sekaipedia.org/wiki/Card:xxx),
+    devuelve posibles variantes: Untrained / Trained.
+    """
+    try:
+        data = await _scrape_card_variants(href)
+        return data
+    except Exception as e:
+        traceback.print_exc()
+        # devolvemos estructura sin variantes para que el front haga fallback al thumb
+        return {"name": "", "variants": []}
+
 
 
 # =================== Static (Front opcional) ===================
