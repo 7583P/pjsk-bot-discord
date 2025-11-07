@@ -95,15 +95,19 @@ async def get_players(
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
-    """
-    Devuelve jugadores de una season ordenados por MMR (paginado).
-    """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
     query = """
-      SELECT p.user_id as discordId, p.name, sp.mmr, p.country, sp.role as rank
-      FROM players p INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
+      SELECT
+        p.user_id    AS user_id,
+        p.discord_id AS discord_id,   -- quita esta línea si tu tabla no la tiene
+        p.name       AS name,
+        p.country    AS country,
+        sp.mmr       AS mmr,
+        sp.role      AS rank
+      FROM players p
+      INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
       WHERE sp.season_id = $1
       ORDER BY sp.mmr DESC
       LIMIT $2 OFFSET $3;
@@ -115,56 +119,19 @@ async def get_players(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
-    return [
-        {
-            "id": r["id"],
-            "name": r["name"],
-            "mmr": r["mmr"],
-            "country": r["country"],
-            "rank": r["rank"],
-        }
-        for r in rows
-    ]
-
-
-@app.get("/api/seasons")
-async def get_seasons():
-    """
-    Devuelve la season activa como 'Current' + el histórico.
-    Activas primero; luego inactivas desde las más recientes.
-    """
-    if not db_pool:
-        raise HTTPException(500, "DB pool not initialized")
-
-    query = """
-       SELECT *
-       FROM (
-           SELECT id, 'Current' AS name, active, startdate, enddate
-           FROM seasons
-           WHERE active = true
-           UNION ALL
-           SELECT id, name, active, startdate, enddate
-           FROM seasons
-           WHERE active = false
-       ) s
-       ORDER BY s.active DESC, s.enddate DESC NULLS LAST, s.startdate DESC NULLS LAST;
-    """
-    try:
-        async with db_pool.acquire() as conn:
-            rows = await conn.fetch(query)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"DB error: {e}")
-
-    return [
-        {
-            "id": r["id"],
-            "name": r["name"],
-            "startdate": r["startdate"],
-            "enddate": r["enddate"],
-        }
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        # asyncpg.Record soporta .get()
+        pid = r.get("user_id") or r.get("id")
+        out.append({
+            "id": pid,                               # el front lo usa como llave
+            "discordId": r.get("discord_id"),        # el front lo usa pfpById
+            "name": r.get("name"),
+            "mmr": r.get("mmr"),
+            "country": r.get("country"),
+            "rank": r.get("rank"),
+        })
+    return out
 
 # ======================= AUTH02 (Discord OAuth) =======================
 # Guardamos PFPs tanto por userId como por nombre normalizado
