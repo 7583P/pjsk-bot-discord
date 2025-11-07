@@ -21,38 +21,46 @@ const PORT         = parseInt(process.env.PORT, 10) || 3000;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const GUILD_ID      = process.env.GUILD_ID;
 
-// ==== EXPRESS base (un solo servidor) ====
+// ==== EXPRESS base ====
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
 app.use(cookieParser());
 
-// CORS cross-site para Vercel con cookies
-app.use(cors({
-  origin: [APP_ORIGIN],
-  credentials: true
-}));
-app.options('*', cors({
-  origin: [APP_ORIGIN],
-  credentials: true
-}));
+// --- CORS middlewares ---
+// Público (no cookies, gratuito)
+const corsPublic = cors({
+  origin: '*',
+  credentials: false,
+  methods: ['GET', 'HEAD', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+});
+
+// Protegido (cookies cross-site)
+const corsCreds = cors({
+  origin: APP_ORIGIN,   // <— tu frontend (no * aquí)
+  credentials: true,
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+});
 
 // Sirve estáticos si los usas (opcional)
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ====== Sesión simple (usa DB/Redis en prod) ======
-const sessionStore = new Map(); // sid -> { discordId, username }
-const pfpMap       = new Map(); // key(nameLower|userId|discordId) -> url
+const sessionStore = new Map();   // sid -> { discordId, username }
+const pfpById      = new Map();   // "<someUserId>" -> url
+const pfpByName    = new Map();   // "nameLower"    -> url
 
 function cryptoRandom(){ return crypto.randomBytes(24).toString('hex'); }
 
 function setSessionCookie(res, sid){
   res.cookie(COOKIE_NAME, sid, {
     httpOnly: true,
-    secure: true,
+    secure: true,        // obligatorio con SameSite=None
     sameSite: 'none',
     path: '/',
-    maxAge: 1000 * 60 * 60 * 24 * 7
+    maxAge: 1000 * 60 * 60 * 24 * 7, // 7 días
   });
 }
 function getSession(req){
@@ -63,9 +71,9 @@ function getSession(req){
 
 // ========= RUTAS auth02 =========
 
-// Simula callback OAuth (reemplaza por tu flujo de Discord real)
-app.get('/auth02/callback', (req, res) => {
-  // Aquí deberías intercambiar "code" por el token de Discord y leer user.
+// Simula callback OAuth (reemplaza por tu flujo real con Discord)
+app.get('/auth02/callback', corsCreds, (req, res) => {
+  // Aquí deberías intercambiar "code" por token y leer user de Discord.
   // Mock mínimo:
   const discordUser = { id: '1234567890', username: 'Diego#0001' };
 
@@ -76,56 +84,71 @@ app.get('/auth02/callback', (req, res) => {
   return res.redirect(302, `${APP_ORIGIN}/?verified=1`);
 });
 
-// Devuelve user si hay cookie de sesión
-app.get('/auth02/me', (req, res) => {
+// Devuelve user si hay cookie de sesión (protegido)
+app.get('/auth02/me', corsCreds, (req, res) => {
   const sess = getSession(req);
   if (!sess) return res.status(401).json({ ok:false });
   return res.json({ id: sess.discordId, username: sess.username });
 });
 
-// Devuelve mapa de PFPs (para el leaderboard)
-app.get('/auth02/pfps', (req, res) => {
-  const obj = {};
-  for (const [k,v] of pfpMap.entries()) obj[k] = v;
-  res.json(obj);
+// Devuelve mapa de PFPs (PÚBLICO, para tu front sin credenciales)
+// Estructura esperada por tu Vue: { byId: {...}, byName: {...} }
+app.get('/auth02/pfps', corsPublic, (req, res) => {
+  const byId = {};
+  for (const [k, v] of pfpById.entries()) byId[k] = v;
+
+  const byName = {};
+  for (const [k, v] of pfpByName.entries()) byName[k] = v;
+
+  res.json({ byId, byName });
 });
 
-// Guarda/borra PFP (requiere sesión)
-app.post('/auth02/set-pfp', (req, res) => {
+// Guarda/borra PFP (PROTEGIDO)
+app.post('/auth02/set-pfp', corsCreds, (req, res) => {
   const sess = getSession(req);
   if (!sess) return res.status(401).json({ ok:false, error:'unauthorized' });
 
   const { url, nameLower, userId } = req.body || {};
-  const key = (nameLower && String(nameLower).toLowerCase())
-          || (userId && String(userId))
-          || sess.discordId;
-
   if (typeof url !== 'string') {
     return res.status(400).json({ ok:false, error:'invalid url' });
   }
 
-  if (url === '' || url === null) {
-    pfpMap.delete(key);
+  // Normaliza llaves
+  const nameKey = (nameLower ? String(nameLower).toLowerCase() : null);
+  const idKey   = (userId ? String(userId) : String(sess.discordId));
+
+  if (url === '') {
+    // Borrar
+    if (idKey)   pfpById.delete(idKey);
+    if (nameKey) pfpByName.delete(nameKey);
   } else {
-    pfpMap.set(key.toLowerCase?.() ?? key, url);
+    // Guardar en ambos mapas si hay data
+    if (idKey)   pfpById.set(idKey, url);
+    if (nameKey) pfpByName.set(nameKey, url);
   }
+
   return res.json({ ok:true });
 });
 
-// Mock de cartas (reemplaza por tu fuente real)
-app.get('/auth02/cards', (req, res) => {
+// Mock de cartas (PÚBLICO). Reemplaza por tu fuente real (Sekaipedia, etc.)
+app.get('/auth02/cards', corsPublic, (req, res) => {
   const cards = [
-    { id: 1, name: 'Miku 01',    thumb:'https://via.placeholder.com/512?text=Miku01' },
-    { id: 2, name: 'Mafuyu 02',  thumb:'https://via.placeholder.com/512?text=Mafuyu02' },
-    { id: 3, name: 'Ichika 03',  thumb:'https://via.placeholder.com/512?text=Ichika03' },
+    { id: 1, name: 'Miku 01',   thumb:'https://via.placeholder.com/512?text=Miku01',   href:'https://example.com/miku01' },
+    { id: 2, name: 'Mafuyu 02', thumb:'https://via.placeholder.com/512?text=Mafuyu02', href:'https://example.com/mafuyu02' },
+    { id: 3, name: 'Ichika 03', thumb:'https://via.placeholder.com/512?text=Ichika03', href:'https://example.com/ichika03' },
   ];
   res.json(cards);
 });
 
+// Preflight (OPTIONS) explícito para ambas políticas
+app.options(['/auth02/me','/auth02/set-pfp','/auth02/callback'], corsCreds);
+app.options(['/auth02/cards','/auth02/pfps'], corsPublic);
+
 // ===== (Opcional) APIs que ya tenías (/api/players, /api/seasons, etc.) =====
-// Si esas viven en otro archivo, impórtalas y haz app.use(router).
-// app.get('/api/players', ...);
-// app.get('/api/seasons', ...);
+// Ejemplo de capa CORS protegida si las usas con cookies:
+app.options(['/api/players','/api/seasons'], corsCreds);
+// app.get('/api/players', corsCreds, ...);
+// app.get('/api/seasons', corsCreds, ...);
 
 // ========= DISCORD BOT =========
 const wanted = ['Placement','Bronze','Gold','Diamond'];
@@ -146,11 +169,11 @@ async function loadRankColors() {
 }
 
 // APIs para colores y asignación de rol (si las usas en tu página)
-app.get('/api/rank-colors', (req, res) => {
+app.get('/api/rank-colors', corsCreds, (req, res) => {
   res.json(rankColors);
 });
 
-app.post('/api/assign-rank', async (req, res) => {
+app.post('/api/assign-rank', corsCreds, async (req, res) => {
   const { userId, newRank } = req.body || {};
   if (!userId || !rankColors[newRank]) {
     return res.status(400).json({ error: 'userId o newRank inválido' });
@@ -172,13 +195,16 @@ app.post('/api/assign-rank', async (req, res) => {
   }
 });
 
-// Arranque: primero el bot, luego el server (o al revés; Express puede iniciar ya)
+// Arranque: primero el bot, luego el server
 client.once('ready', async () => {
   console.log(`🤖 Bot listo: ${client.user.tag}`);
   await loadRankColors();
   client.on('roleCreate', r => wanted.includes(r.name) && loadRankColors());
   client.on('roleUpdate', (_, r) => wanted.includes(r.name) && loadRankColors());
 });
+
+// Healthcheck (útil para Railway)
+app.get('/health', (req, res) => res.json({ ok: true }));
 
 // Inicia ambos
 app.listen(PORT, () => {
