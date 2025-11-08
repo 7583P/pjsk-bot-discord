@@ -5,7 +5,7 @@ import traceback
 import asyncio
 import random
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
@@ -49,7 +49,7 @@ def set_session_cookie(resp, sid: str):
         secure=True,
         samesite="none",
         path="/",
-        max_age=60 * 60 * 24 * 7
+        max_age=60 * 60 * 24 * 7  # 7 días
     )
 
 # =========================== DB & Schema Flags ===========================
@@ -79,14 +79,12 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
         LIMIT 1
     """, table, column)
-    if not row: return None
+    if not row:
+        return None
     dt = str(row["data_type"]).lower()
     if "bigint" in dt or "int8" in dt:
         return "bigint"
     return "text"
-
-def _cast_sql() -> str:
-    return "::bigint" if USER_ID_SQLTYPE == "bigint" else "::text"
 
 async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
@@ -122,7 +120,6 @@ async def startup():
         await _detect_schema(conn)
 
         # Crear tablas persistentes
-        # player_pfps usa el MISMO tipo que players.user_id / player_pfps.user_id detectado
         uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
         await conn.execute(f"""
         CREATE TABLE IF NOT EXISTS public.sekaicards(
@@ -252,9 +249,18 @@ def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], n
         if url: return url
     return None
 
-def _pg_param_user_id(val: Optional[str]) -> str:
-    """Siempre devolvemos string; el cast se hace en SQL según USER_ID_SQLTYPE."""
-    return str(val or "")
+def _uid_for_sql(user_id_like: Optional[str]):
+    """
+    Devuelve el parámetro listo para la query según el tipo de columna:
+    - BIGINT  -> int
+    - TEXT    -> str
+    """
+    s = str(user_id_like or "")
+    if USER_ID_SQLTYPE == "bigint":
+        if not re.fullmatch(r"\d+", s):
+            raise HTTPException(400, "userId debe ser numérico")
+        return int(s)
+    return s  # TEXT
 
 @app.get("/health")
 async def health():
@@ -271,7 +277,7 @@ async def health():
 @app.get("/auth02")
 async def auth02_start():
     state = secrets.token_urlsafe(24)
-    STATE_STORE[state] = datetime.utcnow() + STATE_TTL
+    STATE_STORE[state] = datetime.now(timezone.utc) + STATE_TTL
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -288,7 +294,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
         raise HTTPException(400, "Missing code")
 
     exp = STATE_STORE.pop(state or "", None)
-    if not exp or datetime.utcnow() > exp:
+    if not exp or datetime.now(timezone.utc) > exp:
         raise HTTPException(400, "Invalid or expired state")
 
     async with httpx.AsyncClient() as client:
@@ -376,8 +382,8 @@ async def set_pfp(request: Request):
         if db_pool and user_id:
             async with db_pool.acquire() as conn:
                 await conn.execute(
-                    f"DELETE FROM public.player_pfps WHERE user_id = $1{_cast_sql()}",
-                    _pg_param_user_id(user_id)
+                    "DELETE FROM public.player_pfps WHERE user_id = $1",
+                    _uid_for_sql(user_id)
                 )
         return {"ok": True, "deleted": True}
 
@@ -395,7 +401,7 @@ async def set_pfp(request: Request):
     if discord_id: PFP_BY_DISCORD[discord_id] = url
     if name_lower: PFP_BY_NAME[name_lower] = url
 
-    # Persistir en BD con cast dinámico
+    # Persistir en BD (sin casts; parámetro con tipo correcto)
     if db_pool:
         if not user_id and discord_id:
             resolved = await _resolve_user_id_from_discord(discord_id)
@@ -403,17 +409,13 @@ async def set_pfp(request: Request):
                 user_id = resolved
         if user_id:
             async with db_pool.acquire() as conn:
-                await conn.execute(
-                    f"""
+                await conn.execute("""
                     INSERT INTO public.player_pfps(user_id, url, updated_at)
-                    VALUES ($1{_cast_sql()}, $2, now())
+                    VALUES ($1, $2, now())
                     ON CONFLICT (user_id) DO UPDATE
                       SET url = EXCLUDED.url,
                           updated_at = now()
-                    """,
-                    _pg_param_user_id(user_id),
-                    url
-                )
+                """, _uid_for_sql(user_id), url)
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -530,7 +532,7 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
     }
     return {k: _ascii(v) for k, v in raw.items()}
 
-_cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
+_cards_cache: Dict[str, object] = {"items": [], "ts": datetime.fromtimestamp(0, tz=timezone.utc)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
 
@@ -582,7 +584,8 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
 async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
     row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
     if not row or not row["ts"]: return False
-    return (datetime.utcnow() - row["ts"]) < CARDS_TTL
+    # row["ts"] ya viene aware (timestamptz)
+    return (datetime.now(timezone.utc) - row["ts"]) < CARDS_TTL
 
 async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List[Dict], Optional[datetime]]:
     rows = await conn.fetch("""
@@ -645,7 +648,9 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
     file_titles: List[str] = []
     for _, pinfo in pages.items():
         for it in (pinfo.get("images") or []):
-            t = it.get("title", "");  file_titles.append(t) if t.startswith("File:") else None
+            t = it.get("title", "")
+            if t.startswith("File:"):
+                file_titles.append(t)
     if not file_titles: return []
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
@@ -674,10 +679,19 @@ async def _scrape_card_variants(href: str) -> Dict:
     trained_url = trained_links[0] if trained_links else None
     return {"name": page_title, "variants": ([] + ([{"label":"Trained","url":trained_url}] if trained_url else []))}
 
+# ---------- STUB: listado de cartas ----------
+async def _scrape_cards_from_sekaipedia() -> List[Dict]:
+    """
+    Stub mínimo para evitar NameError.
+    Si ya tienes tu propia implementación, reemplaza esta función.
+    Debe devolver: [{"id": "<page_id>", "name": "...", "href": "https://...", "thumb": "https://..."}]
+    """
+    return []  # deja que el endpoint haga fallback a BD si existe información
+
 # =================== API: /auth02/cards (con persistencia) ===================
 @app.get("/auth02/cards")
 async def auth02_cards():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if db_pool:
         async with db_pool.acquire() as conn:
             try:
@@ -690,7 +704,7 @@ async def auth02_cards():
         return _cards_cache["items"]
 
     async with _cards_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if db_pool:
             async with db_pool.acquire() as conn:
                 try:
@@ -703,7 +717,6 @@ async def auth02_cards():
             return _cards_cache["items"]
 
         try:
-            # Debes tener implementado _scrape_cards_from_sekaipedia()
             items = await _scrape_cards_from_sekaipedia()
             if not items:
                 if db_pool:
@@ -713,7 +726,7 @@ async def auth02_cards():
                 raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
 
             _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.utcnow()
+            _cards_cache["ts"] = datetime.now(timezone.utc)
 
             if db_pool:
                 async with db_pool.acquire() as conn:
@@ -744,7 +757,7 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 page_id = int(row["page_id"]); thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                if variants and ts and (datetime.utcnow() - ts) < CARDS_TTL:
+                if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
     data = {"name": page_title, "variants": []}
