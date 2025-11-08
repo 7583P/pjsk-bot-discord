@@ -11,7 +11,6 @@ from urllib.parse import urlparse, unquote
 
 import asyncpg
 import httpx
-from bs4 import BeautifulSoup  # type: ignore
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,38 +49,60 @@ def set_session_cookie(resp, sid: str):
         secure=True,
         samesite="none",
         path="/",
-        max_age=60 * 60 * 24 * 7  # 7 días
+        max_age=60 * 60 * 24 * 7
     )
 
 # =========================== DB & Schema Flags ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
 
-HAS_DISCORD_ID_COL: bool = False  # players.discord_id
+HAS_DISCORD_ID_COL: bool = False
 SEASONS_HAS_ACTIVE: bool    = False
 SEASONS_HAS_NAME: bool      = False
 SEASONS_HAS_STARTS_AT: bool = False
 SEASONS_HAS_ENDS_AT: bool   = False
 
+# Tipo SQL efectivo del user_id ("text" o "bigint")
+USER_ID_SQLTYPE: str = "text"   # default seguro
+
 async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
-    row = await conn.fetchrow(
-        """
+    row = await conn.fetchrow("""
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
-        """,
-        table, column
-    )
+    """, table, column)
     return bool(row)
 
+async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Optional[str]:
+    row = await conn.fetchrow("""
+        SELECT data_type
+        FROM information_schema.columns
+        WHERE table_schema='public' AND table_name=$1 AND column_name=$2
+        LIMIT 1
+    """, table, column)
+    if not row: return None
+    dt = str(row["data_type"]).lower()
+    if "bigint" in dt or "int8" in dt:
+        return "bigint"
+    return "text"
+
+def _cast_sql() -> str:
+    return "::bigint" if USER_ID_SQLTYPE == "bigint" else "::text"
+
 async def _detect_schema(conn: asyncpg.Connection) -> None:
-    global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT
+    global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
     try:
-        HAS_DISCORD_ID_COL   = await _has_col(conn, "players", "discord_id")
-        SEASONS_HAS_ACTIVE   = await _has_col(conn, "seasons", "active")
-        SEASONS_HAS_NAME     = await _has_col(conn, "seasons", "name")
-        SEASONS_HAS_STARTS_AT= await _has_col(conn, "seasons", "starts_at")
-        SEASONS_HAS_ENDS_AT  = await _has_col(conn, "seasons", "ends_at")
-        print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} | seasons.active={SEASONS_HAS_ACTIVE} name={SEASONS_HAS_NAME} starts_at={SEASONS_HAS_STARTS_AT} ends_at={SEASONS_HAS_ENDS_AT}")
+        HAS_DISCORD_ID_COL    = await _has_col(conn, "players", "discord_id")
+        SEASONS_HAS_ACTIVE    = await _has_col(conn, "seasons", "active")
+        SEASONS_HAS_NAME      = await _has_col(conn, "seasons", "name")
+        SEASONS_HAS_STARTS_AT = await _has_col(conn, "seasons", "starts_at")
+        SEASONS_HAS_ENDS_AT   = await _has_col(conn, "seasons", "ends_at")
+
+        # Detectar tipo de user_id: si player_pfps existe usa su tipo; si no, usa el de players
+        pfps_type = await _col_type(conn, "player_pfps", "user_id")
+        players_type = await _col_type(conn, "players", "user_id")
+        USER_ID_SQLTYPE = pfps_type or players_type or "text"
+
+        print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} | seasons.active={SEASONS_HAS_ACTIVE} name={SEASONS_HAS_NAME} starts_at={SEASONS_HAS_STARTS_AT} ends_at={SEASONS_HAS_ENDS_AT} | user_id_type={USER_ID_SQLTYPE}")
     except Exception:
         traceback.print_exc()
 
@@ -93,17 +114,17 @@ async def startup():
         return
 
     db_pool = await asyncpg.create_pool(
-        DATABASE_URL,
-        min_size=1,
-        max_size=10,
-        timeout=10.0,
-        command_timeout=30.0,
+        DATABASE_URL, min_size=1, max_size=10, timeout=10.0, command_timeout=30.0,
     )
     print("✅ DB pool initialized")
+
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
-        # Migraciones mínimas para persistir cartas y variantes
-        await conn.execute("""
+
+        # Crear tablas persistentes
+        # player_pfps usa el MISMO tipo que players.user_id / player_pfps.user_id detectado
+        uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
+        await conn.execute(f"""
         CREATE TABLE IF NOT EXISTS public.sekaicards(
           page_id    BIGINT PRIMARY KEY,
           name       TEXT NOT NULL,
@@ -113,11 +134,23 @@ async def startup():
         );
         CREATE TABLE IF NOT EXISTS public.sekaicard_variants(
           page_id    BIGINT NOT NULL REFERENCES public.sekaicards(page_id) ON DELETE CASCADE,
-          label      TEXT   NOT NULL,   -- 'Untrained' | 'Trained'
+          label      TEXT   NOT NULL,
           url        TEXT   NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
+        CREATE TABLE IF NOT EXISTS public.player_pfps(
+          user_id    {uid_type_sql} PRIMARY KEY,
+          url        TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        DO $$
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_https_pfp') THEN
+            ALTER TABLE public.player_pfps
+              ADD CONSTRAINT chk_https_pfp CHECK (left(url, 8) = 'https://');
+          END IF;
+        END$$;
         """)
 
 @app.on_event("shutdown")
@@ -132,20 +165,15 @@ async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     return bool(row)
 
 async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: int) -> int:
-    # >0: usa la específica (si existe)
     if requested_season_id > 0:
         if await _season_exists(conn, requested_season_id):
             return requested_season_id
         raise HTTPException(404, f"season {requested_season_id} not found")
 
-    # 0: usa la activa si existe, si no, la última
     if SEASONS_HAS_ACTIVE:
         row = await conn.fetchrow("""
-            SELECT id
-            FROM public.seasons
-            WHERE active = TRUE
-            ORDER BY id DESC
-            LIMIT 1
+            SELECT id FROM public.seasons
+            WHERE active = TRUE ORDER BY id DESC LIMIT 1
         """)
         if row and row["id"]:
             return int(row["id"])
@@ -184,12 +212,11 @@ async def list_seasons():
     return out
 
 # ======================= AUTH02 (Discord OAuth) =======================
-# PFPs en memoria (tres llaves)
-PFP_BY_NAME:    Dict[str, str] = {}  # nameLower -> url
-PFP_BY_ID:      Dict[str, str] = {}  # players.user_id -> url
-PFP_BY_DISCORD: Dict[str, str] = {}  # players.discord_id -> url
+PFP_BY_NAME:    Dict[str, str] = {}
+PFP_BY_ID:      Dict[str, str] = {}
+PFP_BY_DISCORD: Dict[str, str] = {}
 
-STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
+STATE_STORE: Dict[str, datetime] = {}
 STATE_TTL = timedelta(minutes=10)
 
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
@@ -197,8 +224,7 @@ async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
         return None
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT user_id FROM public.players WHERE discord_id = $1 LIMIT 1",
-            discord_id
+            "SELECT user_id FROM public.players WHERE discord_id = $1 LIMIT 1", discord_id
         )
         if row:
             return str(row["user_id"])
@@ -215,7 +241,6 @@ def _valid_https_url(u: str) -> bool:
         return False
 
 def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
-    # Prioridad: user_id -> discord_id -> nameLower
     if user_id:
         url = PFP_BY_ID.get(str(user_id))
         if url: return url
@@ -226,6 +251,10 @@ def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], n
         url = PFP_BY_NAME.get((name or "").lower())
         if url: return url
     return None
+
+def _pg_param_user_id(val: Optional[str]) -> str:
+    """Siempre devolvemos string; el cast se hace en SQL según USER_ID_SQLTYPE."""
+    return str(val or "")
 
 @app.get("/health")
 async def health():
@@ -243,7 +272,6 @@ async def health():
 async def auth02_start():
     state = secrets.token_urlsafe(24)
     STATE_STORE[state] = datetime.utcnow() + STATE_TTL
-
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -321,10 +349,7 @@ MAX_PFPS = 5000
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Guarda/actualiza el PFP:
-    - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
-    - Se guarda por userId, por discordId y opcionalmente por nameLower.
-    - url="" borra los registros asociados a esas llaves.
+    Guarda/actualiza el PFP global del usuario.
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
@@ -348,6 +373,12 @@ async def set_pfp(request: Request):
         if user_id:    PFP_BY_ID.pop(user_id, None)
         if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
         if name_lower: PFP_BY_NAME.pop(name_lower, None)
+        if db_pool and user_id:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    f"DELETE FROM public.player_pfps WHERE user_id = $1{_cast_sql()}",
+                    _pg_param_user_id(user_id)
+                )
         return {"ok": True, "deleted": True}
 
     if not _valid_https_url(url):
@@ -359,9 +390,30 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
+    # Guardar en memoria
     if user_id:    PFP_BY_ID[user_id] = url
     if discord_id: PFP_BY_DISCORD[discord_id] = url
     if name_lower: PFP_BY_NAME[name_lower] = url
+
+    # Persistir en BD con cast dinámico
+    if db_pool:
+        if not user_id and discord_id:
+            resolved = await _resolve_user_id_from_discord(discord_id)
+            if resolved:
+                user_id = resolved
+        if user_id:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    f"""
+                    INSERT INTO public.player_pfps(user_id, url, updated_at)
+                    VALUES ($1{_cast_sql()}, $2, now())
+                    ON CONFLICT (user_id) DO UPDATE
+                      SET url = EXCLUDED.url,
+                          updated_at = now()
+                    """,
+                    _pg_param_user_id(user_id),
+                    url
+                )
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -389,6 +441,8 @@ async def get_players(
                 "p.country  AS country",
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
+                "pp.url     AS pfp_url",
+                "pp.updated_at AS pfp_updated_at"
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -397,6 +451,7 @@ async def get_players(
                 SELECT {", ".join(select_cols)}
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
+                LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -415,11 +470,22 @@ async def get_players(
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
         name       = r.get("name")
 
-        pfp_url = _resolve_pfp_for_player(
-            str(user_id) if user_id is not None else None,
-            str(discord_id) if discord_id is not None else None,
-            name
-        )
+        pfp_url = r.get("pfp_url")
+        pfp_ts  = r.get("pfp_updated_at")
+        if pfp_url:
+            try:
+                epoch = int(pfp_ts.timestamp()) if pfp_ts else None
+            except Exception:
+                epoch = None
+            if epoch:
+                sep = "&" if "?" in pfp_url else "?"
+                pfp_url = f"{pfp_url}{sep}v={epoch}"
+        else:
+            pfp_url = _resolve_pfp_for_player(
+                str(user_id) if user_id is not None else None,
+                str(discord_id) if discord_id is not None else None,
+                name
+            )
 
         out.append({
             "id": user_id,
@@ -428,7 +494,7 @@ async def get_players(
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # <- el front puede usar p.pfp directamente
+            "pfp": pfp_url,
         })
     return out
 
@@ -436,7 +502,6 @@ async def get_players(
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
 
-# UAs rotativos (Chrome/Win/mac/Linux/Android)
 _UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
@@ -463,10 +528,8 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
         "DNT": "1",
         "Sec-Fetch-Mode": "navigate",
     }
-    # Garantiza headers ASCII para httpx / RFC
     return {k: _ascii(v) for k, v in raw.items()}
 
-# Cache (memoria)
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
@@ -475,22 +538,17 @@ async def _sleep_jitter(a=0.15, b=0.5):
     await asyncio.sleep(random.uniform(a, b))
 
 async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
-    # backoff con 403/429
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
-            # origin=* es recomendado por MediaWiki para CORS/CDN; ayuda con 403
-            params2 = dict(params)
-            params2.setdefault("origin", "*")
+            params2 = dict(params); params2.setdefault("origin", "*")
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
             if r.status_code in (403, 429):
-                await asyncio.sleep(1.2 + attempt * 0.6)
-                continue
+                await asyncio.sleep(1.2 + attempt * 0.6); continue
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == 4:
-                raise
+            if attempt == 4: raise
             await asyncio.sleep(0.8 + attempt * 0.5)
     return {}
 
@@ -510,8 +568,7 @@ async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
     return [{"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]} for r in rows]
 
 async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> None:
-    if not items:
-        return
+    if not items: return
     await conn.executemany("""
         INSERT INTO public.sekaicards(page_id, name, href, thumb, updated_at)
         VALUES ($1, $2, $3, $4, now())
@@ -524,8 +581,7 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
 
 async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
     row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
-    if not row or not row["ts"]:
-        return False
+    if not row or not row["ts"]: return False
     return (datetime.utcnow() - row["ts"]) < CARDS_TTL
 
 async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List[Dict], Optional[datetime]]:
@@ -533,7 +589,7 @@ async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List
         SELECT label, url, updated_at
         FROM public.sekaicard_variants
         WHERE page_id=$1
-        ORDER BY label
+        ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
     """, page_id)
     variants = [{"label": r["label"], "url": r["url"]} for r in rows]
     ts = max((r["updated_at"] for r in rows), default=None)
@@ -541,176 +597,87 @@ async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List
 
 async def _variants_db_save(conn: asyncpg.Connection, page_id: int, variants: List[Dict]) -> None:
     await conn.execute("DELETE FROM public.sekaicard_variants WHERE page_id=$1", page_id)
-    if not variants:
-        return
+    if not variants: return
     await conn.executemany("""
         INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
         VALUES ($1, $2, $3, now())
     """, [(page_id, v["label"], v["url"]) for v in variants])
 
-# =================== Scraping ===================
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    items: List[Dict] = []
-    async with httpx.AsyncClient() as client:
-        apcontinue = None
-        while True:
-            params = {
-                "action": "query",
-                "list": "categorymembers",
-                "cmtitle": "Category:Cards",
-                "cmlimit": "500",
-                "format": "json",
-            }
-            if apcontinue: params["cmcontinue"] = apcontinue
-            data = await _get_json(client, SEKAIPEDIA_API, params)
-            for m in data.get("query", {}).get("categorymembers", []):
-                title = m.get("title", "")
-                pageid = str(m.get("pageid", ""))
-                href = f"https://sekaipedia.org/wiki/{title.replace(' ', '_')}"
-                items.append({"id": pageid, "name": title, "href": href, "thumb": None})
-            apcontinue = data.get("continue", {}).get("cmcontinue")
-            if not apcontinue: break
-            await _sleep_jitter(0.25, 0.7)
+# =================== Scraping helpers ===================
+_BAD_KEYWORDS = [
+    "banner","sprite","chibi","icon","logo","title","sticker","stamp",
+    "background","bg","skill","cutin","home","mini","ui","costume",
+    "profile","story","stamp","april","joke"
+]
+def _filename_from_url(u: str) -> str:
+    try: return urlparse(u).path.rsplit("/", 1)[-1].lower()
+    except Exception: return u.lower()
 
-        # pageimages por lotes
-        for i in range(0, len(items), 50):
-            chunk = items[i:i+50]
-            pageids = "|".join(c["id"] for c in chunk)
-            params = {
-                "action": "query",
-                "pageids": pageids,
-                "prop": "pageimages",
-                "piprop": "thumbnail",
-                "pithumbsize": "256",
-                "format": "json",
-            }
-            data = await _get_json(client, SEKAIPEDIA_API, params)
-            for pid, pinfo in (data.get("query", {}).get("pages", {})).items():
-                thumb = (pinfo.get("thumbnail") or {}).get("source")
-                if thumb:
-                    for c in chunk:
-                        if c["id"] == pid:
-                            c["thumb"] = _abs_sekaipedia(thumb)
-            await _sleep_jitter(0.25, 0.7)
-    return items
-
-def _is_trained(filename: str) -> bool:
-    s = filename.lower()
-    return ("trained" in s) or ("after training" in s) or ("idolized" in s)
-
-def _is_untrained(filename: str) -> bool:
-    s = filename.lower()
-    return ("untrained" in s) or ("before training" in s) or ("base" in s)
+def _is_trained(fn: str) -> bool:
+    s = fn.lower(); return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+def _is_untrained(fn: str) -> bool:
+    s = fn.lower(); return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
+def _looks_card_image(fn: str) -> bool:
+    if any(bad in fn for bad in _BAD_KEYWORDS): return False
+    return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
 def _prefer_square(links: List[str]) -> List[str]:
     seen, out = set(), []
     for u in links:
         if u and u not in seen:
-            seen.add(u)
-            out.append(u)
+            seen.add(u); out.append(u)
     return out
 
 def _page_title_from_href(href: str) -> str:
-    # https://sekaipedia.org/wiki/1_Page_of_Daily_Life  ->  1 Page of Daily Life
     try:
-        path = urlparse(href).path  # /wiki/...
+        path = urlparse(href).path
         title = path.split("/wiki/", 1)[1]
-        title = unquote(title).replace("_", " ").strip()
-        return title
+        return unquote(title).replace("_", " ").strip()
     except Exception:
         return ""
 
 async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
-    """
-    Devuelve URLs de imagen de la página usando la MediaWiki API:
-      1) prop=images para títulos de archivo (File:...)
-      2) prop=imageinfo&iiprop=url&iiurlwidth=512 para obtener URLs (thumb o full)
-    """
-    if not page_title:
-        return []
-
-    # 1) Títulos de archivos asociados a la página
-    params1 = {
-        "action": "query",
-        "prop": "images",
-        "titles": page_title,
-        "imlimit": "500",
-        "format": "json",
-    }
-    data1 = await _get_json(client, SEKAIPEDIA_API, params1)
+    if not page_title: return []
+    data1 = await _get_json(client, SEKAIPEDIA_API, {
+        "action":"query","prop":"images","titles":page_title,"imlimit":"500","format":"json"
+    })
     pages = (data1.get("query", {}) or {}).get("pages", {}) or {}
-
     file_titles: List[str] = []
     for _, pinfo in pages.items():
         for it in (pinfo.get("images") or []):
-            t = it.get("title", "")
-            if t.startswith("File:"):
-                file_titles.append(t)
-
-    if not file_titles:
-        return []
-
-    # 2) Resolver URLs por lotes
+            t = it.get("title", "");  file_titles.append(t) if t.startswith("File:") else None
+    if not file_titles: return []
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i:i+50]
-        params2 = {
-            "action": "query",
-            "titles": "|".join(chunk),
-            "prop": "imageinfo",
-            "iiprop": "url|size|mime",
-            "iiurlwidth": "512",
-            "format": "json",
-        }
-        data2 = await _get_json(client, SEKAIPEDIA_API, params2)
+        data2 = await _get_json(client, SEKAIPEDIA_API, {
+            "action":"query","titles":"|".join(chunk),"prop":"imageinfo",
+            "iiprop":"url|size|mime","iiurlwidth":"512","format":"json"
+        })
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
             for ii in (finfo.get("imageinfo") or []):
                 url = ii.get("thumburl") or ii.get("url")
-                if url:
-                    urls.append(_abs_sekaipedia(url))
+                if url: urls.append(_abs_sekaipedia(url))
         await _sleep_jitter(0.2, 0.5)
-
-    # Únicos y en orden
     return _prefer_square(urls)
 
 async def _scrape_card_variants(href: str) -> Dict:
-    # Nueva versión usando MediaWiki API (robusta)
     page_title = _page_title_from_href(href)
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
-
-    trained_links: List[str] = []
-    untrained_links: List[str] = []
-    unknown_links: List[str] = []
-
-    for u in urls:
-        filename = u.rsplit("/", 1)[-1]
-        if _is_trained(filename):
-            trained_links.append(u)
-        elif _is_untrained(filename):
-            untrained_links.append(u)
-        else:
-            unknown_links.append(u)
-
-    if not untrained_links and unknown_links:
-        untrained_links.append(unknown_links[0])
-    if not trained_links and len(unknown_links) >= 2:
-        trained_links.append(unknown_links[1])
-
-    variants = []
-    if untrained_links:
-        variants.append({"label": "Untrained", "url": untrained_links[0]})
-    if trained_links:
-        variants.append({"label": "Trained", "url": trained_links[0]})
-
-    return {"name": page_title, "variants": variants}
+    clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
+    trained_links: List[str] = []; untrained_links: List[str] = []
+    for u in clean_urls:
+        fn = _filename_from_url(u)
+        if _is_trained(fn): trained_links.append(u)
+        elif _is_untrained(fn): untrained_links.append(u)
+    trained_url = trained_links[0] if trained_links else None
+    return {"name": page_title, "variants": ([] + ([{"label":"Trained","url":trained_url}] if trained_url else []))}
 
 # =================== API: /auth02/cards (con persistencia) ===================
 @app.get("/auth02/cards")
 async def auth02_cards():
     now = datetime.utcnow()
-
-    # 1) Si hay DB y está “fresh”, entrega desde BD
     if db_pool:
         async with db_pool.acquire() as conn:
             try:
@@ -719,14 +686,11 @@ async def auth02_cards():
             except Exception:
                 traceback.print_exc()
 
-    # 2) Si el cache en memoria está fresco, úsalo
     if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
         return _cards_cache["items"]
 
-    # 3) Raspa, guarda en BD y en memoria, y devuelve (con lock)
     async with _cards_lock:
         now = datetime.utcnow()
-        # re-check dentro del lock
         if db_pool:
             async with db_pool.acquire() as conn:
                 try:
@@ -739,14 +703,13 @@ async def auth02_cards():
             return _cards_cache["items"]
 
         try:
+            # Debes tener implementado _scrape_cards_from_sekaipedia()
             items = await _scrape_cards_from_sekaipedia()
             if not items:
-                # si scraping falla, pero hay algo en BD, sirve lo de BD
                 if db_pool:
                     async with db_pool.acquire() as conn:
                         existing = await _cards_db_all(conn)
-                        if existing:
-                            return existing
+                        if existing: return existing
                 raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
 
             _cards_cache["items"] = items
@@ -761,53 +724,53 @@ async def auth02_cards():
             raise
         except Exception as e:
             traceback.print_exc()
-            # fallback a BD si existe
             if db_pool:
                 async with db_pool.acquire() as conn:
                     existing = await _cards_db_all(conn)
-                    if existing:
-                        return existing
+                    if existing: return existing
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
-# =================== API: /auth02/card-variants (con persistencia) ===================
+# =================== API: /auth02/card-variants ===================
 @app.get("/auth02/card-variants")
 async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
-    """
-    Busca variantes en BD por page_id (usando href), si existen las devuelve.
-    Si no existen o están fuera de TTL, las re-scrapea, guarda y devuelve.
-    Si el href no está en sekaicards, igual se scrapea y se devuelve (sin guardar).
-    """
     page_title = _page_title_from_href(href)
 
-    # Intentar resolver page_id desde BD por href
     page_id: Optional[int] = None
+    thumb_url: Optional[str] = None
     if db_pool:
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT page_id FROM public.sekaicards WHERE href=$1", href)
+            row = await conn.fetchrow("SELECT page_id, thumb FROM public.sekaicards WHERE href=$1", href)
             if row:
-                page_id = int(row["page_id"])
+                page_id = int(row["page_id"]); thumb_url = row["thumb"]
+            if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
                 if variants and ts and (datetime.utcnow() - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
-    # Scrape
+    data = {"name": page_title, "variants": []}
     try:
-        data = await _scrape_card_variants(href)
+        scraped = await _scrape_card_variants(href)
+        data["variants"] = scraped.get("variants", [])
     except Exception:
         traceback.print_exc()
-        return {"name": "", "variants": []}
 
-    # Guardar si tenemos page_id
+    variants: List[Dict] = []
+    if thumb_url:
+        variants.append({"label": "Thumb", "url": thumb_url})
+    if data["variants"]:
+        for v in data["variants"]:
+            if v.get("label") == "Trained" and v.get("url") and v["url"] != thumb_url:
+                variants.append(v)
+
     try:
         if db_pool and page_id:
             async with db_pool.acquire() as conn:
-                await _variants_db_save(conn, page_id, data.get("variants", []))
+                await _variants_db_save(conn, page_id, variants)
     except Exception:
         traceback.print_exc()
 
-    return data
+    return {"name": page_title, "variants": variants}
 
-# =================== Static (Front opcional) ===================
+# =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#d
