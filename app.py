@@ -101,7 +101,7 @@ async def startup():
     print("✅ DB pool initialized")
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
-        # Migraciones mínimas para persistir cartas, variantes y PFPs
+        # Migraciones mínimas para persistir cartas y variantes (y PFPs)
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS public.sekaicards(
           page_id    BIGINT PRIMARY KEY,
@@ -117,7 +117,6 @@ async def startup():
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
-        -- PFP persistente por jugador (para que sobreviva a restarts/redeploys)
         CREATE TABLE IF NOT EXISTS public.player_pfps(
           user_id    BIGINT PRIMARY KEY REFERENCES public.players(user_id) ON DELETE CASCADE,
           url        TEXT NOT NULL,
@@ -241,6 +240,11 @@ def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], n
         if url: return url
     return None
 
+def _pg_param_user_id(val: Optional[str]):
+    """Devuelve int(val) si es dígito puro; si no, el string original. Evita errores de tipo al insertar/borrar."""
+    s = str(val or "")
+    return int(s) if re.fullmatch(r"\d+", s) else s
+
 @app.get("/health")
 async def health():
     db_ok = False
@@ -282,7 +286,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
             "https://discord.com/api/oauth2/token",
             data={
                 "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,
+                "client_secret": DISCORD_CLIENT_SECRET",
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": DISCORD_REDIRECT_URI,
@@ -338,7 +342,7 @@ async def set_pfp(request: Request):
     Guarda/actualiza el PFP:
     - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
     - Se guarda por userId, por discordId y opcionalmente por nameLower.
-    - url="" borra los registros asociados a esas llaves (incluida la BD).
+    - url="" borra los registros asociados a esas llaves.
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
@@ -362,11 +366,14 @@ async def set_pfp(request: Request):
         if user_id:    PFP_BY_ID.pop(user_id, None)
         if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
         if name_lower: PFP_BY_NAME.pop(name_lower, None)
-        # Borrar persistencia en BD si conocemos user_id
+        # Borrar en BD si conocemos user_id
         if db_pool and user_id:
             async with db_pool.acquire() as conn:
                 try:
-                    await conn.execute("DELETE FROM public.player_pfps WHERE user_id=$1", int(user_id))
+                    await conn.execute(
+                        "DELETE FROM public.player_pfps WHERE user_id = $1",
+                        _pg_param_user_id(user_id)
+                    )
                 except Exception:
                     traceback.print_exc()
         return {"ok": True, "deleted": True}
@@ -380,7 +387,7 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    # Guardar en memoria (compatibilidad con lógica actual)
+    # Guardar en memoria (compatibilidad)
     if user_id:    PFP_BY_ID[user_id] = url
     if discord_id: PFP_BY_DISCORD[discord_id] = url
     if name_lower: PFP_BY_NAME[name_lower] = url
@@ -400,7 +407,7 @@ async def set_pfp(request: Request):
                         ON CONFLICT (user_id) DO UPDATE
                           SET url = EXCLUDED.url,
                               updated_at = now()
-                    """, int(user_id), url)
+                    """, _pg_param_user_id(user_id), url)
                 except Exception:
                     traceback.print_exc()
 
@@ -430,7 +437,6 @@ async def get_players(
                 "p.country  AS country",
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
-                # URL persistida en BD (si existe)
                 "pp.url     AS pfp_url"
             ]
             if HAS_DISCORD_ID_COL:
@@ -440,7 +446,7 @@ async def get_players(
                 SELECT {", ".join(select_cols)}
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
-                LEFT JOIN public.player_pfps pp ON pp.user_id = p.user_id
+                LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -475,7 +481,7 @@ async def get_players(
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # ahora viene de BD si existe; si no, memoria
+            "pfp": pfp_url,
         })
     return out
 
@@ -526,7 +532,6 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
-            # origin=* es recomendado por MediaWiki para CORS/CDN; ayuda con 403
             params2 = dict(params)
             params2.setdefault("origin", "*")
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
@@ -616,7 +621,6 @@ def _is_untrained(fn: str) -> bool:
     return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
 
 def _looks_card_image(fn: str) -> bool:
-    # evitar archivos no relacionados
     if any(bad in fn for bad in _BAD_KEYWORDS):
         return False
     return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
@@ -631,7 +635,7 @@ def _prefer_square(links: List[str]) -> List[str]:
 
 def _page_title_from_href(href: str) -> str:
     try:
-        path = urlparse(href).path  # /wiki/...
+        path = urlparse(href).path
         title = path.split("/wiki/", 1)[1]
         title = unquote(title).replace("_", " ").strip()
         return title
@@ -639,15 +643,9 @@ def _page_title_from_href(href: str) -> str:
         return ""
 
 async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
-    """
-    Devuelve URLs de imagen de la página usando la MediaWiki API:
-      1) prop=images para títulos de archivo (File:...)
-      2) prop=imageinfo&iiprop=url&iiurlwidth=512 para obtener URLs (thumb o full)
-    """
     if not page_title:
         return []
 
-    # 1) Títulos de archivos asociados a la página
     params1 = {
         "action": "query",
         "prop": "images",
@@ -668,7 +666,6 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
     if not file_titles:
         return []
 
-    # 2) Resolver URLs por lotes
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i:i+50]
@@ -688,20 +685,13 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
                     urls.append(_abs_sekaipedia(url))
         await _sleep_jitter(0.2, 0.5)
 
-    # Únicos y en orden
     return _prefer_square(urls)
 
 async def _scrape_card_variants(href: str) -> Dict:
-    """
-    Devuelve como máximo dos variantes:
-      - Thumb   (siempre que exista en la BD)
-      - Trained (si se encuentra; se filtran archivos no relacionados)
-    """
     page_title = _page_title_from_href(href)
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
 
-    # Filtrar ruidos (banner, icon, etc.)
     clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
 
     trained_links: List[str] = []
@@ -714,7 +704,6 @@ async def _scrape_card_variants(href: str) -> Dict:
         elif _is_untrained(fn):
             untrained_links.append(u)
 
-    # Elegir mejor candidato entrenado (si existe)
     trained_url = trained_links[0] if trained_links else None
 
     return {"name": page_title, "variants": ([]
@@ -725,7 +714,6 @@ async def _scrape_card_variants(href: str) -> Dict:
 async def auth02_cards():
     now = datetime.utcnow()
 
-    # 1) Si hay DB y está “fresh”, entrega desde BD
     if db_pool:
         async with db_pool.acquire() as conn:
             try:
@@ -734,14 +722,11 @@ async def auth02_cards():
             except Exception:
                 traceback.print_exc()
 
-    # 2) Si el cache en memoria está fresco, úsalo
     if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
         return _cards_cache["items"]
 
-    # 3) Raspa, guarda en BD y en memoria, y devuelve (con lock)
     async with _cards_lock:
         now = datetime.utcnow()
-        # re-check dentro del lock
         if db_pool:
             async with db_pool.acquire() as conn:
                 try:
@@ -754,10 +739,9 @@ async def auth02_cards():
             return _cards_cache["items"]
 
         try:
-            # NOTA: aquí solo llenamos el listado y su thumb; el “Trained” se resuelve por /card-variants
-            items = await _scrape_cards_from_sekaipedia()  # <- asumes tu función existente
+            # Debe existir tu función _scrape_cards_from_sekaipedia()
+            items = await _scrape_cards_from_sekaipedia()
             if not items:
-                # si scraping falla, pero hay algo en BD, sirve lo de BD
                 if db_pool:
                     async with db_pool.acquire() as conn:
                         existing = await _cards_db_all(conn)
@@ -777,7 +761,6 @@ async def auth02_cards():
             raise
         except Exception as e:
             traceback.print_exc()
-            # fallback a BD si existe
             if db_pool:
                 async with db_pool.acquire() as conn:
                     existing = await _cards_db_all(conn)
@@ -792,12 +775,9 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
     Devuelve variantes priorizando SIEMPRE:
       1) Thumb   (del registro de sekaicards)
       2) Trained (si existe por scraping filtrado)
-
-    Si solo hay Thumb, el front podrá seleccionar en 1 clic (sin modal).
     """
     page_title = _page_title_from_href(href)
 
-    # Intentar resolver page_id + thumb desde BD por href
     page_id: Optional[int] = None
     thumb_url: Optional[str] = None
     if db_pool:
@@ -807,32 +787,26 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 page_id = int(row["page_id"])
                 thumb_url = row["thumb"]
 
-            # Si teníamos variantes frescas guardadas (Thumb/Trained), devuélvelas
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
                 if variants and ts and (datetime.utcnow() - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
-    # Scrape solo para encontrar Trained
     data = {"name": page_title, "variants": []}
     try:
         scraped = await _scrape_card_variants(href)
-        # scraped solo trae (posible) Trained
         data["variants"] = scraped.get("variants", [])
     except Exception:
         traceback.print_exc()
 
-    # Siempre anteponer Thumb si lo tenemos
     variants: List[Dict] = []
     if thumb_url:
         variants.append({"label": "Thumb", "url": thumb_url})
-    # Agregar Trained si se encontró y no duplica al Thumb
     if data["variants"]:
         for v in data["variants"]:
             if v.get("label") == "Trained" and v.get("url") and v["url"] != thumb_url:
                 variants.append(v)
 
-    # Guardar (Thumb + Trained) para esta página
     try:
         if db_pool and page_id:
             async with db_pool.acquire() as conn:
