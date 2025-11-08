@@ -169,61 +169,11 @@ async def list_seasons():
         out.append(item)
     return out
 
-# ======================= API: Players =======================
-@app.get("/api/players")
-async def get_players(
-    season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-):
-    if not db_pool:
-        raise HTTPException(500, "DB pool not initialized")
-
-    try:
-        async with db_pool.acquire() as conn:
-            picked = await _pick_effective_season(conn, season_id)
-
-            select_cols = [
-                "p.user_id  AS user_id",
-                "p.name     AS name",
-                "p.country  AS country",
-                "sp.mmr     AS mmr",
-                "sp.role    AS rank",
-            ]
-            if HAS_DISCORD_ID_COL:
-                select_cols.insert(1, "p.discord_id AS discord_id")
-
-            q = f"""
-                SELECT {", ".join(select_cols)}
-                FROM public.players p
-                INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
-                WHERE sp.season_id = $1
-                ORDER BY sp.mmr DESC
-                LIMIT $2 OFFSET $3
-            """
-            rows = await conn.fetch(q, picked, limit, offset)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"DB error: {e}")
-
-    out = []
-    for r in rows:
-        out.append({
-            "id": r.get("user_id"),
-            "discordId": r.get("discord_id"),
-            "name": r.get("name"),
-            "mmr": r.get("mmr"),
-            "country": r.get("country"),
-            "rank": r.get("rank"),
-        })
-    return out
-
 # ======================= AUTH02 (Discord OAuth) =======================
-PFP_BY_NAME: Dict[str, str] = {}  # nameLower -> url
-PFP_BY_ID:   Dict[str, str] = {}  # userId (players.user_id) -> url
+# PFPs en memoria (con tres llaves posibles)
+PFP_BY_NAME:    Dict[str, str] = {}  # nameLower -> url
+PFP_BY_ID:      Dict[str, str] = {}  # players.user_id -> url
+PFP_BY_DISCORD: Dict[str, str] = {}  # players.discord_id -> url
 
 STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
 STATE_TTL = timedelta(minutes=10)
@@ -255,6 +205,27 @@ def _valid_https_url(u: str) -> bool:
         return True
     except Exception:
         return False
+
+def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
+    """
+    Prioridad de resolución:
+    1) por user_id
+    2) por discord_id
+    3) por nombre en minúsculas
+    """
+    if user_id:
+        url = PFP_BY_ID.get(str(user_id))
+        if url:
+            return url
+    if discord_id:
+        url = PFP_BY_DISCORD.get(str(discord_id))
+        if url:
+            return url
+    if name:
+        url = PFP_BY_NAME.get((name or "").lower())
+        if url:
+            return url
+    return None
 
 @app.get("/health")
 async def health():
@@ -352,8 +323,8 @@ async def set_pfp(request: Request):
     """
     Guarda/actualiza el PFP:
     - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
-    - Guarda por userId (celda) y opcionalmente por nameLower.
-    - url="" borra el registro.
+    - Se guarda por userId, por discordId y opcionalmente por nameLower.
+    - url="" borra los registros asociados a esas llaves.
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
@@ -363,9 +334,9 @@ async def set_pfp(request: Request):
     # Desde sesión OAuth
     sid = request.cookies.get(COOKIE_NAME)
     session = SESSIONS.get(sid or "", {})
+    discord_id = str(session.get("id") or "")
 
     if not user_id:
-        discord_id = str(session.get("id") or "")
         resolved = await _resolve_user_id_from_discord(discord_id)
         if resolved:
             user_id = resolved
@@ -377,6 +348,8 @@ async def set_pfp(request: Request):
     if url == "":
         if user_id:
             PFP_BY_ID.pop(user_id, None)
+        if discord_id:
+            PFP_BY_DISCORD.pop(discord_id, None)
         if name_lower:
             PFP_BY_NAME.pop(name_lower, None)
         return {"ok": True, "deleted": True}
@@ -385,21 +358,88 @@ async def set_pfp(request: Request):
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
 
-    if not (user_id or name_lower):
-        raise HTTPException(400, "missing userId or nameLower (and no session mapping)")
+    if not (user_id or discord_id or name_lower):
+        raise HTTPException(400, "missing userId or discordId or nameLower")
 
-    if len(PFP_BY_ID) + len(PFP_BY_NAME) > MAX_PFPS:
+    if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
+    # Guardar en todas las llaves disponibles
     if user_id:
         PFP_BY_ID[user_id] = url
+    if discord_id:
+        PFP_BY_DISCORD[discord_id] = url
     if name_lower:
         PFP_BY_NAME[name_lower] = url
-    return {"ok": True, "byId": bool(user_id), "byName": bool(name_lower)}
+
+    return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
 @app.get("/auth02/pfps")
 async def list_pfps():
-    return JSONResponse({"byId": PFP_BY_ID, "byName": PFP_BY_NAME})
+    return JSONResponse({"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME})
+
+# ======================= API: Players =======================
+@app.get("/api/players")
+async def get_players(
+    season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+):
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    try:
+        async with db_pool.acquire() as conn:
+            picked = await _pick_effective_season(conn, season_id)
+
+            select_cols = [
+                "p.user_id  AS user_id",
+                "p.name     AS name",
+                "p.country  AS country",
+                "sp.mmr     AS mmr",
+                "sp.role    AS rank",
+            ]
+            if HAS_DISCORD_ID_COL:
+                select_cols.insert(1, "p.discord_id AS discord_id")
+
+            q = f"""
+                SELECT {", ".join(select_cols)}
+                FROM public.players p
+                INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
+                WHERE sp.season_id = $1
+                ORDER BY sp.mmr DESC
+                LIMIT $2 OFFSET $3
+            """
+            rows = await conn.fetch(q, picked, limit, offset)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"DB error: {e}")
+
+    out = []
+    for r in rows:
+        user_id = r.get("user_id")
+        discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
+        name = r.get("name")
+
+        pfp_url = _resolve_pfp_for_player(
+            str(user_id) if user_id is not None else None,
+            str(discord_id) if discord_id is not None else None,
+            name
+        )
+
+        out.append({
+            "id": user_id,
+            "discordId": discord_id,
+            "name": name,
+            "mmr": r.get("mmr"),
+            "country": r.get("country"),
+            "rank": r.get("rank"),
+            "pfp": pfp_url,  # <<—— ahora el leaderboard recibe la URL del PFP
+        })
+    return out
 
 # =================== /auth02/cards (Sekaipedia) ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
