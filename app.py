@@ -6,7 +6,7 @@ import asyncio
 import random
 import unicodedata
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse, unquote
 
 import asyncpg
@@ -102,6 +102,23 @@ async def startup():
     print("✅ DB pool initialized")
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
+        # Migraciones mínimas para persistir cartas y variantes
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS public.sekaicards(
+          page_id    BIGINT PRIMARY KEY,
+          name       TEXT NOT NULL,
+          href       TEXT NOT NULL,
+          thumb      TEXT,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS public.sekaicard_variants(
+          page_id    BIGINT NOT NULL REFERENCES public.sekaicards(page_id) ON DELETE CASCADE,
+          label      TEXT   NOT NULL,   -- 'Untrained' | 'Trained'
+          url        TEXT   NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+          PRIMARY KEY (page_id, label)
+        );
+        """)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -449,7 +466,7 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
     # Garantiza headers ASCII para httpx / RFC
     return {k: _ascii(v) for k, v in raw.items()}
 
-# Cache
+# Cache (memoria)
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
@@ -483,6 +500,55 @@ def _abs_sekaipedia(u: str) -> str:
     if u.startswith("/"):  return "https://sekaipedia.org" + u
     return u
 
+# =================== Persistencia: helpers BD (cartas / variantes) ===================
+async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
+    rows = await conn.fetch("""
+        SELECT page_id AS id, name, href, thumb
+        FROM public.sekaicards
+        ORDER BY page_id DESC
+    """)
+    return [{"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]} for r in rows]
+
+async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> None:
+    if not items:
+        return
+    await conn.executemany("""
+        INSERT INTO public.sekaicards(page_id, name, href, thumb, updated_at)
+        VALUES ($1, $2, $3, $4, now())
+        ON CONFLICT (page_id) DO UPDATE
+          SET name = EXCLUDED.name,
+              href = EXCLUDED.href,
+              thumb = EXCLUDED.thumb,
+              updated_at = now()
+    """, [(int(i["id"]), i["name"], i["href"], i.get("thumb")) for i in items])
+
+async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
+    row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
+    if not row or not row["ts"]:
+        return False
+    return (datetime.utcnow() - row["ts"]) < CARDS_TTL
+
+async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List[Dict], Optional[datetime]]:
+    rows = await conn.fetch("""
+        SELECT label, url, updated_at
+        FROM public.sekaicard_variants
+        WHERE page_id=$1
+        ORDER BY label
+    """, page_id)
+    variants = [{"label": r["label"], "url": r["url"]} for r in rows]
+    ts = max((r["updated_at"] for r in rows), default=None)
+    return variants, ts
+
+async def _variants_db_save(conn: asyncpg.Connection, page_id: int, variants: List[Dict]) -> None:
+    await conn.execute("DELETE FROM public.sekaicard_variants WHERE page_id=$1", page_id)
+    if not variants:
+        return
+    await conn.executemany("""
+        INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
+        VALUES ($1, $2, $3, now())
+    """, [(page_id, v["label"], v["url"]) for v in variants])
+
+# =================== Scraping ===================
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     items: List[Dict] = []
     async with httpx.AsyncClient() as client:
@@ -528,30 +594,6 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             await _sleep_jitter(0.25, 0.7)
     return items
 
-@app.get("/auth02/cards")
-async def auth02_cards():
-    now = datetime.utcnow()
-    if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-        return _cards_cache["items"]
-
-    async with _cards_lock:
-        now = datetime.utcnow()
-        if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-            return _cards_cache["items"]
-        try:
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
-            _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.utcnow()
-            return items
-        except HTTPException:
-            raise
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
-
-# =================== /auth02/card-variants ===================
 def _is_trained(filename: str) -> bool:
     s = filename.lower()
     return ("trained" in s) or ("after training" in s) or ("idolized" in s)
@@ -663,14 +705,107 @@ async def _scrape_card_variants(href: str) -> Dict:
 
     return {"name": page_title, "variants": variants}
 
+# =================== API: /auth02/cards (con persistencia) ===================
+@app.get("/auth02/cards")
+async def auth02_cards():
+    now = datetime.utcnow()
+
+    # 1) Si hay DB y está “fresh”, entrega desde BD
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            try:
+                if await _cards_db_is_fresh(conn):
+                    return await _cards_db_all(conn)
+            except Exception:
+                traceback.print_exc()
+
+    # 2) Si el cache en memoria está fresco, úsalo
+    if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
+        return _cards_cache["items"]
+
+    # 3) Raspa, guarda en BD y en memoria, y devuelve (con lock)
+    async with _cards_lock:
+        now = datetime.utcnow()
+        # re-check dentro del lock
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                try:
+                    if await _cards_db_is_fresh(conn):
+                        return await _cards_db_all(conn)
+                except Exception:
+                    traceback.print_exc()
+
+        if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
+            return _cards_cache["items"]
+
+        try:
+            items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                # si scraping falla, pero hay algo en BD, sirve lo de BD
+                if db_pool:
+                    async with db_pool.acquire() as conn:
+                        existing = await _cards_db_all(conn)
+                        if existing:
+                            return existing
+                raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
+
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = datetime.utcnow()
+
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    await _cards_db_upsert_many(conn, items)
+
+            return items
+        except HTTPException:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            # fallback a BD si existe
+            if db_pool:
+                async with db_pool.acquire() as conn:
+                    existing = await _cards_db_all(conn)
+                    if existing:
+                        return existing
+            raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
+
+# =================== API: /auth02/card-variants (con persistencia) ===================
 @app.get("/auth02/card-variants")
 async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
+    """
+    Busca variantes en BD por page_id (usando href), si existen las devuelve.
+    Si no existen o están fuera de TTL, las re-scrapea, guarda y devuelve.
+    Si el href no está en sekaicards, igual se scrapea y se devuelve (sin guardar).
+    """
+    page_title = _page_title_from_href(href)
+
+    # Intentar resolver page_id desde BD por href
+    page_id: Optional[int] = None
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT page_id FROM public.sekaicards WHERE href=$1", href)
+            if row:
+                page_id = int(row["page_id"])
+                variants, ts = await _variants_db_get(conn, page_id)
+                if variants and ts and (datetime.utcnow() - ts) < CARDS_TTL:
+                    return {"name": page_title, "variants": variants}
+
+    # Scrape
     try:
         data = await _scrape_card_variants(href)
-        return data
     except Exception:
         traceback.print_exc()
         return {"name": "", "variants": []}
+
+    # Guardar si tenemos page_id
+    try:
+        if db_pool and page_id:
+            async with db_pool.acquire() as conn:
+                await _variants_db_save(conn, page_id, data.get("variants", []))
+    except Exception:
+        traceback.print_exc()
+
+    return data
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
