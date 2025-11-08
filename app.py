@@ -11,7 +11,6 @@ from urllib.parse import urlparse, unquote
 
 import asyncpg
 import httpx
-from bs4 import BeautifulSoup  # type: ignore
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -113,7 +112,7 @@ async def startup():
         );
         CREATE TABLE IF NOT EXISTS public.sekaicard_variants(
           page_id    BIGINT NOT NULL REFERENCES public.sekaicards(page_id) ON DELETE CASCADE,
-          label      TEXT   NOT NULL,   -- 'Untrained' | 'Trained'
+          label      TEXT   NOT NULL,   -- 'Thumb' | 'Trained'
           url        TEXT   NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
@@ -533,7 +532,7 @@ async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List
         SELECT label, url, updated_at
         FROM public.sekaicard_variants
         WHERE page_id=$1
-        ORDER BY label
+        ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
     """, page_id)
     variants = [{"label": r["label"], "url": r["url"]} for r in rows]
     ts = max((r["updated_at"] for r in rows), default=None)
@@ -548,59 +547,31 @@ async def _variants_db_save(conn: asyncpg.Connection, page_id: int, variants: Li
         VALUES ($1, $2, $3, now())
     """, [(page_id, v["label"], v["url"]) for v in variants])
 
-# =================== Scraping ===================
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    items: List[Dict] = []
-    async with httpx.AsyncClient() as client:
-        apcontinue = None
-        while True:
-            params = {
-                "action": "query",
-                "list": "categorymembers",
-                "cmtitle": "Category:Cards",
-                "cmlimit": "500",
-                "format": "json",
-            }
-            if apcontinue: params["cmcontinue"] = apcontinue
-            data = await _get_json(client, SEKAIPEDIA_API, params)
-            for m in data.get("query", {}).get("categorymembers", []):
-                title = m.get("title", "")
-                pageid = str(m.get("pageid", ""))
-                href = f"https://sekaipedia.org/wiki/{title.replace(' ', '_')}"
-                items.append({"id": pageid, "name": title, "href": href, "thumb": None})
-            apcontinue = data.get("continue", {}).get("cmcontinue")
-            if not apcontinue: break
-            await _sleep_jitter(0.25, 0.7)
+# =================== Scraping helpers (filtrado robusto) ===================
+_BAD_KEYWORDS = [
+    "banner", "sprite", "chibi", "icon", "logo", "title", "sticker", "stamp",
+    "background", "bg", "skill", "cutin", "home", "mini", "ui", "costume",
+    "profile", "story", "stamp", "april", "joke"
+]
+def _filename_from_url(u: str) -> str:
+    try:
+        return urlparse(u).path.rsplit("/", 1)[-1].lower()
+    except Exception:
+        return u.lower()
 
-        # pageimages por lotes
-        for i in range(0, len(items), 50):
-            chunk = items[i:i+50]
-            pageids = "|".join(c["id"] for c in chunk)
-            params = {
-                "action": "query",
-                "pageids": pageids,
-                "prop": "pageimages",
-                "piprop": "thumbnail",
-                "pithumbsize": "256",
-                "format": "json",
-            }
-            data = await _get_json(client, SEKAIPEDIA_API, params)
-            for pid, pinfo in (data.get("query", {}).get("pages", {})).items():
-                thumb = (pinfo.get("thumbnail") or {}).get("source")
-                if thumb:
-                    for c in chunk:
-                        if c["id"] == pid:
-                            c["thumb"] = _abs_sekaipedia(thumb)
-            await _sleep_jitter(0.25, 0.7)
-    return items
-
-def _is_trained(filename: str) -> bool:
-    s = filename.lower()
+def _is_trained(fn: str) -> bool:
+    s = fn.lower()
     return ("trained" in s) or ("after training" in s) or ("idolized" in s)
 
-def _is_untrained(filename: str) -> bool:
-    s = filename.lower()
-    return ("untrained" in s) or ("before training" in s) or ("base" in s)
+def _is_untrained(fn: str) -> bool:
+    s = fn.lower()
+    return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
+
+def _looks_card_image(fn: str) -> bool:
+    # evitar archivos no relacionados
+    if any(bad in fn for bad in _BAD_KEYWORDS):
+        return False
+    return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
 def _prefer_square(links: List[str]) -> List[str]:
     seen, out = set(), []
@@ -611,7 +582,6 @@ def _prefer_square(links: List[str]) -> List[str]:
     return out
 
 def _page_title_from_href(href: str) -> str:
-    # https://sekaipedia.org/wiki/1_Page_of_Daily_Life  ->  1 Page of Daily Life
     try:
         path = urlparse(href).path  # /wiki/...
         title = path.split("/wiki/", 1)[1]
@@ -674,36 +644,33 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
     return _prefer_square(urls)
 
 async def _scrape_card_variants(href: str) -> Dict:
-    # Nueva versión usando MediaWiki API (robusta)
+    """
+    Devuelve como máximo dos variantes:
+      - Thumb   (siempre que exista en la BD)
+      - Trained (si se encuentra; se filtran archivos no relacionados)
+    """
     page_title = _page_title_from_href(href)
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
 
+    # Filtrar ruidos (banner, icon, etc.)
+    clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
+
     trained_links: List[str] = []
     untrained_links: List[str] = []
-    unknown_links: List[str] = []
 
-    for u in urls:
-        filename = u.rsplit("/", 1)[-1]
-        if _is_trained(filename):
+    for u in clean_urls:
+        fn = _filename_from_url(u)
+        if _is_trained(fn):
             trained_links.append(u)
-        elif _is_untrained(filename):
+        elif _is_untrained(fn):
             untrained_links.append(u)
-        else:
-            unknown_links.append(u)
 
-    if not untrained_links and unknown_links:
-        untrained_links.append(unknown_links[0])
-    if not trained_links and len(unknown_links) >= 2:
-        trained_links.append(unknown_links[1])
+    # Elegir mejor candidato entrenado (si existe)
+    trained_url = trained_links[0] if trained_links else None
 
-    variants = []
-    if untrained_links:
-        variants.append({"label": "Untrained", "url": untrained_links[0]})
-    if trained_links:
-        variants.append({"label": "Trained", "url": trained_links[0]})
-
-    return {"name": page_title, "variants": variants}
+    return {"name": page_title, "variants": ([]
+            + ([{"label": "Trained", "url": trained_url}] if trained_url else []))}
 
 # =================== API: /auth02/cards (con persistencia) ===================
 @app.get("/auth02/cards")
@@ -739,6 +706,7 @@ async def auth02_cards():
             return _cards_cache["items"]
 
         try:
+            # NOTA: aquí solo llenamos el listado y su thumb; el “Trained” se resuelve por /card-variants
             items = await _scrape_cards_from_sekaipedia()
             if not items:
                 # si scraping falla, pero hay algo en BD, sirve lo de BD
@@ -769,45 +737,63 @@ async def auth02_cards():
                         return existing
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
-# =================== API: /auth02/card-variants (con persistencia) ===================
+# =================== API: /auth02/card-variants (Thumb + Trained) ===================
 @app.get("/auth02/card-variants")
 async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
     """
-    Busca variantes en BD por page_id (usando href), si existen las devuelve.
-    Si no existen o están fuera de TTL, las re-scrapea, guarda y devuelve.
-    Si el href no está en sekaicards, igual se scrapea y se devuelve (sin guardar).
+    Devuelve variantes priorizando SIEMPRE:
+      1) Thumb   (del registro de sekaicards)
+      2) Trained (si existe por scraping filtrado)
+
+    Si solo hay Thumb, el front podrá seleccionar en 1 clic (sin modal).
     """
     page_title = _page_title_from_href(href)
 
-    # Intentar resolver page_id desde BD por href
+    # Intentar resolver page_id + thumb desde BD por href
     page_id: Optional[int] = None
+    thumb_url: Optional[str] = None
     if db_pool:
         async with db_pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT page_id FROM public.sekaicards WHERE href=$1", href)
+            row = await conn.fetchrow("SELECT page_id, thumb FROM public.sekaicards WHERE href=$1", href)
             if row:
                 page_id = int(row["page_id"])
+                thumb_url = row["thumb"]
+
+            # Si teníamos variantes frescas guardadas (Thumb/Trained), devuélvelas
+            if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
                 if variants and ts and (datetime.utcnow() - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
-    # Scrape
+    # Scrape solo para encontrar Trained
+    data = {"name": page_title, "variants": []}
     try:
-        data = await _scrape_card_variants(href)
+        scraped = await _scrape_card_variants(href)
+        # scraped solo trae (posible) Trained
+        data["variants"] = scraped.get("variants", [])
     except Exception:
         traceback.print_exc()
-        return {"name": "", "variants": []}
 
-    # Guardar si tenemos page_id
+    # Siempre anteponer Thumb si lo tenemos
+    variants: List[Dict] = []
+    if thumb_url:
+        variants.append({"label": "Thumb", "url": thumb_url})
+    # Agregar Trained si se encontró y no duplica al Thumb
+    if data["variants"]:
+        for v in data["variants"]:
+            if v.get("label") == "Trained" and v.get("url") and v["url"] != thumb_url:
+                variants.append(v)
+
+    # Guardar (Thumb + Trained) para esta página
     try:
         if db_pool and page_id:
             async with db_pool.acquire() as conn:
-                await _variants_db_save(conn, page_id, data.get("variants", []))
+                await _variants_db_save(conn, page_id, variants)
     except Exception:
         traceback.print_exc()
 
-    return data
+    return {"name": page_title, "variants": variants}
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#d
