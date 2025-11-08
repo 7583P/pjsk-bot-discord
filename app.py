@@ -286,7 +286,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
             "https://discord.com/api/oauth2/token",
             data={
                 "client_id": DISCORD_CLIENT_ID,
-                "client_secret": DISCORD_CLIENT_SECRET,  # ← sin comilla extra
+                "client_secret": DISCORD_CLIENT_SECRET,  # <- fix typo
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": DISCORD_REDIRECT_URI,
@@ -342,7 +342,7 @@ async def set_pfp(request: Request):
     Guarda/actualiza el PFP:
     - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
     - Se guarda por userId, por discordId y opcionalmente por nameLower.
-    - url="" borra los registros asociados a esas llaves.
+    - url="" borra los registros (memoria + BD).
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
@@ -366,16 +366,12 @@ async def set_pfp(request: Request):
         if user_id:    PFP_BY_ID.pop(user_id, None)
         if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
         if name_lower: PFP_BY_NAME.pop(name_lower, None)
-        # Borrar en BD si conocemos user_id
         if db_pool and user_id:
             async with db_pool.acquire() as conn:
-                try:
-                    await conn.execute(
-                        "DELETE FROM public.player_pfps WHERE user_id = $1",
-                        _pg_param_user_id(user_id)
-                    )
-                except Exception:
-                    traceback.print_exc()
+                await conn.execute(
+                    "DELETE FROM public.player_pfps WHERE user_id = $1",
+                    _pg_param_user_id(user_id)
+                )
         return {"ok": True, "deleted": True}
 
     if not _valid_https_url(url):
@@ -387,12 +383,12 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    # Guardar en memoria (compatibilidad)
+    # Guardar en memoria
     if user_id:    PFP_BY_ID[user_id] = url
     if discord_id: PFP_BY_DISCORD[discord_id] = url
     if name_lower: PFP_BY_NAME[name_lower] = url
 
-    # Persistir en BD si conocemos user_id (resolver si falta)
+    # Persistir en BD (errores no silenciados)
     if db_pool:
         if not user_id and discord_id:
             resolved = await _resolve_user_id_from_discord(discord_id)
@@ -400,16 +396,13 @@ async def set_pfp(request: Request):
                 user_id = resolved
         if user_id:
             async with db_pool.acquire() as conn:
-                try:
-                    await conn.execute("""
-                        INSERT INTO public.player_pfps(user_id, url, updated_at)
-                        VALUES ($1, $2, now())
-                        ON CONFLICT (user_id) DO UPDATE
-                          SET url = EXCLUDED.url,
-                              updated_at = now()
-                    """, _pg_param_user_id(user_id), url)
-                except Exception:
-                    traceback.print_exc()
+                await conn.execute("""
+                    INSERT INTO public.player_pfps(user_id, url, updated_at)
+                    VALUES ($1, $2, now())
+                    ON CONFLICT (user_id) DO UPDATE
+                      SET url = EXCLUDED.url,
+                          updated_at = now()
+                """, _pg_param_user_id(user_id), url)
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -437,7 +430,8 @@ async def get_players(
                 "p.country  AS country",
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
-                "pp.url     AS pfp_url"
+                "pp.url     AS pfp_url",
+                "pp.updated_at AS pfp_updated_at"  # para cache-buster
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -465,9 +459,18 @@ async def get_players(
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
         name       = r.get("name")
 
-        # Prioridad: BD > memoria
+        # Prioridad: BD > memoria, y cache-buster si viene de BD
         pfp_url = r.get("pfp_url")
-        if not pfp_url:
+        pfp_ts  = r.get("pfp_updated_at")
+        if pfp_url:
+            try:
+                epoch = int(pfp_ts.timestamp()) if pfp_ts else None
+            except Exception:
+                epoch = None
+            if epoch:
+                sep = "&" if "?" in pfp_url else "?"
+                pfp_url = f"{pfp_url}{sep}v={epoch}"
+        else:
             pfp_url = _resolve_pfp_for_player(
                 str(user_id) if user_id is not None else None,
                 str(discord_id) if discord_id is not None else None,
@@ -532,6 +535,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
+            # origin=* recomendado por MediaWiki para CORS/CDN
             params2 = dict(params)
             params2.setdefault("origin", "*")
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
@@ -635,7 +639,7 @@ def _prefer_square(links: List[str]) -> List[str]:
 
 def _page_title_from_href(href: str) -> str:
     try:
-        path = urlparse(href).path
+        path = urlparse(href).path  # /wiki/...
         title = path.split("/wiki/", 1)[1]
         title = unquote(title).replace("_", " ").strip()
         return title
