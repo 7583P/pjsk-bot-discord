@@ -3,6 +3,7 @@ import re
 import secrets
 import traceback
 import asyncio
+import random
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 from urllib.parse import urlparse
@@ -29,8 +30,6 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ===================== FastAPI =====================
 app = FastAPI()
-
-# ============== CORS (con credenciales) ==============
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONT_URL],
@@ -56,10 +55,7 @@ def set_session_cookie(resp, sid: str):
 # =========================== DB & Schema Flags ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
 
-# players.*
-HAS_DISCORD_ID_COL: bool = False
-
-# seasons.*
+HAS_DISCORD_ID_COL: bool = False  # players.discord_id
 SEASONS_HAS_ACTIVE: bool    = False
 SEASONS_HAS_NAME: bool      = False
 SEASONS_HAS_STARTS_AT: bool = False
@@ -170,7 +166,7 @@ async def list_seasons():
     return out
 
 # ======================= AUTH02 (Discord OAuth) =======================
-# PFPs en memoria (con tres llaves posibles)
+# PFPs en memoria (tres llaves)
 PFP_BY_NAME:    Dict[str, str] = {}  # nameLower -> url
 PFP_BY_ID:      Dict[str, str] = {}  # players.user_id -> url
 PFP_BY_DISCORD: Dict[str, str] = {}  # players.discord_id -> url
@@ -179,9 +175,6 @@ STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
 STATE_TTL = timedelta(minutes=10)
 
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
-    """
-    Si existe players.discord_id, mapear discord_id -> players.user_id
-    """
     if not (db_pool and HAS_DISCORD_ID_COL and discord_id):
         return None
     async with db_pool.acquire() as conn:
@@ -196,35 +189,24 @@ async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
 def _valid_https_url(u: str) -> bool:
     try:
         p = urlparse(u)
-        if p.scheme != "https":
-            return False
-        if not p.netloc:
-            return False
-        if any(c.isspace() for c in u) or '"' in u or "'" in u:
-            return False
+        if p.scheme != "https": return False
+        if not p.netloc: return False
+        if any(c.isspace() for c in u) or '"' in u or "'" in u: return False
         return True
     except Exception:
         return False
 
 def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
-    """
-    Prioridad de resolución:
-    1) por user_id
-    2) por discord_id
-    3) por nombre en minúsculas
-    """
+    # Prioridad: user_id -> discord_id -> nameLower
     if user_id:
         url = PFP_BY_ID.get(str(user_id))
-        if url:
-            return url
+        if url: return url
     if discord_id:
         url = PFP_BY_DISCORD.get(str(discord_id))
-        if url:
-            return url
+        if url: return url
     if name:
         url = PFP_BY_NAME.get((name or "").lower())
-        if url:
-            return url
+        if url: return url
     return None
 
 @app.get("/health")
@@ -331,7 +313,6 @@ async def set_pfp(request: Request):
     name_lower = (body.get("nameLower") or "").strip().lower()
     user_id = (body.get("userId") or "").strip()
 
-    # Desde sesión OAuth
     sid = request.cookies.get(COOKIE_NAME)
     session = SESSIONS.get(sid or "", {})
     discord_id = str(session.get("id") or "")
@@ -346,15 +327,11 @@ async def set_pfp(request: Request):
 
     # Borrado
     if url == "":
-        if user_id:
-            PFP_BY_ID.pop(user_id, None)
-        if discord_id:
-            PFP_BY_DISCORD.pop(discord_id, None)
-        if name_lower:
-            PFP_BY_NAME.pop(name_lower, None)
+        if user_id:    PFP_BY_ID.pop(user_id, None)
+        if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
+        if name_lower: PFP_BY_NAME.pop(name_lower, None)
         return {"ok": True, "deleted": True}
 
-    # Validación URL
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
 
@@ -364,13 +341,9 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    # Guardar en todas las llaves disponibles
-    if user_id:
-        PFP_BY_ID[user_id] = url
-    if discord_id:
-        PFP_BY_DISCORD[discord_id] = url
-    if name_lower:
-        PFP_BY_NAME[name_lower] = url
+    if user_id:    PFP_BY_ID[user_id] = url
+    if discord_id: PFP_BY_DISCORD[discord_id] = url
+    if name_lower: PFP_BY_NAME[name_lower] = url
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -420,9 +393,9 @@ async def get_players(
 
     out = []
     for r in rows:
-        user_id = r.get("user_id")
+        user_id    = r.get("user_id")
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
-        name = r.get("name")
+        name       = r.get("name")
 
         pfp_url = _resolve_pfp_for_player(
             str(user_id) if user_id is not None else None,
@@ -437,39 +410,72 @@ async def get_players(
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # <<—— ahora el leaderboard recibe la URL del PFP
+            "pfp": pfp_url,  # <- el front puede usar p.pfp directamente
         })
     return out
 
-# =================== /auth02/cards (Sekaipedia) ===================
+# =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
 
+# UAs rotativos (Chrome/Win/mac/Linux/Android)
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+]
+
+def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
+    return {
+        "User-Agent": random.choice(_UA_POOL),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Referer": referer or "https://sekaipedia.org/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Sec-Fetch-Mode": "navigate",
+    }
+
+# Cache
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
 
-_HTTP_HEADERS = {
-    "User-Agent": "pjsk-lounge/1.1 (+worker; contact: admin@pjsk-lounge)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://sekaipedia.org/",
-}
+async def _sleep_jitter(a=0.15, b=0.5):
+    await asyncio.sleep(random.uniform(a, b))
 
-def _abs_url(u: str) -> str:
+async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
+    # backoff con 403/429
+    for attempt in range(5):
+        try:
+            headers = _mk_headers(SEKAIPEDIA_LIST)
+            # origin=* es recomendado por MediaWiki para CORS; ayuda con 403 en algunos edge/CDN
+            params2 = dict(params)
+            params2.setdefault("origin", "*")
+            r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
+            if r.status_code in (403, 429):
+                await asyncio.sleep(1.2 + attempt * 0.6)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt == 4:
+                raise
+            await asyncio.sleep(0.8 + attempt * 0.5)
+    return {}
+
+def _abs_sekaipedia(u: str) -> str:
     if not u: return ""
     if u.startswith("//"): return "https:" + u
     if u.startswith("/"):  return "https://sekaipedia.org" + u
     return u
 
-def _guess_id(name: str, href: str) -> str:
-    m = re.search(r"#(\d+)", name or "")
-    if m: return m.group(1)
-    return (href or "").rstrip("/").split("/")[-1] or (name or "")
-
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     items: List[Dict] = []
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+    async with httpx.AsyncClient() as client:
         apcontinue = None
         while True:
             params = {
@@ -480,9 +486,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                 "format": "json",
             }
             if apcontinue: params["cmcontinue"] = apcontinue
-            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
-            r.raise_for_status()
-            data = r.json()
+            data = await _get_json(client, SEKAIPEDIA_API, params)
             for m in data.get("query", {}).get("categorymembers", []):
                 title = m.get("title", "")
                 pageid = str(m.get("pageid", ""))
@@ -490,8 +494,9 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                 items.append({"id": pageid, "name": title, "href": href, "thumb": None})
             apcontinue = data.get("continue", {}).get("cmcontinue")
             if not apcontinue: break
+            await _sleep_jitter(0.25, 0.7)
 
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        # pageimages por lotes
         for i in range(0, len(items), 50):
             chunk = items[i:i+50]
             pageids = "|".join(c["id"] for c in chunk)
@@ -503,14 +508,14 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                 "pithumbsize": "256",
                 "format": "json",
             }
-            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
-            r.raise_for_status()
-            for pid, pinfo in (r.json().get("query", {}).get("pages", {})).items():
+            data = await _get_json(client, SEKAIPEDIA_API, params)
+            for pid, pinfo in (data.get("query", {}).get("pages", {})).items():
                 thumb = (pinfo.get("thumbnail") or {}).get("source")
                 if thumb:
                     for c in chunk:
                         if c["id"] == pid:
-                            c["thumb"] = thumb
+                            c["thumb"] = _abs_sekaipedia(thumb)
+            await _sleep_jitter(0.25, 0.7)
     return items
 
 @app.get("/auth02/cards")
@@ -537,12 +542,6 @@ async def auth02_cards():
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
 # =================== /auth02/card-variants ===================
-def _abs_sekaipedia(u: str) -> str:
-    if not u: return ""
-    if u.startswith("//"): return "https:" + u
-    if u.startswith("/"):  return "https://sekaipedia.org" + u
-    return u
-
 def _is_trained(filename: str) -> bool:
     s = filename.lower()
     return ("trained" in s) or ("after training" in s) or ("idolized" in s)
@@ -560,8 +559,12 @@ def _prefer_square(links: List[str]) -> List[str]:
     return out
 
 async def _scrape_card_variants(href: str) -> Dict:
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        r = await client.get(href, headers=_HTTP_HEADERS)
+    async with httpx.AsyncClient() as client:
+        # usar headers rotativos y referer = la propia página
+        r = await client.get(href, headers=_mk_headers(href), follow_redirects=True, timeout=30)
+        if r.status_code in (403, 429):
+            await asyncio.sleep(1.0)
+            r = await client.get(href, headers=_mk_headers(href), follow_redirects=True, timeout=30)
         r.raise_for_status()
         html = r.text
 
