@@ -447,8 +447,11 @@ _cards_cache = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 _cards_lock = asyncio.Lock()
 
 async def _fetch_cards_from_sekai_best():
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get("https://sekai.best/api/cards")
+    async with httpx.AsyncClient(
+        timeout=20,
+        headers={"User-Agent": "pjsk-lounge/1.1 (+contact: admin@pjsk-lounge)"}
+    ) as client:
+        r = await client.get("https://api.sekai.best/api/cards")  # ✅ aquí
         r.raise_for_status()
         data = r.json()
 
@@ -456,11 +459,13 @@ async def _fetch_cards_from_sekai_best():
         for card in data:
             cards.append({
                 "id": card["id"],
-                "name": card["name"],
-                "thumb": card["icon"],  # 256x256 aprox
+                "name": card["name"],         # nombre
+                "thumb": card["icon"],        # imagen 256x256 lista
             })
+
         cards.sort(key=lambda c: c["id"], reverse=True)
         return cards
+
 
 @app.get("/auth02/cards")
 async def auth02_cards():
