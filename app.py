@@ -4,9 +4,10 @@ import secrets
 import traceback
 import asyncio
 import random
+import unicodedata
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import asyncpg
 import httpx
@@ -427,8 +428,15 @@ _UA_POOL = [
     "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
 ]
 
+def _ascii(s: str) -> str:
+    return (
+        unicodedata.normalize("NFKD", s or "")
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
 def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
-    return {
+    raw = {
         "User-Agent": random.choice(_UA_POOL),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
@@ -438,6 +446,8 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
         "DNT": "1",
         "Sec-Fetch-Mode": "navigate",
     }
+    # Garantiza headers ASCII para httpx / RFC
+    return {k: _ascii(v) for k, v in raw.items()}
 
 # Cache
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
@@ -452,7 +462,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
-            # origin=* es recomendado por MediaWiki para CORS; ayuda con 403 en algunos edge/CDN
+            # origin=* es recomendado por MediaWiki para CORS/CDN; ayuda con 403
             params2 = dict(params)
             params2.setdefault("origin", "*")
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
@@ -558,48 +568,89 @@ def _prefer_square(links: List[str]) -> List[str]:
             out.append(u)
     return out
 
-async def _scrape_card_variants(href: str) -> Dict:
-    async with httpx.AsyncClient() as client:
-        # usar headers rotativos y referer = la propia página
-        r = await client.get(href, headers=_mk_headers(href), follow_redirects=True, timeout=30)
-        if r.status_code in (403, 429):
-            await asyncio.sleep(1.0)
-            r = await client.get(href, headers=_mk_headers(href), follow_redirects=True, timeout=30)
-        r.raise_for_status()
-        html = r.text
-
+def _page_title_from_href(href: str) -> str:
+    # https://sekaipedia.org/wiki/1_Page_of_Daily_Life  ->  1 Page of Daily Life
     try:
-        soup = BeautifulSoup(html, "lxml")
+        path = urlparse(href).path  # /wiki/...
+        title = path.split("/wiki/", 1)[1]
+        title = unquote(title).replace("_", " ").strip()
+        return title
     except Exception:
-        soup = BeautifulSoup(html, "html.parser")
+        return ""
 
-    title = soup.select_one("#firstHeading")
-    card_name = title.get_text(strip=True) if title else ""
+async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
+    """
+    Devuelve URLs de imagen de la página usando la MediaWiki API:
+      1) prop=images para títulos de archivo (File:...)
+      2) prop=imageinfo&iiprop=url&iiurlwidth=512 para obtener URLs (thumb o full)
+    """
+    if not page_title:
+        return []
 
-    root = soup.select_one("#mw-content-text") or soup
-    imgs = root.select("img")
+    # 1) Títulos de archivos asociados a la página
+    params1 = {
+        "action": "query",
+        "prop": "images",
+        "titles": page_title,
+        "imlimit": "500",
+        "format": "json",
+    }
+    data1 = await _get_json(client, SEKAIPEDIA_API, params1)
+    pages = (data1.get("query", {}) or {}).get("pages", {}) or {}
+
+    file_titles: List[str] = []
+    for _, pinfo in pages.items():
+        for it in (pinfo.get("images") or []):
+            t = it.get("title", "")
+            if t.startswith("File:"):
+                file_titles.append(t)
+
+    if not file_titles:
+        return []
+
+    # 2) Resolver URLs por lotes
+    urls: List[str] = []
+    for i in range(0, len(file_titles), 50):
+        chunk = file_titles[i:i+50]
+        params2 = {
+            "action": "query",
+            "titles": "|".join(chunk),
+            "prop": "imageinfo",
+            "iiprop": "url|size|mime",
+            "iiurlwidth": "512",
+            "format": "json",
+        }
+        data2 = await _get_json(client, SEKAIPEDIA_API, params2)
+        for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
+            for ii in (finfo.get("imageinfo") or []):
+                url = ii.get("thumburl") or ii.get("url")
+                if url:
+                    urls.append(_abs_sekaipedia(url))
+        await _sleep_jitter(0.2, 0.5)
+
+    # Únicos y en orden
+    return _prefer_square(urls)
+
+async def _scrape_card_variants(href: str) -> Dict:
+    # Nueva versión usando MediaWiki API (robusta)
+    page_title = _page_title_from_href(href)
+    async with httpx.AsyncClient() as client:
+        urls = await _fetch_page_images(client, page_title)
 
     trained_links: List[str] = []
     untrained_links: List[str] = []
     unknown_links: List[str] = []
 
-    for img in imgs:
-        src = img.get("data-src") or img.get("src") or ""
-        alt = (img.get("alt") or "").strip()
-        src = _abs_sekaipedia(src)
-        if not src or ("sekaipedia" not in src and "wikimg" not in src and "wikipedia" not in src):
-            continue
-        filename = alt or src
+    for u in urls:
+        filename = u.rsplit("/", 1)[-1]
         if _is_trained(filename):
-            trained_links.append(src)
+            trained_links.append(u)
         elif _is_untrained(filename):
-            untrained_links.append(src)
+            untrained_links.append(u)
         else:
-            unknown_links.append(src)
+            unknown_links.append(u)
 
-    trained_links   = _prefer_square(trained_links)
-    untrained_links = _prefer_square(untrained_links)
-    if not untrained_links and len(unknown_links) >= 1:
+    if not untrained_links and unknown_links:
         untrained_links.append(unknown_links[0])
     if not trained_links and len(unknown_links) >= 2:
         trained_links.append(unknown_links[1])
@@ -609,7 +660,8 @@ async def _scrape_card_variants(href: str) -> Dict:
         variants.append({"label": "Untrained", "url": untrained_links[0]})
     if trained_links:
         variants.append({"label": "Trained", "url": trained_links[0]})
-    return {"name": card_name, "variants": variants}
+
+    return {"name": page_title, "variants": variants}
 
 @app.get("/auth02/card-variants")
 async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
