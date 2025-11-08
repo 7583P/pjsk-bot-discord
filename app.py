@@ -1,5 +1,4 @@
 import os
-import re
 import secrets
 import traceback
 import asyncio
@@ -11,7 +10,6 @@ from urllib.parse import urlparse, unquote
 
 import asyncpg
 import httpx
-from bs4 import BeautifulSoup  # type: ignore
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +60,7 @@ SEASONS_HAS_NAME: bool      = False
 SEASONS_HAS_STARTS_AT: bool = False
 SEASONS_HAS_ENDS_AT: bool   = False
 
+# ======================= Arranque de BD =======================
 async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
     row = await conn.fetchrow(
         """
@@ -85,6 +84,41 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
     except Exception:
         traceback.print_exc()
 
+async def _ensure_pfp_table(conn: asyncpg.Connection) -> None:
+    """
+    Crea tabla/índices para persistir PFPs.
+    - Un registro por user_id (si existe).
+    - También permite guardar por discord_id o name_lower.
+    - ÍNDICES ÚNICOS parciales para poder hacer UPSERT por cada llave.
+    """
+    await conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS public.player_pfps (
+          id         BIGSERIAL PRIMARY KEY,
+          user_id    TEXT UNIQUE,
+          discord_id TEXT,
+          name_lower TEXT,
+          url        TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        """
+    )
+    # índices únicos parciales (permiten ON CONFLICT por esas columnas)
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_player_pfps_discord_id
+        ON public.player_pfps(discord_id)
+        WHERE discord_id IS NOT NULL;
+        """
+    )
+    await conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_player_pfps_name_lower
+        ON public.player_pfps(name_lower)
+        WHERE name_lower IS NOT NULL;
+        """
+    )
+
 @app.on_event("startup")
 async def startup():
     global db_pool
@@ -102,6 +136,7 @@ async def startup():
     print("✅ DB pool initialized")
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
+        await _ensure_pfp_table(conn)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -167,11 +202,6 @@ async def list_seasons():
     return out
 
 # ======================= AUTH02 (Discord OAuth) =======================
-# PFPs en memoria (tres llaves)
-PFP_BY_NAME:    Dict[str, str] = {}  # nameLower -> url
-PFP_BY_ID:      Dict[str, str] = {}  # players.user_id -> url
-PFP_BY_DISCORD: Dict[str, str] = {}  # players.discord_id -> url
-
 STATE_STORE: Dict[str, datetime] = {}  # state -> expiry (UTC)
 STATE_TTL = timedelta(minutes=10)
 
@@ -196,19 +226,6 @@ def _valid_https_url(u: str) -> bool:
         return True
     except Exception:
         return False
-
-def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
-    # Prioridad: user_id -> discord_id -> nameLower
-    if user_id:
-        url = PFP_BY_ID.get(str(user_id))
-        if url: return url
-    if discord_id:
-        url = PFP_BY_DISCORD.get(str(discord_id))
-        if url: return url
-    if name:
-        url = PFP_BY_NAME.get((name or "").lower())
-        if url: return url
-    return None
 
 @app.get("/health")
 async def health():
@@ -298,59 +315,140 @@ async def auth02_logout(request: Request):
     resp.delete_cookie(COOKIE_NAME, path="/")
     return resp
 
-# =================== /auth02/pfps ===================
-MAX_PFPS = 5000
+# =================== Persistencia de PFP en DB ===================
 
+def _ascii(s: str) -> str:
+    return (
+        unicodedata.normalize("NFKD", s or "")
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+
+# UAs rotativos (Chrome/Win/mac/Linux/Android)
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+]
+
+def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
+    raw = {
+        "User-Agent": random.choice(_UA_POOL),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        "Referer": referer or "https://sekaipedia.org/",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "DNT": "1",
+        "Sec-Fetch-Mode": "navigate",
+    }
+    # headers ASCII ⇒ sin UnicodeEncodeError
+    return {k: _ascii(v) for k, v in raw.items()}
+
+# === Set PFP (persistente) ===
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Guarda/actualiza el PFP:
-    - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
-    - Se guarda por userId, por discordId y opcionalmente por nameLower.
-    - url="" borra los registros asociados a esas llaves.
+    Guarda/actualiza el PFP en Postgres.
+    Prioridad de llave: user_id (si puede resolverse) → discord_id → name_lower.
+    url="" borra los registros asociados a cualquiera de esas llaves.
     """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
     body = await request.json()
     url = (body.get("url") or "").strip()
-    name_lower = (body.get("nameLower") or "").strip().lower()
-    user_id = (body.get("userId") or "").strip()
+    name_lower = (body.get("nameLower") or "").strip().lower() or None
+    user_id = (body.get("userId") or "").strip() or None
 
     sid = request.cookies.get(COOKIE_NAME)
     session = SESSIONS.get(sid or "", {})
-    discord_id = str(session.get("id") or "")
+    discord_id = str(session.get("id") or "") or None
 
-    if not user_id:
+    # Intentar resolver user_id por discord si no llegó
+    if not user_id and discord_id:
         resolved = await _resolve_user_id_from_discord(discord_id)
         if resolved:
             user_id = resolved
 
-    if not name_lower and session:
-        name_lower = (session.get("username") or "").lower()
-
-    # Borrado
-    if url == "":
-        if user_id:    PFP_BY_ID.pop(user_id, None)
-        if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
-        if name_lower: PFP_BY_NAME.pop(name_lower, None)
-        return {"ok": True, "deleted": True}
-
-    if not _valid_https_url(url):
-        raise HTTPException(400, "invalid url")
-
+    # Si no hay ninguna llave, error
     if not (user_id or discord_id or name_lower):
         raise HTTPException(400, "missing userId or discordId or nameLower")
 
-    if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
-        raise HTTPException(429, "pfp store is full")
+    async with db_pool.acquire() as conn:
+        # BORRADO
+        if url == "":
+            if user_id:
+                await conn.execute("DELETE FROM public.player_pfps WHERE user_id = $1", user_id)
+            if discord_id:
+                await conn.execute("DELETE FROM public.player_pfps WHERE discord_id = $1", discord_id)
+            if name_lower:
+                await conn.execute("DELETE FROM public.player_pfps WHERE name_lower = $1", name_lower)
+            return {"ok": True, "deleted": True}
 
-    if user_id:    PFP_BY_ID[user_id] = url
-    if discord_id: PFP_BY_DISCORD[discord_id] = url
-    if name_lower: PFP_BY_NAME[name_lower] = url
+        if not _valid_https_url(url):
+            raise HTTPException(400, "invalid url")
 
-    return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
+        # UPSERT por prioridad de llave
+        if user_id:
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfps(user_id, discord_id, name_lower, url)
+                VALUES ($1,$2,$3,$4)
+                ON CONFLICT (user_id) DO UPDATE SET
+                  discord_id = EXCLUDED.discord_id,
+                  name_lower = EXCLUDED.name_lower,
+                  url        = EXCLUDED.url,
+                  updated_at = now()
+                """,
+                user_id, discord_id, name_lower, url
+            )
+        elif discord_id:
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfps(discord_id, name_lower, url)
+                VALUES ($1,$2,$3)
+                ON CONFLICT ON CONSTRAINT ux_player_pfps_discord_id DO UPDATE SET
+                  name_lower = EXCLUDED.name_lower,
+                  url        = EXCLUDED.url,
+                  updated_at = now()
+                """,
+                discord_id, name_lower, url
+            )
+        else:  # name_lower
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfps(name_lower, url)
+                VALUES ($1,$2)
+                ON CONFLICT ON CONSTRAINT ux_player_pfps_name_lower DO UPDATE SET
+                  url        = EXCLUDED.url,
+                  updated_at = now()
+                """,
+                name_lower, url
+            )
+
+    return {"ok": True, "byUser": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
 @app.get("/auth02/pfps")
 async def list_pfps():
-    return JSONResponse({"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME})
+    """Devuelve mapas byId/byDiscord/byName desde DB (persistente)."""
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id, discord_id, name_lower, url FROM public.player_pfps")
+
+    byId, byDiscord, byName = {}, {}, {}
+    for r in rows:
+        if r["user_id"]:
+            byId[str(r["user_id"])] = r["url"]
+        if r["discord_id"]:
+            byDiscord[str(r["discord_id"])] = r["url"]
+        if r["name_lower"]:
+            byName[str(r["name_lower"]).lower()] = r["url"]
+    return JSONResponse({"byId": byId, "byDiscord": byDiscord, "byName": byName})
 
 # ======================= API: Players =======================
 @app.get("/api/players")
@@ -394,60 +492,21 @@ async def get_players(
 
     out = []
     for r in rows:
-        user_id    = r.get("user_id")
-        discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
-        name       = r.get("name")
-
-        pfp_url = _resolve_pfp_for_player(
-            str(user_id) if user_id is not None else None,
-            str(discord_id) if discord_id is not None else None,
-            name
-        )
-
         out.append({
-            "id": user_id,
-            "discordId": discord_id,
-            "name": name,
+            "id": r.get("user_id"),
+            "discordId": r.get("discord_id") if HAS_DISCORD_ID_COL else None,
+            "name": r.get("name"),
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # <- el front puede usar p.pfp directamente
+            # el front traerá el mapa /auth02/pfps; mantener campo opcional:
+            "pfp": None,
         })
     return out
 
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
-
-# UAs rotativos (Chrome/Win/mac/Linux/Android)
-_UA_POOL = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
-]
-
-def _ascii(s: str) -> str:
-    return (
-        unicodedata.normalize("NFKD", s or "")
-        .encode("ascii", "ignore")
-        .decode("ascii")
-    )
-
-def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
-    raw = {
-        "User-Agent": random.choice(_UA_POOL),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        "Referer": referer or "https://sekaipedia.org/",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "DNT": "1",
-        "Sec-Fetch-Mode": "navigate",
-    }
-    # Garantiza headers ASCII para httpx / RFC
-    return {k: _ascii(v) for k, v in raw.items()}
 
 # Cache
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
@@ -462,9 +521,8 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
-            # origin=* es recomendado por MediaWiki para CORS/CDN; ayuda con 403
             params2 = dict(params)
-            params2.setdefault("origin", "*")
+            params2.setdefault("origin", "*")  # recomendado por MediaWiki
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
             if r.status_code in (403, 429):
                 await asyncio.sleep(1.2 + attempt * 0.6)
@@ -551,22 +609,7 @@ async def auth02_cards():
             traceback.print_exc()
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
-# =================== /auth02/card-variants ===================
-def _is_trained(filename: str) -> bool:
-    s = filename.lower()
-    return ("trained" in s) or ("after training" in s) or ("idolized" in s)
-
-def _is_untrained(filename: str) -> bool:
-    s = filename.lower()
-    return ("untrained" in s) or ("before training" in s) or ("base" in s)
-
-def _prefer_square(links: List[str]) -> List[str]:
-    seen, out = set(), []
-    for u in links:
-        if u and u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
+# =================== /auth02/card-variants (API robusta) ===================
 
 def _page_title_from_href(href: str) -> str:
     # https://sekaipedia.org/wiki/1_Page_of_Daily_Life  ->  1 Page of Daily Life
@@ -578,26 +621,31 @@ def _page_title_from_href(href: str) -> str:
     except Exception:
         return ""
 
-async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
+def _is_trained_text(s: str) -> bool:
+    s = (s or "").lower()
+    return any(k in s for k in ["after training", "trained", "idolized"])
+
+def _is_untrained_text(s: str) -> bool:
+    s = (s or "").lower()
+    return any(k in s for k in ["before training", "untrained", "base"])
+
+async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[Dict]:
     """
-    Devuelve URLs de imagen de la página usando la MediaWiki API:
-      1) prop=images para títulos de archivo (File:...)
-      2) prop=imageinfo&iiprop=url&iiurlwidth=512 para obtener URLs (thumb o full)
+    Devuelve {url, filename, cats[]} por cada File:* asociado a la página.
+    Usa prop=images y luego prop=imageinfo|categories.
     """
     if not page_title:
         return []
 
-    # 1) Títulos de archivos asociados a la página
-    params1 = {
+    # 1) Listar archivos de la página
+    data1 = await _get_json(client, SEKAIPEDIA_API, {
         "action": "query",
         "prop": "images",
         "titles": page_title,
         "imlimit": "500",
         "format": "json",
-    }
-    data1 = await _get_json(client, SEKAIPEDIA_API, params1)
+    })
     pages = (data1.get("query", {}) or {}).get("pages", {}) or {}
-
     file_titles: List[str] = []
     for _, pinfo in pages.items():
         for it in (pinfo.get("images") or []):
@@ -608,71 +656,88 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
     if not file_titles:
         return []
 
-    # 2) Resolver URLs por lotes
-    urls: List[str] = []
+    # 2) Resolver url + categorías por lotes
+    results: List[Dict] = []
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i:i+50]
-        params2 = {
+        data2 = await _get_json(client, SEKAIPEDIA_API, {
             "action": "query",
             "titles": "|".join(chunk),
-            "prop": "imageinfo",
+            "prop": "imageinfo|categories",
             "iiprop": "url|size|mime",
             "iiurlwidth": "512",
+            "cllimit": "50",
             "format": "json",
-        }
-        data2 = await _get_json(client, SEKAIPEDIA_API, params2)
+        })
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
+            cats = [(c.get("title") or "").lower() for c in (finfo.get("categories") or [])]
+            url = None
             for ii in (finfo.get("imageinfo") or []):
-                url = ii.get("thumburl") or ii.get("url")
-                if url:
-                    urls.append(_abs_sekaipedia(url))
+                url = ii.get("thumburl") or ii.get("url") or url
+            if not url:
+                continue
+            filename = (finfo.get("title") or "").rsplit(":", 1)[-1]
+            results.append({"url": _abs_sekaipedia(url), "filename": filename, "cats": cats})
         await _sleep_jitter(0.2, 0.5)
 
-    # Únicos y en orden
-    return _prefer_square(urls)
-
-async def _scrape_card_variants(href: str) -> Dict:
-    # Nueva versión usando MediaWiki API (robusta)
-    page_title = _page_title_from_href(href)
-    async with httpx.AsyncClient() as client:
-        urls = await _fetch_page_images(client, page_title)
-
-    trained_links: List[str] = []
-    untrained_links: List[str] = []
-    unknown_links: List[str] = []
-
-    for u in urls:
-        filename = u.rsplit("/", 1)[-1]
-        if _is_trained(filename):
-            trained_links.append(u)
-        elif _is_untrained(filename):
-            untrained_links.append(u)
-        else:
-            unknown_links.append(u)
-
-    if not untrained_links and unknown_links:
-        untrained_links.append(unknown_links[0])
-    if not trained_links and len(unknown_links) >= 2:
-        trained_links.append(unknown_links[1])
-
-    variants = []
-    if untrained_links:
-        variants.append({"label": "Untrained", "url": untrained_links[0]})
-    if trained_links:
-        variants.append({"label": "Trained", "url": trained_links[0]})
-
-    return {"name": page_title, "variants": variants}
+    return results
 
 @app.get("/auth02/card-variants")
 async def get_card_variants(href: str = Query(..., description="URL absoluta de la Card:")) -> Dict:
+    page_title = _page_title_from_href(href)
     try:
-        data = await _scrape_card_variants(href)
-        return data
+        async with httpx.AsyncClient() as client:
+            infos = await _fetch_page_images(client, page_title)
+
+        trained: List[str] = []
+        untrained: List[str] = []
+        unknown: List[str] = []
+
+        for it in infos:
+            url = it["url"]
+            cats = it["cats"]
+            fname = it["filename"]
+            is_tr = any(_is_trained_text(c) for c in cats) or _is_trained_text(fname)
+            is_un = any(_is_untrained_text(c) for c in cats) or _is_untrained_text(fname)
+
+            if is_tr:
+                trained.append(url)
+            elif is_un:
+                untrained.append(url)
+            else:
+                unknown.append(url)
+
+        # Fallbacks razonables
+        if not untrained and unknown:
+            untrained.append(unknown[0])
+        if not trained and len(unknown) >= 2:
+            trained.append(unknown[1])
+
+        # Únicos manteniendo orden
+        def uniq(xs):
+            seen=set(); out=[]
+            for x in xs:
+                if x and x not in seen:
+                    seen.add(x); out.append(x)
+            return out
+
+        trained   = uniq(trained)
+        untrained = uniq(untrained)
+
+        variants = []
+        if untrained:
+            variants.append({"label": "Untrained", "url": untrained[0]})
+        if trained:
+            variants.append({"label": "Trained", "url": trained[0]})
+        if not variants and unknown:
+            variants = [{"label": "Artwork", "url": unknown[0]}]
+
+        return {"name": page_title, "variants": variants}
+
     except Exception:
         traceback.print_exc()
-        return {"name": "", "variants": []}
+        return {"name": page_title, "variants": []}
 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#d
