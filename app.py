@@ -22,10 +22,10 @@ load_dotenv()
 DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
 DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://unique-education-production.up.railway.app/auth02/callback")
-FRONT_URL   = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
-CORS_ORIGIN = os.getenv("CORS_ORIGIN", FRONT_URL)
-COOKIE_NAME = os.getenv("COOKIE_NAME", "sid")
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+FRONT_URL             = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
+CORS_ORIGIN           = os.getenv("CORS_ORIGIN", FRONT_URL)
+COOKIE_NAME           = os.getenv("COOKIE_NAME", "sid")
+DATABASE_URL          = os.getenv("DATABASE_URL", "")
 
 # ===================== FastAPI =====================
 app = FastAPI()
@@ -79,11 +79,11 @@ async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
 async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT
     try:
-        HAS_DISCORD_ID_COL   = await _has_col(conn, "players", "discord_id")
-        SEASONS_HAS_ACTIVE   = await _has_col(conn, "seasons", "active")
-        SEASONS_HAS_NAME     = await _has_col(conn, "seasons", "name")
-        SEASONS_HAS_STARTS_AT= await _has_col(conn, "seasons", "starts_at")
-        SEASONS_HAS_ENDS_AT  = await _has_col(conn, "seasons", "ends_at")
+        HAS_DISCORD_ID_COL    = await _has_col(conn, "players", "discord_id")
+        SEASONS_HAS_ACTIVE    = await _has_col(conn, "seasons", "active")
+        SEASONS_HAS_NAME      = await _has_col(conn, "seasons", "name")
+        SEASONS_HAS_STARTS_AT = await _has_col(conn, "seasons", "starts_at")
+        SEASONS_HAS_ENDS_AT   = await _has_col(conn, "seasons", "ends_at")
         print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} | seasons.active={SEASONS_HAS_ACTIVE} name={SEASONS_HAS_NAME} starts_at={SEASONS_HAS_STARTS_AT} ends_at={SEASONS_HAS_ENDS_AT}")
     except Exception:
         traceback.print_exc()
@@ -378,7 +378,7 @@ async def set_pfp(request: Request):
 async def list_pfps():
     return JSONResponse({"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME})
 
-# ======================= API: Players =======================
+# ======================= API: Players (con PFP resuelto) =======================
 @app.get("/api/players")
 async def get_players(
     season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
@@ -437,81 +437,30 @@ async def get_players(
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # <<—— ahora el leaderboard recibe la URL del PFP
+            "pfp": pfp_url,  # ← el leaderboard debe mostrar esta URL si existe
         })
     return out
 
-# =================== /auth02/cards (Sekaipedia) ===================
-SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
-SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
-
-_cards_cache: Dict[str, object] = {"items": [], "ts": datetime.utcfromtimestamp(0)}
+# =================== /auth02/cards (Usando sekai.best) ===================
 CARDS_TTL = timedelta(hours=6)
+_cards_cache = {"items": [], "ts": datetime.utcfromtimestamp(0)}
 _cards_lock = asyncio.Lock()
 
-_HTTP_HEADERS = {
-    "User-Agent": "pjsk-lounge/1.1 (+worker; contact: admin@pjsk-lounge)",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Referer": "https://sekaipedia.org/",
-}
+async def _fetch_cards_from_sekai_best():
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get("https://sekai.best/api/cards")
+        r.raise_for_status()
+        data = r.json()
 
-def _abs_url(u: str) -> str:
-    if not u: return ""
-    if u.startswith("//"): return "https:" + u
-    if u.startswith("/"):  return "https://sekaipedia.org" + u
-    return u
-
-def _guess_id(name: str, href: str) -> str:
-    m = re.search(r"#(\d+)", name or "")
-    if m: return m.group(1)
-    return (href or "").rstrip("/").split("/")[-1] or (name or "")
-
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    items: List[Dict] = []
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        apcontinue = None
-        while True:
-            params = {
-                "action": "query",
-                "list": "categorymembers",
-                "cmtitle": "Category:Cards",
-                "cmlimit": "500",
-                "format": "json",
-            }
-            if apcontinue: params["cmcontinue"] = apcontinue
-            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
-            r.raise_for_status()
-            data = r.json()
-            for m in data.get("query", {}).get("categorymembers", []):
-                title = m.get("title", "")
-                pageid = str(m.get("pageid", ""))
-                href = f"https://sekaipedia.org/wiki/{title.replace(' ', '_')}"
-                items.append({"id": pageid, "name": title, "href": href, "thumb": None})
-            apcontinue = data.get("continue", {}).get("cmcontinue")
-            if not apcontinue: break
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        for i in range(0, len(items), 50):
-            chunk = items[i:i+50]
-            pageids = "|".join(c["id"] for c in chunk)
-            params = {
-                "action": "query",
-                "pageids": pageids,
-                "prop": "pageimages",
-                "piprop": "thumbnail",
-                "pithumbsize": "256",
-                "format": "json",
-            }
-            r = await client.get(SEKAIPEDIA_API, params=params, headers=_HTTP_HEADERS)
-            r.raise_for_status()
-            for pid, pinfo in (r.json().get("query", {}).get("pages", {})).items():
-                thumb = (pinfo.get("thumbnail") or {}).get("source")
-                if thumb:
-                    for c in chunk:
-                        if c["id"] == pid:
-                            c["thumb"] = thumb
-    return items
+        cards = []
+        for card in data:
+            cards.append({
+                "id": card["id"],
+                "name": card["name"],
+                "thumb": card["icon"],  # 256x256 aprox
+            })
+        cards.sort(key=lambda c: c["id"], reverse=True)
+        return cards
 
 @app.get("/auth02/cards")
 async def auth02_cards():
@@ -523,34 +472,34 @@ async def auth02_cards():
         now = datetime.utcnow()
         if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
             return _cards_cache["items"]
+
         try:
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
+            items = await _fetch_cards_from_sekai_best()
             _cards_cache["items"] = items
             _cards_cache["ts"] = datetime.utcnow()
             return items
-        except HTTPException:
-            raise
         except Exception as e:
             traceback.print_exc()
-            raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
+            raise HTTPException(503, f"Failed to fetch from sekai.best: {e}")
 
-# =================== /auth02/card-variants ===================
+# =================== /auth02/card-variants (de Sekaipedia: detalle por página) ===================
+_HTTP_HEADERS = {
+    "User-Agent": "pjsk-lounge/1.1 (+worker; contact: admin@pjsk-lounge)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Referer": "https://sekaipedia.org/",
+}
 def _abs_sekaipedia(u: str) -> str:
     if not u: return ""
     if u.startswith("//"): return "https:" + u
     if u.startswith("/"):  return "https://sekaipedia.org" + u
     return u
-
 def _is_trained(filename: str) -> bool:
     s = filename.lower()
     return ("trained" in s) or ("after training" in s) or ("idolized" in s)
-
 def _is_untrained(filename: str) -> bool:
     s = filename.lower()
     return ("untrained" in s) or ("before training" in s) or ("base" in s)
-
 def _prefer_square(links: List[str]) -> List[str]:
     seen, out = set(), []
     for u in links:
@@ -620,4 +569,3 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static (Front opcional) ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#d
