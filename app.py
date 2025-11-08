@@ -101,7 +101,7 @@ async def startup():
     print("✅ DB pool initialized")
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
-        # Migraciones mínimas para persistir cartas y variantes
+        # Migraciones mínimas para persistir cartas, variantes y PFPs
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS public.sekaicards(
           page_id    BIGINT PRIMARY KEY,
@@ -117,6 +117,21 @@ async def startup():
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
+        -- PFP persistente por jugador (para que sobreviva a restarts/redeploys)
+        CREATE TABLE IF NOT EXISTS public.player_pfps(
+          user_id    BIGINT PRIMARY KEY REFERENCES public.players(user_id) ON DELETE CASCADE,
+          url        TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint WHERE conname = 'chk_https_pfp'
+          ) THEN
+            ALTER TABLE public.player_pfps
+              ADD CONSTRAINT chk_https_pfp CHECK (left(url, 8) = 'https://');
+          END IF;
+        END$$;
         """)
 
 @app.on_event("shutdown")
@@ -323,7 +338,7 @@ async def set_pfp(request: Request):
     Guarda/actualiza el PFP:
     - Si no mandan userId, intenta cookie -> discord_id -> players.user_id.
     - Se guarda por userId, por discordId y opcionalmente por nameLower.
-    - url="" borra los registros asociados a esas llaves.
+    - url="" borra los registros asociados a esas llaves (incluida la BD).
     """
     body = await request.json()
     url = (body.get("url") or "").strip()
@@ -347,6 +362,13 @@ async def set_pfp(request: Request):
         if user_id:    PFP_BY_ID.pop(user_id, None)
         if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
         if name_lower: PFP_BY_NAME.pop(name_lower, None)
+        # Borrar persistencia en BD si conocemos user_id
+        if db_pool and user_id:
+            async with db_pool.acquire() as conn:
+                try:
+                    await conn.execute("DELETE FROM public.player_pfps WHERE user_id=$1", int(user_id))
+                except Exception:
+                    traceback.print_exc()
         return {"ok": True, "deleted": True}
 
     if not _valid_https_url(url):
@@ -358,9 +380,29 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
+    # Guardar en memoria (compatibilidad con lógica actual)
     if user_id:    PFP_BY_ID[user_id] = url
     if discord_id: PFP_BY_DISCORD[discord_id] = url
     if name_lower: PFP_BY_NAME[name_lower] = url
+
+    # Persistir en BD si conocemos user_id (resolver si falta)
+    if db_pool:
+        if not user_id and discord_id:
+            resolved = await _resolve_user_id_from_discord(discord_id)
+            if resolved:
+                user_id = resolved
+        if user_id:
+            async with db_pool.acquire() as conn:
+                try:
+                    await conn.execute("""
+                        INSERT INTO public.player_pfps(user_id, url, updated_at)
+                        VALUES ($1, $2, now())
+                        ON CONFLICT (user_id) DO UPDATE
+                          SET url = EXCLUDED.url,
+                              updated_at = now()
+                    """, int(user_id), url)
+                except Exception:
+                    traceback.print_exc()
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -388,6 +430,8 @@ async def get_players(
                 "p.country  AS country",
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
+                # URL persistida en BD (si existe)
+                "pp.url     AS pfp_url"
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -396,6 +440,7 @@ async def get_players(
                 SELECT {", ".join(select_cols)}
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
+                LEFT JOIN public.player_pfps pp ON pp.user_id = p.user_id
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -414,11 +459,14 @@ async def get_players(
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
         name       = r.get("name")
 
-        pfp_url = _resolve_pfp_for_player(
-            str(user_id) if user_id is not None else None,
-            str(discord_id) if discord_id is not None else None,
-            name
-        )
+        # Prioridad: BD > memoria
+        pfp_url = r.get("pfp_url")
+        if not pfp_url:
+            pfp_url = _resolve_pfp_for_player(
+                str(user_id) if user_id is not None else None,
+                str(discord_id) if discord_id is not None else None,
+                name
+            )
 
         out.append({
             "id": user_id,
@@ -427,7 +475,7 @@ async def get_players(
             "mmr": r.get("mmr"),
             "country": r.get("country"),
             "rank": r.get("rank"),
-            "pfp": pfp_url,  # <- el front puede usar p.pfp directamente
+            "pfp": pfp_url,  # ahora viene de BD si existe; si no, memoria
         })
     return out
 
@@ -707,7 +755,7 @@ async def auth02_cards():
 
         try:
             # NOTA: aquí solo llenamos el listado y su thumb; el “Trained” se resuelve por /card-variants
-            items = await _scrape_cards_from_sekaipedia()
+            items = await _scrape_cards_from_sekaipedia()  # <- asumes tu función existente
             if not items:
                 # si scraping falla, pero hay algo en BD, sirve lo de BD
                 if db_pool:
