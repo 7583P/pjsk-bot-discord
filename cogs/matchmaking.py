@@ -77,6 +77,24 @@ APPEND_RANGES = {
     "Legend":         (32, 37),
 }
 
+# Tamaño del pool para non-append
+NON_APPEND_POOL_LIMIT = 10
+
+# Cuántas canciones append se meten al pool según el rango más alto presente
+APPEND_POOL_CONFIG = {
+    "Diamond":        2,  # ~500 MMR
+    "Crystal":        2,  # ~600
+    "Master":         3,  # ~700
+    "Champion":       3,  # ~800
+    "Grand Champion": 4,  # ~900
+    "Legend":         5,  # 1000+
+}
+
+def get_append_pool_limit_for_rank(rank: str) -> int:
+    """Devuelve cuántas canciones append meter al pool según el rango alto."""
+    return APPEND_POOL_CONFIG.get(rank, 0)
+
+
 def _highest_high_rank(counts: dict[str, int]) -> str | None:
     """Devuelve el rango más alto presente entre Diamond..Legend, o None si no hay."""
     for r in APPEND_RANKS_ORDER:
@@ -1054,14 +1072,6 @@ class Matchmaking(commands.Cog):
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
 
-        # 🚫 Regla adicional: si hay al menos un Placement en la sala, quitar "append"
-        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
-            hr = _highest_high_rank(counts)
-            if hr is not None:
-                lo, hi = APPEND_RANGES[hr]
-
-
-
 
         # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
         if counts.get("Placement", 0) > 0:
@@ -1075,29 +1085,31 @@ class Matchmaking(commands.Cog):
 
             # b) Determinar (opcional) el gap SOLO para append
             append_lo_hi = None
+            append_limit = 0
             if "append" in allowed_diffs:
                 hr = _highest_high_rank(counts)  # Diamond..Legend más alto presente
                 if hr is not None:
                     append_lo_hi = APPEND_RANGES[hr]
+                    append_limit = get_append_pool_limit_for_rank(hr)
 
             # c) Traer canciones por tipo de diff
             pool = []
 
-            # Non-append (Expert/Master) en gap base
+            # Non-append (Expert/Master) en gap base → siempre hasta 10
             if non_append_diffs:
                 non_append_pool = await self._get_random_songs(
-                    base_lo, base_hi, non_append_diffs, limit=9
+                    base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
                 )
                 pool.extend(non_append_pool)
                 taken_titles = {t for (t, *_ ) in non_append_pool}
             else:
                 taken_titles = set()
 
-            # Append en su gap especial (si aplica)
-            if append_lo_hi is not None:
+            # Append en su gap especial → según rango alto
+            if append_lo_hi is not None and append_limit > 0:
                 alo, ahi = append_lo_hi
                 append_pool = await self._get_random_songs(
-                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                    alo, ahi, ("append",), limit=append_limit, exclude_titles=taken_titles
                 )
                 pool.extend(append_pool)
 
@@ -1227,14 +1239,6 @@ class Matchmaking(commands.Cog):
                 allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
                 break
 
-
-        # 🚫 Regla adicional: si hay Placement en la sala, quitar "append"
-        if "append" in allowed_diffs and counts.get("Placement", 0) == 0:
-            hr = _highest_high_rank(counts)
-            if hr is not None:
-                lo, hi = APPEND_RANGES[hr]
-
-        # — 6.1) Obtener canciones según reglas (gap base vs append-only-range)
         if counts.get("Placement", 0) > 0:
             picks = await self._pick_placement_songs_levels_24_to_28()
             lo, hi = 24, 28  # Mostrar explícitamente el rango especial
@@ -1245,28 +1249,30 @@ class Matchmaking(commands.Cog):
 
             # b) gap SOLO para append (si aplica)
             append_lo_hi = None
+            append_limit = 0
             if "append" in allowed_diffs:
                 hr = _highest_high_rank(counts)
                 if hr is not None:
                     append_lo_hi = APPEND_RANGES[hr]
+                    append_limit = get_append_pool_limit_for_rank(hr)
 
             pool = []
 
-            # c) Non-append (Expert/Master) en gap base
+            # c) Non-append (Expert/Master) en gap base → siempre hasta 10
             if non_append_diffs:
                 non_append_pool = await self._get_random_songs(
-                    base_lo, base_hi, non_append_diffs, limit=9
+                    base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
                 )
                 pool.extend(non_append_pool)
                 taken_titles = {t for (t, *_ ) in non_append_pool}
             else:
                 taken_titles = set()
 
-            # d) Append en su gap especial
-            if append_lo_hi is not None:
+            # d) Append en su gap especial → según rango alto
+            if append_lo_hi is not None and append_limit > 0:
                 alo, ahi = append_lo_hi
                 append_pool = await self._get_random_songs(
-                    alo, ahi, ("append",), limit=9, exclude_titles=taken_titles
+                    alo, ahi, ("append",), limit=append_limit, exclude_titles=taken_titles
                 )
                 pool.extend(append_pool)
 
@@ -1274,7 +1280,6 @@ class Matchmaking(commands.Cog):
             picks = pool[:5]
             # (IMPORTANTE) mantener el rango mostrado = gap base
             lo, hi = base_lo, base_hi
-
 
 
 
