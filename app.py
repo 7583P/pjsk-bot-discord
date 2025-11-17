@@ -427,7 +427,7 @@ async def list_pfps():
 @app.get("/api/players")
 async def get_players(
     season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
-    limit: int = Query(100, ge=1, le=500),
+    limit: int = Query(10000, ge=1, le=100000),
     offset: int = Query(0, ge=0),
 ):
     if not db_pool:
