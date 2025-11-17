@@ -82,13 +82,28 @@ NON_APPEND_POOL_LIMIT = 10
 
 # Cuántas canciones append se meten al pool según el rango más alto presente
 APPEND_POOL_CONFIG = {
-    "Diamond":        2,  # ~500 MMR
-    "Crystal":        2,  # ~600
-    "Master":         3,  # ~700
-    "Champion":       3,  # ~800
-    "Grand Champion": 4,  # ~900
+    "Diamond":        5,  # ~500 MMR
+    "Crystal":        5,  # ~600
+    "Master":         5,  # ~700
+    "Champion":       5,  # ~800
+    "Grand Champion": 5,  # ~900
     "Legend":         5,  # 1000+
 }
+
+# Probabilidad de usar append según el rango más alto presente
+APPEND_PROBABILITIES = {
+    "Diamond":        0.10,
+    "Crystal":        0.20,
+    "Master":         0.30,
+    "Champion":       0.35,
+    "Grand Champion": 0.40,
+    "Legend":         0.50,
+}
+
+def get_append_probability_for_rank(rank: str) -> float:
+    """Devuelve la probabilidad de habilitar canciones append para el rango dado."""
+    return APPEND_PROBABILITIES.get(rank, 0.0)
+
 
 def get_append_pool_limit_for_rank(rank: str) -> int:
     """Devuelve cuántas canciones append meter al pool según el rango alto."""
@@ -1083,14 +1098,17 @@ class Matchmaking(commands.Cog):
             base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Determinar (opcional) el gap SOLO para append
+            # b) Determinar (opcional) el gap SOLO para append, pero con probabilidad por rango
             append_lo_hi = None
             append_limit = 0
             if "append" in allowed_diffs:
                 hr = _highest_high_rank(counts)  # Diamond..Legend más alto presente
                 if hr is not None:
-                    append_lo_hi = APPEND_RANGES[hr]
-                    append_limit = get_append_pool_limit_for_rank(hr)
+                    prob = get_append_probability_for_rank(hr)
+                    # Tirada de probabilidad: solo si pasa el check metemos append al pool
+                    if random.random() < prob:
+                        append_lo_hi = APPEND_RANGES[hr]
+                        append_limit = get_append_pool_limit_for_rank(hr)
 
             # c) Traer canciones por tipo de diff
             pool = []
@@ -1247,14 +1265,16 @@ class Matchmaking(commands.Cog):
             base_lo, base_hi = lo, hi
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) gap SOLO para append (si aplica)
+            # b) gap SOLO para append (si aplica), con probabilidad por rango
             append_lo_hi = None
             append_limit = 0
             if "append" in allowed_diffs:
                 hr = _highest_high_rank(counts)
                 if hr is not None:
-                    append_lo_hi = APPEND_RANGES[hr]
-                    append_limit = get_append_pool_limit_for_rank(hr)
+                    prob = get_append_probability_for_rank(hr)
+                    if random.random() < prob:
+                        append_lo_hi = APPEND_RANGES[hr]
+                        append_limit = get_append_pool_limit_for_rank(hr)
 
             pool = []
 
