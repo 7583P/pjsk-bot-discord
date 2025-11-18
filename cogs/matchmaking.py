@@ -66,13 +66,16 @@ def flagify_iso2_suffix(text: str) -> str:
     return t[:m.start(1)] + country_flag(m.group(1).upper())
 
 # ————— Append: solo limita el rango de selección para canciones 'append' —————
-APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master", "Crystal", "Diamond"]
+APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master ⬆", "Master" "Crystal ⬆", "Crystal" "Diamond ⬆", "Diamond"]
 
 APPEND_RANGES = {
     "Diamond":        (24, 27),
-    "Crystal":        (25, 28),
-    "Master":         (27, 30),
-    "Champion":       (29, 32),
+    "Diamond ⬆":      (25, 28),
+    "Crystal":        (26, 29),
+    "Crystal ⬆":      (27, 30),
+    "Master":         (28, 31),
+    "Master ⬆":       (29, 32),
+    "Champion":       (30, 33),
     "Grand Champion": (31, 35),
     "Legend":         (32, 37),
 }
@@ -83,8 +86,11 @@ NON_APPEND_POOL_LIMIT = 10
 # Cuántas canciones append se meten al pool según el rango más alto presente
 APPEND_POOL_CONFIG = {
     "Diamond":        5,  # ~500 MMR
+    "Diamond ⬆":      5,  # ~550 MMR
     "Crystal":        5,  # ~600
+    "Crystal ⬆":      5,  # ~650
     "Master":         5,  # ~700
+    "Master ⬆":       5,  # ~750
     "Champion":       5,  # ~800
     "Grand Champion": 5,  # ~900
     "Legend":         5,  # 1000+
@@ -93,10 +99,13 @@ APPEND_POOL_CONFIG = {
 # Probabilidad de usar append según el rango más alto presente
 APPEND_PROBABILITIES = {
     "Diamond":        0.10,
+    "Diamond ⬆":        0.15,
     "Crystal":        0.20,
+    "Crystal ⬆":        0.25,
     "Master":         0.30,
-    "Champion":       0.35,
-    "Grand Champion": 0.40,
+    "Master ⬆":         0.35,
+    "Champion":       0.40,
+    "Grand Champion": 0.45,
     "Legend":         0.50,
 }
 
@@ -134,8 +143,11 @@ ALLOWED_DIFFS_BY_RANK = {
     "Platinum":      ("hard", "expert", "master"),
     "Platinum ⬆":      ("hard", "expert", "master"),
     "Diamond":       ("expert", "master", "append"),
+    "Diamond ⬆":     ("expert", "master", "append"),
     "Crystal":       ("expert", "master", "append"),
+    "Crystal ⬆":     ("expert", "master", "append"),
     "Master":        ("expert", "master", "append"),
+    "Master ⬆":    ("expert", "master", "append"),
     "Champion":      ("expert", "master", "append"),
     "Grand Champion": ("expert", "master", "append"),
     "Legend":        ("master", "append"),
@@ -153,10 +165,13 @@ BRACKET_RANGES = {
     "Gold ⬆":        (23, 28),
     "Platinum":      (24, 29),
     "Platinum ⬆":    (25, 29),
-    "Diamond":       (26, 30), 
+    "Diamond":       (26, 30),
+    "Diamond ⬆":     (27, 30), 
     "Crystal":       (28, 31),
+    "Crystal ⬆":     (28, 32),
     "Master":        (29, 33),
-    "Champion":      (30, 34),
+    "Master ⬆":      (30, 34),
+    "Champion":      (31, 34),
     "Grand Champion": (31, 35),
     "Legend":        (32, 37),
 }
@@ -212,12 +227,18 @@ def get_rank_from_mmr(mmr: int) -> str:
         return "Platinum"
     elif mmr <= 499:
         return "Platinum ⬆"
-    elif mmr <= 599:
+    elif mmr <= 549:
         return "Diamond"
-    elif mmr <= 699:
+    elif mmr <= 599:
+        return "Diamond ⬆"
+    elif mmr <= 649:
         return "Crystal"
-    elif mmr <= 799:
+    elif mmr <= 699:
+        return "Crystal ⬆"
+    elif mmr <= 749:
         return "Master"
+    elif mmr <= 799:
+        return "Master ⬆"
     elif mmr <= 899:
         return "Champion"
     elif mmr <= 999:
@@ -237,8 +258,11 @@ RANK_ROLE_IDS = {
     "Platinum":      1389343805521789098,
     "Platinum ⬆":    1434564540619554960,
     "Diamond":      1371324561542484108,
+    "Diamond ⬆":    1440477553151184916,
     "Crystal":       1394445724703527012,
+    "Crystal ⬆":   1440477788501966858,
     "Master":       1394635883466199110,
+    "Master ⬆":   1440478019012530267,
     "Champion":      1371323543501144115,
     "Grand Champion": 1394444744892874832,
     "Legend":        1371323380510363749,
@@ -1730,7 +1754,7 @@ class Matchmaking(commands.Cog):
         if other == 0:  # All perfect (5 songs)
             return 800, "Champion"
         if other == 1:
-            return 750, "Master"
+            return 750, "Master ⬆"
         if other == 2:
             return 740, "Master"
         if other == 3:
@@ -1742,8 +1766,12 @@ class Matchmaking(commands.Cog):
         if 6 <= other <= 10:
             return 700, "Master"
         if 11 <= other <= 15:
+            return 650, "Crystal ⬆"
+        if 16 <= other <= 20:
             return 600, "Crystal"
-        if 16 <= other <= 30:
+        if 21 <= other <= 25:
+            return 550, "Diamond ⬆"
+        if 26 <= other <= 30:
             return 500, "Diamond"
         if 31 <= other <= 50:
             return 450, "Platinum ⬆"
