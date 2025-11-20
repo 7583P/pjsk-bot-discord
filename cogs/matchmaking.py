@@ -1769,15 +1769,15 @@ class Matchmaking(commands.Cog):
             return 650, "Crystal ⬆"
         if 16 <= other <= 20:
             return 600, "Crystal"
-        if 21 <= other <= 25:
+        if 21 <= other <= 30:
             return 550, "Diamond ⬆"
-        if 26 <= other <= 30:
-            return 500, "Diamond"
         if 31 <= other <= 50:
-            return 450, "Platinum ⬆"
+            return 500, "Diamond"
         if 51 <= other <= 70:
+            return 450, "Platinum ⬆"
+        if 71 <= other <= 100:
             return 400, "Platinum"
-        if 71 <= other <= 150:
+        if 101 <= other <= 150:
             return 350, "Gold ⬆"
         if 151 <= other <= 300:
             return 300, "Gold"
