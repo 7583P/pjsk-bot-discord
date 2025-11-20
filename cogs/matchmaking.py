@@ -179,6 +179,7 @@ BRACKET_RANGES = {
 MIN_LEVEL_GAP = 3
 
 VOTE_TIMEOUT_SUBMIT = 30 
+VOTE_TIMEOUT_FORFEIT = 30
 
 def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
     centers, gaps = [], []
@@ -985,12 +986,41 @@ class Matchmaking(commands.Cog):
                     musics = await grab(self.RAW_JP, "musics")
                     diffs  = await grab(self.RAW_JP, "musicDifficulties")
 
-            title_by_id = {m["id"]: m["title"] for m in musics}
+            # --------- NUEVO: necesitamos todo el objeto music, no solo el título ---------
+            music_by_id = {m["id"]: m for m in musics}
+            now_ts = int(datetime.datetime.utcnow().timestamp())  # segundos epoch actuales
+            # ---------------------------------------------------------------------------
 
             rows = []
             for d in diffs:
                 if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
                     continue
+
+                # --------- NUEVO: tomar fecha de release del juego y aplicar delay 24h -----
+                music = music_by_id.get(d["musicId"], {})
+                # título como antes
+                title = music.get("title", f"ID {d['musicId']}")
+
+                # en los JSON de Sekai suele ser publishedAt (ms); por si acaso probamos varias claves
+                raw_release = (
+                    music.get("publishedAt") or
+                    music.get("startAt") or
+                    music.get("releaseAt") or
+                    0
+                )
+
+                # convertir a segundos (si viene en milisegundos)
+                if raw_release and raw_release > 10_000_000_000:
+                    # probablemente milisegundos
+                    release_ts = int(raw_release // 1000)
+                else:
+                    release_ts = int(raw_release or 0)
+
+                # si tenemos fecha de release y aún no han pasado 24h → NO la metemos al pool
+                if release_ts and (release_ts + 24 * 60 * 60) > now_ts:
+                    # todavía es "demasiado nueva" en el juego → la saltamos
+                    continue
+                # ---------------------------------------------------------------------------
 
                 # Total de notas robusto (mantengo tu lógica)
                 notes_total = d.get("notesCount", None)
@@ -1012,7 +1042,7 @@ class Matchmaking(commands.Cog):
 
                 rows.append((
                     d["musicId"],
-                    title_by_id.get(d["musicId"], f"ID {d['musicId']}"),
+                    title,
                     d["musicDifficulty"],
                     int(d["playLevel"]),
                     int(notes_total or 0),
@@ -1031,6 +1061,7 @@ class Matchmaking(commands.Cog):
                     rows
                 )
         print("[songs] Catálogo global actualizado (UPSERT)")
+
 
 
     @refresh_songs.before_loop
@@ -1803,6 +1834,164 @@ class Matchmaking(commands.Cog):
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
 
+    @app_commands.command(
+        name="forfeit",
+        description="Starts a forfeit pool to close the room"
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def forfeit(self, interaction: discord.Interaction):
+        ch = interaction.channel
+
+        # Solo funciona dentro de un hilo cuyo padre sea un #join permitido
+        if not (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS):
+            return await interaction.response.send_message(
+                "This command only works inside a room thread.",
+                ephemeral=True
+            )
+
+        # Buscar la sala asociada a este hilo
+        room = next((r for r in self.rooms.values() if r["thread"].id == ch.id), None)
+        if not room:
+            return await interaction.response.send_message(
+                "⚠️ I can't find the room for this thread.",
+                ephemeral=True
+            )
+
+        # Si la sala ya fue finalizada (submit o forfeit previo), no tiene sentido
+        if room.get("finished", False):
+            return await interaction.response.send_message(
+                "This room is already finished.",
+                ephemeral=True
+            )
+
+        # No permitir si hay otra votación (submit o forfeit) en curso
+        if room.get("vote_in_progress", False):
+            return await interaction.response.send_message(
+                "There is already a vote in progress in this room.",
+                ephemeral=True
+            )
+
+        # Jugadores actuales en la sala (los que están en el hilo en este momento)
+        players = [m for m in room.get("players", []) if not m.bot]
+        if not players:
+            return await interaction.response.send_message(
+                "There are no players in this room.",
+                ephemeral=True
+            )
+
+        # Marcamos que hay una votación en curso para bloquear otros submits/forfeits
+        room["vote_in_progress"] = True
+
+        try:
+            # Mensaje de poll (NO efímero, necesitamos reacciones)
+            content = (
+                f"Forfeit pool\n"
+                f"React ✅ to forfeit and close the room, ❎ to cancel "
+                f"(auto-close in {VOTE_TIMEOUT_FORFEIT}s)"
+            )
+            await interaction.response.send_message(content)
+            poll_msg = await interaction.original_response()
+
+            # Reacciones ✅ y ❎
+            try:
+                await poll_msg.add_reaction("✅")
+                await poll_msg.add_reaction("❎")
+            except Exception:
+                pass
+
+            # Solo votan los jugadores que están en la sala *en este momento*
+            allowed_voters = {m.id for m in players}
+            total_voters = len(allowed_voters)
+            votes_yes = 0
+            votes_no = 0
+            voted: set[int] = set()
+
+            def check(reaction: discord.Reaction, user: discord.User):
+                return (
+                    reaction.message.id == poll_msg.id
+                    and not user.bot
+                    and user.id in allowed_voters
+                    and str(reaction.emoji) in ("✅", "❎")
+                )
+
+            deadline = asyncio.get_event_loop().time() + float(VOTE_TIMEOUT_FORFEIT)
+
+            # Recolectamos reacciones hasta que:
+            #  - voten todos (y vemos el resultado), o
+            #  - se acabe el tiempo de 15s
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    break
+
+                try:
+                    reaction, user = await self.bot.wait_for(
+                        "reaction_add",
+                        timeout=remaining,
+                        check=check
+                    )
+                except asyncio.TimeoutError:
+                    break
+
+                # Un voto por usuario
+                if user.id in voted:
+                    continue
+
+                voted.add(user.id)
+                if str(reaction.emoji) == "✅":
+                    votes_yes += 1
+                else:
+                    votes_no += 1
+
+                # Si ya votaron todos, terminamos antes de tiempo
+                if len(voted) == total_voters:
+                    break
+
+            # Condición de cierre:
+            #  - todos los jugadores actuales votaron
+            #  - y TODOS fueron ✅
+            if len(voted) == total_voters and votes_yes == total_voters and votes_no == 0:
+                # Cerrar sala por forfeit
+                try:
+                    await poll_msg.edit(
+                        content=f"🛑 Forfeit accepted — closing room "
+                                f"(✅ {votes_yes} / ❎ {votes_no}, {len(voted)}/{total_voters} voted)"
+                    )
+                except Exception:
+                    pass
+
+                room["finished"] = True
+                room["closed"] = True
+
+                await ch.send("Room forfeited by all current players. Closing room...")
+
+                # Notificar a otros cogs y cerrar el hilo
+                rid = next(
+                    (rid for rid, r in self.rooms.items() if r["thread"].id == ch.id),
+                    None
+                )
+                if rid is not None:
+                    self.bot.dispatch('room_finished', rid)
+
+                # Cerramos el hilo con un pequeño delay
+                asyncio.create_task(self.close_room(ch, delay=5, delete=True))
+
+            else:
+                # No hubo unanimidad de ✅ dentro de los 15s → no se cierra
+                try:
+                    await poll_msg.edit(
+                        content=(
+                            f"Forfeit canceled "
+                            f"(✅ {votes_yes} / ❎ {votes_no}, {len(voted)}/{total_voters} voted)"
+                        )
+                    )
+                except Exception:
+                    pass
+                await ch.send("Forfeit vote did not pass. Room remains open.")
+
+        finally:
+            # Siempre liberar el flag de votación en curso
+            room["vote_in_progress"] = False
 
 
     @commands.command(name="submit")
