@@ -1834,7 +1834,7 @@ class Matchmaking(commands.Cog):
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
 
-     @app_commands.command(
+    @app_commands.command(
         name="forfeit",
         description="Starts a forfeit vote to close the room by majority"
     )
