@@ -557,8 +557,8 @@ class Matchmaking(commands.Cog):
         """
         Devuelve (season_id, season_name) según la elección del usuario.
         - None o "current/actual" => temporada activa (get_current_season)
-        - "beta"                  => busca por nombre 'beta' (case-insensitive)
-        - "preseason"             => busca por 'preseason'/'pre-season'/'pre season' (case-insensitive)
+        - "AlphaSeason"                  => busca por nombre 'AlphaSeason' (case-insensitive)
+        - "Beta"             => busca por 'Beta'/'Beta'/'Beta' (case-insensitive)
         - Si no coincide, intenta buscar por nombre exacto (case-insensitive) o por ID numérico.
         """
         val = (season_choice or "current").strip()
@@ -571,8 +571,8 @@ class Matchmaking(commands.Cog):
 
         # Mapas de alias por conveniencia
         aliases = {
-            "beta": ["beta"],
-            "preseason": ["preseason", "pre-season", "pre season"],
+            "alphaseason": ["alphaseason"],
+            "beta": ["beta", "beta", "beta"],
         }
         candidate_names = aliases.get(key, [val])
 
@@ -1552,19 +1552,19 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Season: Current, Beta or PreSeason")
+    @app_commands.describe(season="Season: Current, AlphaSeason or Beta")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="PreSeason",   value="preseason"),
             app_commands.Choice(name="Beta",   value="beta"),
+            app_commands.Choice(name="AlphaSeason",   value="alphaseason"),
         ]
     )
     async def stats(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message("⚠️ Season not founf", ephemeral=True)
+            return await interaction.response.send_message("⚠️ Season not found", ephemeral=True)
 
         user_id = interaction.user.id
         data = await self._fetch_user_stats(user_id, season_id)
@@ -1585,12 +1585,12 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(user="Player", season="Season: Current, Beta or PreSeason")
+    @app_commands.describe(user="Player", season="Season: Current, AlphaSeason or Beta")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="PreSeason",   value="preseason"),
             app_commands.Choice(name="Beta",   value="beta"),
+            app_commands.Choice(name="AlphaSeason",   value="alphaseason"),
         ]
     )
     async def stats_user(self, interaction: discord.Interaction, user: discord.Member, season: app_commands.Choice[str] | None = None):
@@ -1620,12 +1620,12 @@ class Matchmaking(commands.Cog):
         description="Shows the MMR Cutoff of T10, T20, T30, T40, T50 y T100 for the selected season"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Temporada: Current, Beta or PreSeason")
+    @app_commands.describe(season="Temporada: Current, AlphaSeason or Beta")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="PreSeason", value="preseason"),
             app_commands.Choice(name="Beta", value="beta"),
+            app_commands.Choice(name="AlphaSeason", value="alphaseason"),
         ]
     )
 
