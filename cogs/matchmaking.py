@@ -1834,9 +1834,9 @@ class Matchmaking(commands.Cog):
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
 
-    @app_commands.command(
+     @app_commands.command(
         name="forfeit",
-        description="Starts a forfeit pool to close the room"
+        description="Starts a forfeit vote to close the room by majority"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def forfeit(self, interaction: discord.Interaction):
@@ -1871,7 +1871,7 @@ class Matchmaking(commands.Cog):
                 ephemeral=True
             )
 
-        # Jugadores actuales en la sala (los que están en el hilo en este momento)
+        # Jugadores actuales registrados en la sala (no bots)
         players = [m for m in room.get("players", []) if not m.bot]
         if not players:
             return await interaction.response.send_message(
@@ -1885,7 +1885,7 @@ class Matchmaking(commands.Cog):
         try:
             # Mensaje de poll (NO efímero, necesitamos reacciones)
             content = (
-                f"Forfeit pool\n"
+                f"Forfeit vote\n"
                 f"React ✅ to forfeit and close the room, ❎ to cancel "
                 f"(auto-close in {VOTE_TIMEOUT_FORFEIT}s)"
             )
@@ -1899,63 +1899,76 @@ class Matchmaking(commands.Cog):
             except Exception:
                 pass
 
-            # Solo votan los jugadores que están en la sala *en este momento*
-            allowed_voters = {m.id for m in players}
-            total_voters = len(allowed_voters)
-            votes_yes = 0
-            votes_no = 0
-            voted: set[int] = set()
+            # Esperamos el timeout completo y luego calculamos TODO al final,
+            # para respetar a quienes se fueron del hilo durante la votación.
+            await asyncio.sleep(float(VOTE_TIMEOUT_FORFEIT))
 
-            def check(reaction: discord.Reaction, user: discord.User):
-                return (
-                    reaction.message.id == poll_msg.id
-                    and not user.bot
-                    and user.id in allowed_voters
-                    and str(reaction.emoji) in ("✅", "❎")
+            # Refrescamos el mensaje para asegurar tener las reacciones finales
+            try:
+                poll_msg = await ch.fetch_message(poll_msg.id)
+            except discord.NotFound:
+                # Si el mensaje desapareció, cancelamos silenciosamente
+                return
+
+            thread: discord.Thread = ch  # para type hint
+
+            # Jugadores ACTIVOS al cierre de la votación:
+            # - tienen que estar en room["players"]
+            # - y seguir en el hilo (thread.members)
+            active_players = {
+                m.id
+                for m in thread.members
+                if (not m.bot and any(m is p for p in room.get("players", [])))
+            }
+
+            if not active_players:
+                await ch.send(
+                    "There are no active players left in this room. Forfeit vote canceled."
                 )
+                return
 
-            deadline = asyncio.get_event_loop().time() + float(VOTE_TIMEOUT_FORFEIT)
+            yes_voters: set[int] = set()
+            no_voters: set[int] = set()
 
-            # Recolectamos reacciones hasta que:
-            #  - voten todos (y vemos el resultado), o
-            #  - se acabe el tiempo de 15s
-            while True:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
-
-                try:
-                    reaction, user = await self.bot.wait_for(
-                        "reaction_add",
-                        timeout=remaining,
-                        check=check
-                    )
-                except asyncio.TimeoutError:
-                    break
-
-                # Un voto por usuario
-                if user.id in voted:
+            # Recorremos las reacciones y contamos votos SOLO de jugadores activos
+            for reaction in poll_msg.reactions:
+                emoji_str = str(reaction.emoji)
+                if emoji_str not in ("✅", "❎"):
                     continue
 
-                voted.add(user.id)
-                if str(reaction.emoji) == "✅":
-                    votes_yes += 1
-                else:
-                    votes_no += 1
+                async for user in reaction.users():
+                    if user.bot:
+                        continue
+                    if user.id not in active_players:
+                        continue
 
-                # Si ya votaron todos, terminamos antes de tiempo
-                if len(voted) == total_voters:
-                    break
+                    if emoji_str == "✅":
+                        yes_voters.add(user.id)
+                    else:
+                        no_voters.add(user.id)
 
-            # Condición de cierre:
-            #  - todos los jugadores actuales votaron
-            #  - y TODOS fueron ✅
-            if len(voted) == total_voters and votes_yes == total_voters and votes_no == 0:
-                # Cerrar sala por forfeit
+            # Si alguien puso ambas reacciones, lo limpiamos (no cuenta ningún voto)
+            conflicted = yes_voters & no_voters
+            if conflicted:
+                yes_voters -= conflicted
+                no_voters -= conflicted
+
+            total_active = len(active_players)
+            yes_count = len(yes_voters)
+            no_count = len(no_voters)
+
+            # Mayoría estricta sobre los que QUEDAN en el hilo
+            # (ej. 3 activos → se necesitan 2 ó más ✅)
+            threshold = total_active // 2 + 1
+
+            if yes_count >= threshold:
+                # Forfeit aceptado por mayoría
                 try:
                     await poll_msg.edit(
-                        content=f"🛑 Forfeit accepted — closing room "
-                                f"(✅ {votes_yes} / ❎ {votes_no}, {len(voted)}/{total_voters} voted)"
+                        content=(
+                            f"🛑 Forfeit accepted — closing room "
+                            f"(✅ {yes_count} / ❎ {no_count}, {total_active} active players)"
+                        )
                     )
                 except Exception:
                     pass
@@ -1963,7 +1976,9 @@ class Matchmaking(commands.Cog):
                 room["finished"] = True
                 room["closed"] = True
 
-                await ch.send("Room forfeited by all current players. Closing room...")
+                await ch.send(
+                    "Room forfeited by majority of the players that remain in this thread. Closing room..."
+                )
 
                 # Notificar a otros cogs y cerrar el hilo
                 rid = next(
@@ -1977,21 +1992,23 @@ class Matchmaking(commands.Cog):
                 asyncio.create_task(self.close_room(ch, delay=5, delete=True))
 
             else:
-                # No hubo unanimidad de ✅ dentro de los 15s → no se cierra
+                # No se alcanzó la mayoría
                 try:
                     await poll_msg.edit(
                         content=(
-                            f"Forfeit canceled "
-                            f"(✅ {votes_yes} / ❎ {votes_no}, {len(voted)}/{total_voters} voted)"
+                            f"Forfeit vote did not pass "
+                            f"(✅ {yes_count} / ❎ {no_count}, {total_active} active players; "
+                            f"needed {threshold} ✅)"
                         )
                     )
                 except Exception:
                     pass
-                await ch.send("Forfeit vote did not pass. Room remains open.")
+                await ch.send("Forfeit vote failed. Room remains open.")
 
         finally:
             # Siempre liberar el flag de votación en curso
             room["vote_in_progress"] = False
+
 
 
     @commands.command(name="submit")
