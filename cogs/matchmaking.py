@@ -597,25 +597,20 @@ class Matchmaking(commands.Cog):
 
     async def _fetch_user_stats(self, user_id: int, season_id: int):
         """
-        Devuelve (pos, total, mmr, role, matches_played) para user_id en la season dada, o None si no existe.
+        Devuelve (pos, total, mmr, role) para user_id en la season dada, o None si no existe.
         """
         sql = """
         WITH ranked AS (
-        SELECT
+          SELECT
             sp.user_id,
             sp.mmr,
             sp.role,
-            sp.matches_played,
             RANK() OVER (ORDER BY sp.mmr DESC) AS pos
-        FROM seasonplayers sp
-        WHERE sp.season_id = $2
+          FROM seasonplayers sp
+          WHERE sp.season_id = $2
         )
-        SELECT
-            r.pos,
-            (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
-            r.mmr,
-            r.role,
-            COALESCE(r.matches_played, 0) AS matches_played
+        SELECT r.pos, (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
+               r.mmr, r.role
         FROM ranked r
         WHERE r.user_id = $1
         """
@@ -623,14 +618,7 @@ class Matchmaking(commands.Cog):
             row = await conn.fetchrow(sql, user_id, season_id)
         if not row:
             return None
-        return (
-            int(row["pos"]),
-            int(row["total"]),
-            int(row["mmr"]),
-            row["role"],
-            int(row["matches_played"]),
-        )
-
+        return int(row["pos"]), int(row["total"]), int(row["mmr"]), row["role"]
 
     async def _fetch_cutoff(self, season_id: int, rank_n: int) -> int:
         """
@@ -1603,14 +1591,13 @@ class Matchmaking(commands.Cog):
                 f"You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role, matches_played = data
+        pos, total, mmr, role = data
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {interaction.user.mention}\n"
             f"• **Position:** #{pos} of {total}\n"
             f"• **MMR:** {mmr}\n"
-            f"• **Rank:** {role}\n"
-            f"• **Matches played:** {matches_played}"
+            f"• **Rank:** {role}"
         )
         await interaction.response.send_message(msg)
 
@@ -1636,14 +1623,13 @@ class Matchmaking(commands.Cog):
                 f"{user.mention} You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role, matches_played = data
+        pos, total, mmr, role = data
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {user.mention}\n"
             f"• **Position:** #{pos} of {total}\n"
             f"• **MMR:** {mmr}\n"
-            f"• **Rank:** {role}\n"
-            f"• **Matches played:** {matches_played}"
+            f"• **Rank:** {role}"
         )
         await interaction.response.send_message(msg)
 
@@ -2253,39 +2239,27 @@ class Matchmaking(commands.Cog):
                 season_row  = await self.get_current_season()
                 season_id   = season_row["id"]
 
-                # Asegura la tabla con constraint único + matches_played
+                # Asegura la tabla con constraint único (solo una vez; puedes moverlo a cog_load si prefieres)
                 await self.db_pool.execute("""
                     CREATE TABLE IF NOT EXISTS seasonplayers (
-                        season_id       INTEGER NOT NULL,
-                        user_id         BIGINT  NOT NULL,
-                        mmr             INTEGER NOT NULL DEFAULT 0,
-                        role            TEXT    NOT NULL DEFAULT 'Placement',
-                        matches_played  INTEGER NOT NULL DEFAULT 0,
+                        season_id   INTEGER NOT NULL,
+                        user_id     BIGINT  NOT NULL,
+                        mmr         INTEGER NOT NULL DEFAULT 0,
+                        role        TEXT    NOT NULL DEFAULT 'Placement',
                         PRIMARY KEY (season_id, user_id)
                     );
                 """)
 
-                # Por si la tabla ya existía sin la nueva columna
-                await self.db_pool.execute("""
-                    ALTER TABLE seasonplayers
-                    ADD COLUMN IF NOT EXISTS matches_played INTEGER NOT NULL DEFAULT 0;
-                """)
-
-
                 # UPSERT por temporada
                 await self.db_pool.execute(
                     """
-                    INSERT INTO seasonplayers (season_id, user_id, mmr, role, matches_played)
-                    VALUES ($1, $2, $3, $4, 1)
+                    INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (season_id, user_id)
-                    DO UPDATE SET
-                        mmr = EXCLUDED.mmr,
-                        role = EXCLUDED.role,
-                        matches_played = seasonplayers.matches_played + 1
+                    DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
                     """,
                     season_id, p["member"].id, mmr_final, role_name
                 )
-
 
                 # Actualización de roles en Discord
                 role_id = RANK_ROLE_IDS.get(role_name)
