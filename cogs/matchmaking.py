@@ -1603,8 +1603,6 @@ class Matchmaking(commands.Cog):
                 f"You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role = data
-        msg = (
         pos, total, mmr, role, matches_played = data
         msg = (
             f"**Stats — Season {season_name}**\n"
@@ -1638,8 +1636,6 @@ class Matchmaking(commands.Cog):
                 f"{user.mention} You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role, matches_played = data
-        msg = (
         pos, total, mmr, role, matches_played = data
         msg = (
             f"**Stats — Season {season_name}**\n"
