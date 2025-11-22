@@ -535,26 +535,18 @@ class Matchmaking(commands.Cog):
         )
 
         lines = []
-        for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final, was_placement in summary_rows:
+        for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
             # Convierte 'pe', 'jp', 'us' finales → 🇵🇪 🇯🇵 🇺🇸
             safe_name = flagify_iso2_suffix(name_with_flag)
 
             pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
-
-            if was_placement:
-                # PLACEMENT(mmr_inicial) +X = Y
-                mmr_display = f"PLACEMENT({mmr_prev}) {mmr_delta:+3d} = {mmr_final}"
-            else:
-                mmr_display = f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
-
             lines.append(
                 f"{str(pos):<{W_POS}}| "
                 f"{safe_name:<{W_PLAYER}}| "
                 f"{pggbm:<{W_PGGBM}}| "
                 f"{pts:>{W_POINTS}}| "
-                f"{mmr_display}"
+                f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
             )
-
 
 
         body = "\n".join(lines) if lines else "(sin filas)"
@@ -926,32 +918,6 @@ class Matchmaking(commands.Cog):
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
 
-            # NEW: tabla de settings globales (para el contador de results)
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS global_settings (
-                    key   TEXT PRIMARY KEY,
-                    value BIGINT NOT NULL
-                );
-                """
-            )
-
-            # NEW: tabla de resultados, indexados por un ID global que NO se resetea
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS results (
-                    result_id   BIGINT PRIMARY KEY,
-                    season_id   INTEGER NOT NULL,
-                    season_name TEXT    NOT NULL,
-                    channel_id  BIGINT  NOT NULL,
-                    message_id  BIGINT  NOT NULL,
-                    gap_low     INTEGER,
-                    gap_high    INTEGER,
-                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                );
-                """
-            )
-
             # Canciones (catálogo global). Si ya existe, no re-crea.
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS songs (
@@ -1240,11 +1206,6 @@ class Matchmaking(commands.Cog):
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
 
-        # NEW: guardar también el gap de niveles y total de notas en la sala
-        room_info["total_notes"] = total_notes
-        room_info["gap_low"]     = low
-        room_info["gap_high"]    = high
-
         song_lines = "\n".join(
             f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
             for i, (title, lvl, diff, notes) in enumerate(picks, start=1)
@@ -1418,9 +1379,6 @@ class Matchmaking(commands.Cog):
         # — 6.2) Sumar total de notas y guardar en la sala —
         total_notes               = sum(song[3] for song in picks)
         room_entry["total_notes"] = total_notes
-        # NEW: guardar también el gap de niveles usado en esta partida
-        room_entry["gap_low"]  = lo
-        room_entry["gap_high"] = hi
 
         # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas —
         song_lines = "\n".join(
@@ -1643,62 +1601,6 @@ class Matchmaking(commands.Cog):
         )
         await interaction.response.send_message(msg)
 
-    @app_commands.command(
-        name="searchresult",
-        description="Show a past results table by its global ID"
-    )
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(result_id="Result ID shown under the season name in the results embed")
-    async def searchresult(self, interaction: discord.Interaction, result_id: int):
-        # Buscar el result en la tabla
-        async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT result_id, season_name, channel_id, message_id, gap_low, gap_high, created_at
-                FROM results
-                WHERE result_id = $1
-                """,
-                result_id
-            )
-
-        if not row:
-            return await interaction.response.send_message(
-                f"⚠️ No result found with ID `{result_id}`.",
-                ephemeral=True
-            )
-
-        channel = await self._resolve_channel(row["channel_id"], fallback=interaction.channel)
-        try:
-            msg = await channel.fetch_message(row["message_id"])
-        except discord.NotFound:
-            return await interaction.response.send_message(
-                "⚠️ The original result message could not be found (maybe deleted).",
-                ephemeral=True
-            )
-        except discord.Forbidden:
-            return await interaction.response.send_message(
-                "⚠️ I don't have permissions to view the channel of that result.",
-                ephemeral=True
-            )
-
-        content = (
-            f"Result **#{row['result_id']}** — **{row['season_name']}**\n"
-            f"[Jump to original message]({msg.jump_url})"
-        )
-
-        if msg.embeds:
-            await interaction.response.send_message(
-                content,
-                embed=msg.embeds[0],
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                content,
-                ephemeral=True
-            )
-
-
     @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(user="Player", season="Season: Current, AlphaSeason or Beta")
@@ -1888,31 +1790,6 @@ class Matchmaking(commands.Cog):
                 for i, (title, level, diff) in enumerate(songs[:5])
             )
         )
-
-    # NEW: contador global de resultados (0,1,2,3,...) que NO se resetea por season
-    async def _next_result_id(self) -> int:
-        async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT value FROM global_settings WHERE key = 'last_result_id'"
-            )
-            if not row:
-                next_id = 0
-                await conn.execute(
-                    """
-                    INSERT INTO global_settings(key, value)
-                    VALUES ('last_result_id', $1)
-                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-                    """,
-                    next_id
-                )
-            else:
-                next_id = int(row["value"]) + 1
-                await conn.execute(
-                    "UPDATE global_settings SET value = $1 WHERE key = 'last_result_id'",
-                    next_id
-                )
-        return next_id
-
 
     @staticmethod
     def placement_seed_from_stats(stats) -> tuple[int, str]:
@@ -2333,8 +2210,6 @@ class Matchmaking(commands.Cog):
                     "old": old,
                     "role": current_role,
                     "display_flag": display_flag,  # ← usamos esto al imprimir resultados
-                    "was_placement": (current_role == "Placement"),
-                    "seed_mmr": None,
                 })
 
 
@@ -2342,15 +2217,10 @@ class Matchmaking(commands.Cog):
             for p in players_list:
                 if p["role"] == "Placement":
                     seed_mmr, seed_rank = self.placement_seed_from_stats(p["stats"])
-                    p["mmr_actual"]     = seed_mmr
-                    p["seed_rank"]      = seed_rank
-                    p["was_placement"]  = True
-                    p["seed_mmr"]       = seed_mmr
+                    p["mmr_actual"] = seed_mmr
+                    p["seed_rank"]  = seed_rank
                 else:
-                    p["mmr_actual"]     = p["old"]
-                    p["was_placement"]  = False
-                    p["seed_mmr"]       = None
-
+                    p["mmr_actual"] = p["old"]
 
 
             # Fase 2: Elo por pares con K fijo
@@ -2417,6 +2287,7 @@ class Matchmaking(commands.Cog):
 
                 # ← medalla / posición: usa 🥇🥈🥉 para top3 y número para el resto
                 pos_str = medals.get(idx) or f"{idx}."
+
                 name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append((
                     pos_str,
@@ -2425,61 +2296,27 @@ class Matchmaking(commands.Cog):
                     p["stats"],
                     mmr_prev,
                     mmr_delta,
-                    mmr_final,
-                    p["was_placement"]   # ✅ extra field
+                    mmr_final
                 ))
 
 
             # Publicar resultados en canal de resultados y en el hilo (como board)
             season_row    = await self.get_current_season()
             season_name   = season_row["name"] if season_row else "N/A"
-            join_parent   = ctx.channel.parent
+            join_parent = ctx.channel.parent
             result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-            result_chan   = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
-
-            # NEW: gap guardado en la sala (solo niveles)
-            gap_low  = room.get("gap_low")
-            gap_high = room.get("gap_high")
-
-            # NEW: obtener ID global del result (0,1,2,... sin reset por season)
-            result_id = await self._next_result_id()
+            result_chan = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
 
             board_block = self._format_results_board(summary)
-
-            # Línea que va DEBAJO del nombre de la season, con ID y gap a la derecha
-            gap_text = ""
-            if gap_low is not None and gap_high is not None:
-                gap_text = f" · Lv {gap_low}–{gap_high}"
-
-            header_line = f"ID: {result_id}{gap_text}"
-
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
-                description=header_line + "\n" + board_block,
+                description=board_block,
                 color=0x00f7ff
             )
-
-            # Enviar al canal de results y guardar mensaje para /searchresult
-            msg_result = await result_chan.send(embed=embed)
+            await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
-
-            # NEW: guardar el result en la tabla results
-            await self.db_pool.execute(
-                """
-                INSERT INTO results (result_id, season_id, season_name, channel_id, message_id, gap_low, gap_high)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
-                """,
-                result_id,
-                season_row["id"] if season_row else 0,
-                season_name,
-                msg_result.channel.id,
-                msg_result.id,
-                gap_low,
-                gap_high,
-            )
-
 
 
             # Bloquear futuros submit en esta sala y permitir /c en otra
