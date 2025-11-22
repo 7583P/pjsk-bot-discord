@@ -1119,14 +1119,24 @@ class Matchmaking(commands.Cog):
         thread  = room_info["thread"]
         players = room_info["players"]
 
-        # — 1) Cuenta cuántos jugadores hay de cada rango —
-        counts = { rank: 0 for rank in BRACKET_RANGES }
+        counts = {rank: 0 for rank in BRACKET_RANGES}
         for m in players:
-            user_rank = next(
+            # 1) Intentar detectar rango por rol
+            rank_by_role = next(
                 (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
-                "Placement"
+                None
             )
-            counts[user_rank] += 1
+
+            if rank_by_role is not None:
+                # Si tiene un rol de rango, usamos ese (Placement solo si tiene el rol)
+                user_rank = rank_by_role
+            else:
+                # 2) Sin rol de rango → usar rango según MMR (NO se considera Placement)
+                mmr_val, _ = await self.fetch_player(m.id)
+                user_rank = get_rank_from_mmr(mmr_val)
+
+            counts[user_rank] = counts.get(user_rank, 0) + 1
+
 
         # — 2) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
         if counts.get("Placement", 0) > 0:
@@ -1270,13 +1280,21 @@ class Matchmaking(commands.Cog):
             )
 
         # — 4) Cuenta cuántos jugadores hay de cada rango —
-        counts = { rank: 0 for rank in BRACKET_RANGES }
+        counts = {rank: 0 for rank in BRACKET_RANGES}
         for m in players:
-            user_rank = next(
+            rank_by_role = next(
                 (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
-                "Placement"
+                None
             )
-            counts[user_rank] += 1
+
+            if rank_by_role is not None:
+                user_rank = rank_by_role
+            else:
+                mmr_val, _ = await self.fetch_player(m.id)
+                user_rank = get_rank_from_mmr(mmr_val)
+
+            counts[user_rank] = counts.get(user_rank, 0) + 1
+
 
         # — 5) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
         if counts.get("Placement", 0) > 0:
@@ -1912,14 +1930,20 @@ class Matchmaking(commands.Cog):
 
             thread: discord.Thread = ch  # para type hint
 
+            # IDs de los jugadores que están registrados en la sala
+            room_player_ids = {p.id for p in room.get("players", [])}
+
             # Jugadores ACTIVOS al cierre de la votación:
-            # - tienen que estar en room["players"]
-            # - y seguir en el hilo (thread.members)
-            active_players = {
-                m.id
-                for m in thread.members
-                if (not m.bot and any(m is p for p in room.get("players", [])))
-            }
+            # - Tienen que seguir en el hilo (thread.members)
+            # - y deben estar en room["players"]
+            active_players: set[int] = set()
+            for tm in thread.members:
+                # thread.members devuelve ThreadMember → obtenemos el User/Member real
+                user = getattr(tm, "user", None) or tm
+                if getattr(user, "bot", False):
+                    continue
+                if user.id in room_player_ids:
+                    active_players.add(user.id)
 
             if not active_players:
                 await ch.send(
