@@ -1369,114 +1369,55 @@ class Matchmaking(commands.Cog):
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
-        # — 1) Guardia: sólo #join o sus hilos —
-        is_join_chan   = ch.id in ALLOWED_JOIN_CHANNELS
-        is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
-        if not (is_join_chan or is_join_thread):
+        # Solo funciona dentro de un hilo cuyo padre sea un #join permitido
+        if not (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS):
             return await interaction.response.send_message(
                 "This command only works in rooms",
                 ephemeral=True
             )
 
-        # — 2) Determinar canal padre y lista de players —
-        if is_join_thread:
-            join_chan = ch.parent
-            room_entry = next(
-                (r for r in self.rooms.values() if r["thread"].id == ch.id),
-                None
+        thread = ch
+
+        # Buscar la sala asociada a este hilo
+        room_entry = next(
+            (r for r in self.rooms.values() if r["thread"].id == thread.id),
+            None
+        )
+        if not room_entry:
+            return await interaction.response.send_message(
+                "⚠️ No encuentro la sala asociada a este hilo.",
+                ephemeral=True
             )
-            if not room_entry:
-                return await interaction.response.send_message(
-                    "⚠️ No encuentro la sala asociada a este hilo.",
-                    ephemeral=True
-                )
 
-            # ⛔ Ya se inició en esta sala
-            if room_entry.get("started"):
-                return await interaction.response.send_message("songs has been selected", ephemeral=True)
+        # Ya se inició en esta sala
+        if room_entry.get("started"):
+            return await interaction.response.send_message(
+                "songs has been selected",
+                ephemeral=True
+            )
 
-            players = room_entry["players"]
+        # Jugadores actuales (sin bots)
+        players = [m for m in room_entry["players"] if not m.bot]
 
-        else:
-            join_chan = ch
-            players   = [m for m in join_chan.members if not m.bot]
-
-        # — 3) Validar 2–5 jugadores —
+        # Validar 3–5 jugadores
         if not (3 <= len(players) <= 5):
             return await interaction.response.send_message(
                 "Room must have between 3-5 players",
                 ephemeral=True
             )
 
-        # — 4) Cuenta cuántos jugadores hay de cada rango —
-        counts = {rank: 0 for rank in BRACKET_RANGES}
-        for m in players:
-            rank_by_role = next(
-                (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
-                None
-            )
+        # Aseguramos que room_entry["players"] coincide con la lista filtrada
+        room_entry["players"] = players
 
-            if rank_by_role is not None:
-                user_rank = rank_by_role
-            else:
-                mmr_val, _ = await self.fetch_player(m.id)
-                user_rank = get_rank_from_mmr(mmr_val)
+        # Reutiliza TODA la lógica de selección de canciones aquí
+        await self.launch_song_poll(room_entry)
 
-            counts[user_rank] = counts.get(user_rank, 0) + 1
+        # Confirmación efímera al invocador
+        await interaction.response.send_message(
+            f"✅ Votación iniciada en {thread.mention}",
+            ephemeral=True
+        )
 
-
-        # — 5) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
-        if counts.get("Placement", 0) > 0:
-            picks = await self._pick_placement_songs_levels_24_to_28()
-            lo, hi = 24, 28  # Mostrar explícitamente el rango especial
-        else:
-            # a) gap base para non-append
-            base_lo, base_hi = lo, hi
-            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
-
-            # b) gap SOLO para append (si aplica), basado en MMR promedio del room
-            append_lo_hi = None
-            append_limit = 0
-            if "append" in allowed_diffs:
-                room_rank = await self._get_room_rank_by_avg_mmr(players)
-                append_lo_hi = APPEND_RANGES.get(room_rank)
-                append_limit = get_append_pool_limit_for_rank(room_rank)
-                prob        = get_append_probability_for_rank(room_rank)
-
-                if not append_lo_hi or append_limit <= 0 or random.random() >= prob:
-                    append_lo_hi = None
-                    append_limit = 0
-
-            # c) si el rango de append se sale del base, expandir base
-            if append_lo_hi is not None and append_limit > 0:
-                alo, ahi = append_lo_hi
-                base_lo = min(base_lo, alo)
-                base_hi = max(base_hi, ahi)
-
-            pool = []
-
-            # d) Non-append en gap base (posiblemente expandido)
-            if non_append_diffs:
-                non_append_pool = await self._get_random_songs(
-                    base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
-                )
-                pool.extend(non_append_pool)
-                taken_titles = {t for (t, *_ ) in non_append_pool}
-            else:
-                taken_titles = set()
-
-            # e) Append en su rango dentro del base expandido
-            if append_lo_hi is not None and append_limit > 0:
-                alo, ahi = append_lo_hi
-                append_pool = await self._get_random_songs(
-                    alo, ahi, ("append",), limit=append_limit, exclude_titles=taken_titles
-                )
-                pool.extend(append_pool)
-
-            random.shuffle(pool)
-            picks = pool[:5]
-            # (IMPORTANTE) mantener el rango mostrado = gap base final
-            lo, hi = base_lo, base_hi
 
 
 
