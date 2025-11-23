@@ -800,6 +800,50 @@ class Matchmaking(commands.Cog):
                     pass
             self._closing_threads.discard(thread.id)
 
+    async def _fetch_cutoff(self, season_id: int, top_n: int) -> int | None:
+        """
+        Devuelve el MMR del jugador en la posición `top_n` (T10, T20, etc.)
+        para la temporada indicada. Si no hay suficientes jugadores devuelve None.
+        """
+        assert top_n >= 1
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT mmr
+                FROM seasonplayers
+                WHERE season_id = $1
+                ORDER BY mmr DESC
+                OFFSET $2
+                LIMIT 1
+                """,
+                season_id,
+                top_n - 1,          # OFFSET es 0-based
+            )
+
+        return int(row["mmr"]) if row else None
+
+
+    def _format_cutoffs_board(self, season_name: str, data: dict[int, int | None]) -> str:
+        """
+        data: {10: mmr_T10, 20: mmr_T20, ...}
+        Devuelve un string listo para enviar en Discord con formato tipo tabla.
+        """
+        lines: list[str] = []
+        lines.append(f"MMR cutoffs — Season {season_name}")
+        lines.append("```")
+        lines.append("Tier | Players |  MMR")
+        lines.append("-----+---------+------")
+
+        # Ordenar T10, T20, T30, ...
+        for n in sorted(data.keys()):
+            mmr = data[n]
+            tier_label = f"T{n}"
+            mmr_str = str(mmr) if mmr is not None else "N/A"
+            lines.append(f"{tier_label:<4}| {n:>7} | {mmr_str:>6}")
+
+        lines.append("```")
+        return "\n".join(lines)
 
 
 
@@ -1418,43 +1462,6 @@ class Matchmaking(commands.Cog):
             ephemeral=True
         )
 
-
-
-
-        # — 6.2) Sumar total de notas y guardar en la sala —
-        total_notes               = sum(song[3] for song in picks)
-        room_entry["total_notes"] = total_notes
-        # NEW: guardar también el gap de niveles usado en esta partida
-        room_entry["gap_low"]  = lo
-        room_entry["gap_high"] = hi
-
-        # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas —
-        song_lines = "\n".join(
-            f"{i+1}. **{t}** (Lv {lvl} {df}) [{nts} notas]"
-            for i,(t,lvl,df,nts) in enumerate(picks)
-        )
-        await thread.send(
-            f"Selected songs (Lv {lo}–{hi}) "
-            f"(Total {total_notes} notes) 🎶\n{song_lines}"
-        )
-
-        # ——— MARCAR INICIO + TIMESTAMP ———
-        room_entry["started"] = True
-        room_entry["closed"]  = True
-        self.inactivity.pop(thread.id, None)
-        room_entry.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
-        room_entry.setdefault("started_ts", room_entry["started_at"])  # ← para #rooms
-
-        # refrescar tablero y #rooms
-        rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
-        if rid is not None:
-            await self.update_room_board(interaction.guild, rid)
-            self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
-
-        # — 9) Confirmación efímera al invocador —
-        await interaction.response.send_message(
-            f"✅ Votación iniciada en {thread.mention}", ephemeral=True
-        )
 
     async def get_current_season(self) -> asyncpg.Record | None:
         """
@@ -2425,7 +2432,7 @@ class Matchmaking(commands.Cog):
                     mmr_prev,
                     mmr_final,
                     mmr_delta,
-                    idx == 1,  # True si quedó 1º, False en otro caso
+                    mmr_delta >= 0,  # ✅ Win si gana MMR o queda en 0
                 )
 
 
