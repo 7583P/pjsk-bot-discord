@@ -66,7 +66,18 @@ def flagify_iso2_suffix(text: str) -> str:
     return t[:m.start(1)] + country_flag(m.group(1).upper())
 
 # ————— Append: solo limita el rango de selección para canciones 'append' —————
-APPEND_RANKS_ORDER = ["Legend", "Grand Champion", "Champion", "Master ⬆", "Master" "Crystal ⬆", "Crystal" "Diamond ⬆", "Diamond"]
+APPEND_RANKS_ORDER = [
+    "Legend",
+    "Grand Champion",
+    "Champion",
+    "Master ⬆",
+    "Master",
+    "Crystal ⬆",
+    "Crystal",
+    "Diamond ⬆",
+    "Diamond",
+]
+
 
 APPEND_RANGES = {
     "Diamond":        (24, 27),
@@ -399,6 +410,22 @@ class Matchmaking(commands.Cog):
             out = [max(-cap, min(cap, d)) for d in out]
         return out
     
+    async def _get_room_rank_by_avg_mmr(self, players: list[discord.Member]) -> str:
+        """
+        Usa el MMR promedio del room para mapearlo a un rango con get_rank_from_mmr.
+        """
+        if not players:
+            return "Diamond"  # fallback neutro
+
+        mmrs = []
+        for m in players:
+            mmr_val, _ = await self.fetch_player(m.id)
+            mmrs.append(mmr_val)
+
+        avg_mmr = round(sum(mmrs) / len(mmrs)) if mmrs else 0
+        return get_rank_from_mmr(avg_mmr)
+
+    
     async def _get_random_songs(self, low: int, high: int, diffs: tuple[str, ...], limit: int, exclude_titles: set[str] | None = None):
         """
         Devuelve hasta 'limit' canciones aleatorias (title, level, diff_capitalized, notes) en [low, high] y diffs dadas.
@@ -535,18 +562,26 @@ class Matchmaking(commands.Cog):
         )
 
         lines = []
-        for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final in summary_rows:
+        for pos, name_with_flag, pts, stats, mmr_prev, mmr_delta, mmr_final, was_placement in summary_rows:
             # Convierte 'pe', 'jp', 'us' finales → 🇵🇪 🇯🇵 🇺🇸
             safe_name = flagify_iso2_suffix(name_with_flag)
 
             pggbm = f"({stats[0]},{stats[1]},{stats[2]},{stats[3]},{stats[4]})"
+
+            if was_placement:
+                # PLACEMENT(mmr_inicial) +X = Y
+                mmr_display = f"PLACEMENT({mmr_prev}) {mmr_delta:+3d} = {mmr_final}"
+            else:
+                mmr_display = f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
+
             lines.append(
                 f"{str(pos):<{W_POS}}| "
                 f"{safe_name:<{W_PLAYER}}| "
                 f"{pggbm:<{W_PGGBM}}| "
                 f"{pts:>{W_POINTS}}| "
-                f"{mmr_prev:>4} {mmr_delta:+3d} = {mmr_final:<4}"
+                f"{mmr_display}"
             )
+
 
 
         body = "\n".join(lines) if lines else "(sin filas)"
@@ -597,7 +632,13 @@ class Matchmaking(commands.Cog):
 
     async def _fetch_user_stats(self, user_id: int, season_id: int):
         """
-        Devuelve (pos, total, mmr, role) para user_id en la season dada, o None si no existe.
+        Devuelve un dict con:
+        - pos, total, mmr, role             (de seasonplayers)
+        - matches_played                    (COUNT(*) de match_history)
+        - last10_wins, last10_losses        (W-L Last 10)
+        - last10_mmr_delta                  (suma de mmr_delta en las últimas 10 partidas)
+        - peak_mmr                          (máximo mmr_after de la season)
+        Todo filtrado por season_id, así sirve para cualquier season.
         """
         sql = """
         WITH ranked AS (
@@ -609,47 +650,73 @@ class Matchmaking(commands.Cog):
           FROM seasonplayers sp
           WHERE sp.season_id = $2
         )
-        SELECT r.pos, (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
-               r.mmr, r.role
+        SELECT r.pos,
+               (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
+               r.mmr,
+               r.role
         FROM ranked r
         WHERE r.user_id = $1
         """
+
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(sql, user_id, season_id)
-        if not row:
-            return None
-        return int(row["pos"]), int(row["total"]), int(row["mmr"]), row["role"]
+            if not row:
+                return None
 
-    async def _fetch_cutoff(self, season_id: int, rank_n: int) -> int:
-        """
-        Devuelve el MMR del puesto N (rank_n) en la season dada.
-        Si no existe ese puesto, devuelve 0.
-        """
-        sql = """
-            SELECT sp.mmr
-            FROM seasonplayers sp
-            WHERE sp.season_id = $1
-            ORDER BY sp.mmr DESC
-            OFFSET $2 LIMIT 1
-        """
-        async with self.db_pool.acquire() as conn:
-            val = await conn.fetchval(sql, season_id, max(0, rank_n - 1))
-        return int(val) if val is not None else 0
+            pos   = int(row["pos"])
+            total = int(row["total"])
+            mmr   = int(row["mmr"])
+            role  = row["role"]
 
-    def _format_cutoffs_board(self, season_name: str, data: dict[int, int]) -> str:
-        """
-        data: {10:mmr, 20:mmr, 30:mmr, 40:mmr, 50:mmr, 100:mmr}
-        Devuelve el board monoespaciado.
-        """
-        header = f"CUTOFFS — Season {season_name}"
-        colh   = "Tier |   MMR"
-        sep    = "-----+-------"
-        lines  = []
-        for n in (10, 20, 30, 40, 50, 100):
-            mmr = data.get(n, 0)
-            lines.append(f"T{n:<3}| {mmr:>6}")
-        body = "\n".join(lines) if lines else "(sin datos)"
-        return "```\n" + header + "\n" + colh + "\n" + sep + "\n" + body + "\n```"
+            # Total de partidas jugadas en la season
+            matches_played = await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM match_history
+                WHERE season_id = $1 AND user_id = $2
+                """,
+                season_id, user_id
+            ) or 0
+
+            # Últimas 10 partidas (o menos si no hay tantas)
+            recent_rows = await conn.fetch(
+                """
+                SELECT is_win, mmr_delta
+                FROM match_history
+                WHERE season_id = $1 AND user_id = $2
+                ORDER BY played_at DESC, id DESC
+                LIMIT 10
+                """,
+                season_id, user_id
+            )
+
+            last10_wins   = sum(1 for r in recent_rows if r["is_win"])
+            last10_losses = sum(1 for r in recent_rows if not r["is_win"])
+            last10_delta  = sum(int(r["mmr_delta"]) for r in recent_rows) if recent_rows else 0
+
+            # Peak MMR dentro de la season (máximo mmr_after)
+            peak_mmr = await conn.fetchval(
+                """
+                SELECT MAX(mmr_after)
+                FROM match_history
+                WHERE season_id = $1 AND user_id = $2
+                """,
+                season_id, user_id
+            )
+            if peak_mmr is None:
+                peak_mmr = mmr  # si no tiene histórico, usamos el MMR actual
+
+        return {
+            "pos": pos,
+            "total": total,
+            "mmr": mmr,
+            "role": role,
+            "matches_played": matches_played,
+            "last10_wins": last10_wins,
+            "last10_losses": last10_losses,
+            "last10_mmr_delta": last10_delta,
+            "peak_mmr": int(peak_mmr),
+        }
 
 
 
@@ -733,6 +800,50 @@ class Matchmaking(commands.Cog):
                     pass
             self._closing_threads.discard(thread.id)
 
+    async def _fetch_cutoff(self, season_id: int, top_n: int) -> int | None:
+        """
+        Devuelve el MMR del jugador en la posición `top_n` (T10, T20, etc.)
+        para la temporada indicada. Si no hay suficientes jugadores devuelve None.
+        """
+        assert top_n >= 1
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT mmr
+                FROM seasonplayers
+                WHERE season_id = $1
+                ORDER BY mmr DESC
+                OFFSET $2
+                LIMIT 1
+                """,
+                season_id,
+                top_n - 1,          # OFFSET es 0-based
+            )
+
+        return int(row["mmr"]) if row else None
+
+
+    def _format_cutoffs_board(self, season_name: str, data: dict[int, int | None]) -> str:
+        """
+        data: {10: mmr_T10, 20: mmr_T20, ...}
+        Devuelve un string listo para enviar en Discord con formato tipo tabla.
+        """
+        lines: list[str] = []
+        lines.append(f"MMR cutoffs — Season {season_name}")
+        lines.append("```")
+        lines.append("Tier | Players |  MMR")
+        lines.append("-----+---------+------")
+
+        # Ordenar T10, T20, T30, ...
+        for n in sorted(data.keys()):
+            mmr = data[n]
+            tier_label = f"T{n}"
+            mmr_str = str(mmr) if mmr is not None else "N/A"
+            lines.append(f"{tier_label:<4}| {n:>7} | {mmr_str:>6}")
+
+        lines.append("```")
+        return "\n".join(lines)
 
 
 
@@ -917,6 +1028,71 @@ class Matchmaking(commands.Cog):
             await conn.execute(
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
+
+            # NEW: tabla de settings globales (para el contador de results)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS global_settings (
+                    key   TEXT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                """
+            )
+
+            # NEW: tabla de resultados, indexados por un ID global que NO se resetea
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS results (
+                    result_id   BIGINT PRIMARY KEY,
+                    season_id   INTEGER NOT NULL,
+                    season_name TEXT    NOT NULL,
+                    channel_id  BIGINT  NOT NULL,
+                    message_id  BIGINT  NOT NULL,
+                    gap_low     INTEGER,
+                    gap_high    INTEGER,
+                    room_mmr    INTEGER,               -- NEW
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+
+            # Historial de partidas por jugador y temporada
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS match_history (
+                    id            BIGSERIAL PRIMARY KEY,
+                    season_id     INTEGER       NOT NULL,
+                    result_id     BIGINT,             -- NEW: id global del result
+                    user_id       BIGINT        NOT NULL,
+                    pos           INTEGER,            -- NEW: posición en el result
+                    s_perfect     INTEGER,            -- NEW: P
+                    s_great       INTEGER,            -- NEW: G
+                    s_good        INTEGER,            -- NEW: G2
+                    s_bad         INTEGER,            -- NEW: B
+                    s_miss        INTEGER,            -- NEW: M
+                    mmr_before    INTEGER       NOT NULL,
+                    mmr_after     INTEGER       NOT NULL,
+                    mmr_delta     INTEGER       NOT NULL,
+                    was_placement BOOLEAN       NOT NULL DEFAULT false,
+                    is_win        BOOLEAN       NOT NULL,
+                    played_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+                );
+            """)
+
+            # Por si ya existía tabla vieja:
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS result_id BIGINT;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS pos INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS s_perfect INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS s_great INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS s_good INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS s_bad INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS s_miss INTEGER;")
+            await conn.execute("ALTER TABLE match_history ADD COLUMN IF NOT EXISTS was_placement BOOLEAN DEFAULT false;")
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_match_history_user_season
+                ON match_history (user_id, season_id, played_at DESC);
+            """)
+
 
             # Canciones (catálogo global). Si ya existe, no re-crea.
             await conn.execute("""
@@ -1159,26 +1335,35 @@ class Matchmaking(commands.Cog):
             picks = await self._pick_placement_songs_levels_24_to_28()
             low, high = 24, 28
         else:
-            # a) Mantener el gap base para non-append
+            # a) gap base para non-append
             base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Determinar (opcional) el gap SOLO para append, pero con probabilidad por rango
+            # b) Determinar (opcional) el gap de append usando el RANGO DEL ROOM
             append_lo_hi = None
             append_limit = 0
             if "append" in allowed_diffs:
-                hr = _highest_high_rank(counts)  # Diamond..Legend más alto presente
-                if hr is not None:
-                    prob = get_append_probability_for_rank(hr)
-                    # Tirada de probabilidad: solo si pasa el check metemos append al pool
-                    if random.random() < prob:
-                        append_lo_hi = APPEND_RANGES[hr]
-                        append_limit = get_append_pool_limit_for_rank(hr)
+                # 🔥 usar rango según MMR promedio del room, NO el más alto
+                room_rank = await self._get_room_rank_by_avg_mmr(players)
+                append_lo_hi = APPEND_RANGES.get(room_rank)
+                append_limit = get_append_pool_limit_for_rank(room_rank)
+                prob        = get_append_probability_for_rank(room_rank)
 
-            # c) Traer canciones por tipo de diff
+                # si no hay rango o la tirada de prob falla → no usar append
+                if not append_lo_hi or append_limit <= 0 or random.random() >= prob:
+                    append_lo_hi = None
+                    append_limit = 0
+
+            # c) si vamos a usar append y su rango sale del base, EXPANDIR el base
+            if append_lo_hi is not None and append_limit > 0:
+                alo, ahi = append_lo_hi
+                base_lo = min(base_lo, alo)
+                base_hi = max(base_hi, ahi)
+
+            # d) Traer canciones por tipo de diff
             pool = []
 
-            # Non-append (Expert/Master) en gap base → siempre hasta 10
+            # Non-append (hard/expert/master) en gap base (posiblemente expandido)
             if non_append_diffs:
                 non_append_pool = await self._get_random_songs(
                     base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
@@ -1188,7 +1373,7 @@ class Matchmaking(commands.Cog):
             else:
                 taken_titles = set()
 
-            # Append en su gap especial → según rango alto
+            # Append en su rango propio (que ahora está contenido dentro del base expandido)
             if append_lo_hi is not None and append_limit > 0:
                 alo, ahi = append_lo_hi
                 append_pool = await self._get_random_songs(
@@ -1196,15 +1381,22 @@ class Matchmaking(commands.Cog):
                 )
                 pool.extend(append_pool)
 
-            # d) Barajar y tomar 5
+            # e) Mezclar y tomar 5
             random.shuffle(pool)
             picks = pool[:5]
-            # (IMPORTANTE) Mantener el rango mostrado = gap base
+
+            # f) El rango mostrado es SIEMPRE el base final (ya expandido)
             low, high = base_lo, base_hi
+
 
 
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
+
+        # NEW: guardar también el gap de niveles y total de notas en la sala
+        room_info["total_notes"] = total_notes
+        room_info["gap_low"]     = low
+        room_info["gap_high"]    = high
 
         song_lines = "\n".join(
             f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
@@ -1240,173 +1432,55 @@ class Matchmaking(commands.Cog):
     async def start(self, interaction: discord.Interaction):
         ch = interaction.channel
 
-        # — 1) Guardia: sólo #join o sus hilos —
-        is_join_chan   = ch.id in ALLOWED_JOIN_CHANNELS
-        is_join_thread = isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS
-        if not (is_join_chan or is_join_thread):
+        # Solo funciona dentro de un hilo cuyo padre sea un #join permitido
+        if not (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS):
             return await interaction.response.send_message(
                 "This command only works in rooms",
                 ephemeral=True
             )
 
-        # — 2) Determinar canal padre y lista de players —
-        if is_join_thread:
-            join_chan = ch.parent
-            room_entry = next(
-                (r for r in self.rooms.values() if r["thread"].id == ch.id),
-                None
+        thread = ch
+
+        # Buscar la sala asociada a este hilo
+        room_entry = next(
+            (r for r in self.rooms.values() if r["thread"].id == thread.id),
+            None
+        )
+        if not room_entry:
+            return await interaction.response.send_message(
+                "⚠️ No encuentro la sala asociada a este hilo.",
+                ephemeral=True
             )
-            if not room_entry:
-                return await interaction.response.send_message(
-                    "⚠️ No encuentro la sala asociada a este hilo.",
-                    ephemeral=True
-                )
 
-            # ⛔ Ya se inició en esta sala
-            if room_entry.get("started"):
-                return await interaction.response.send_message("songs has been selected", ephemeral=True)
+        # Ya se inició en esta sala
+        if room_entry.get("started"):
+            return await interaction.response.send_message(
+                "songs has been selected",
+                ephemeral=True
+            )
 
-            players = room_entry["players"]
+        # Jugadores actuales (sin bots)
+        players = [m for m in room_entry["players"] if not m.bot]
 
-        else:
-            join_chan = ch
-            players   = [m for m in join_chan.members if not m.bot]
-
-        # — 3) Validar 2–5 jugadores —
+        # Validar 3–5 jugadores
         if not (3 <= len(players) <= 5):
             return await interaction.response.send_message(
                 "Room must have between 3-5 players",
                 ephemeral=True
             )
 
-        # — 4) Cuenta cuántos jugadores hay de cada rango —
-        counts = {rank: 0 for rank in BRACKET_RANGES}
-        for m in players:
-            rank_by_role = next(
-                (r for r in BRACKET_RANGES if discord.utils.get(m.roles, name=r)),
-                None
-            )
+        # Aseguramos que room_entry["players"] coincide con la lista filtrada
+        room_entry["players"] = players
 
-            if rank_by_role is not None:
-                user_rank = rank_by_role
-            else:
-                mmr_val, _ = await self.fetch_player(m.id)
-                user_rank = get_rank_from_mmr(mmr_val)
+        # Reutiliza TODA la lógica de selección de canciones aquí
+        await self.launch_song_poll(room_entry)
 
-            counts[user_rank] = counts.get(user_rank, 0) + 1
-
-
-        # — 5) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
-        if counts.get("Placement", 0) > 0:
-            lo, hi = BRACKET_RANGES["Placement"]  # (25, 28)
-        else:
-            lo, hi = dynamic_range(counts)
-
-
-        # — 8) Envía la vista en el hilo correspondiente —
-        if is_join_thread:
-            thread = ch
-        else:
-            join_chan = ch
-            players   = [m for m in join_chan.members if not m.bot]
-            thread = await join_chan.create_thread(
-                name=f"Sala {len(self.rooms)+1} ({lo}–{hi}★)",
-                auto_archive_duration=60,
-                type=discord.ChannelType.public_thread
-            )
-            new_id = max(self.rooms.keys(), default=0) + 1
-            self.rooms[new_id] = {
-                "players": players.copy(),
-                "thread": thread,
-                "category_id": join_chan.category_id or 0,
-                "closed": True,               # ← ya cerrada para que /c no meta más
-            }
-            room_entry = self.rooms[new_id]   # ← IMPORTANTE
-
-        # — 6) Filtrar diffs según el rango (lo, hi) —
-        allowed_diffs = DIFFICULTY_PRIORITY
-        for rank, (rlo, rhi) in BRACKET_RANGES.items():
-            if rlo == lo and rhi == hi:
-                allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
-                break
-
-        if counts.get("Placement", 0) > 0:
-            picks = await self._pick_placement_songs_levels_24_to_28()
-            lo, hi = 24, 28  # Mostrar explícitamente el rango especial
-        else:
-            # a) gap base para Expert/Master
-            base_lo, base_hi = lo, hi
-            non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
-
-            # b) gap SOLO para append (si aplica), con probabilidad por rango
-            append_lo_hi = None
-            append_limit = 0
-            if "append" in allowed_diffs:
-                hr = _highest_high_rank(counts)
-                if hr is not None:
-                    prob = get_append_probability_for_rank(hr)
-                    if random.random() < prob:
-                        append_lo_hi = APPEND_RANGES[hr]
-                        append_limit = get_append_pool_limit_for_rank(hr)
-
-            pool = []
-
-            # c) Non-append (Expert/Master) en gap base → siempre hasta 10
-            if non_append_diffs:
-                non_append_pool = await self._get_random_songs(
-                    base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
-                )
-                pool.extend(non_append_pool)
-                taken_titles = {t for (t, *_ ) in non_append_pool}
-            else:
-                taken_titles = set()
-
-            # d) Append en su gap especial → según rango alto
-            if append_lo_hi is not None and append_limit > 0:
-                alo, ahi = append_lo_hi
-                append_pool = await self._get_random_songs(
-                    alo, ahi, ("append",), limit=append_limit, exclude_titles=taken_titles
-                )
-                pool.extend(append_pool)
-
-            random.shuffle(pool)
-            picks = pool[:5]
-            # (IMPORTANTE) mantener el rango mostrado = gap base
-            lo, hi = base_lo, base_hi
-
-
-
-        # — 6.2) Sumar total de notas y guardar en la sala —
-        total_notes               = sum(song[3] for song in picks)
-        room_entry["total_notes"] = total_notes
-
-        # — 7) Enviar UN SOLO mensaje con rango, diffs y total de notas —
-        song_lines = "\n".join(
-            f"{i+1}. **{t}** (Lv {lvl} {df}) [{nts} notas]"
-            for i,(t,lvl,df,nts) in enumerate(picks)
-        )
-        await thread.send(
-            f"Selected songs (Lv {lo}–{hi}) "
-            f"(Total {total_notes} notes) 🎶\n{song_lines}"
-        )
-
-        # ——— MARCAR INICIO + TIMESTAMP ———
-        room_entry["started"] = True
-        room_entry["closed"]  = True
-        self.inactivity.pop(thread.id, None)
-        room_entry.setdefault("started_at", int(datetime.datetime.utcnow().timestamp()))
-        room_entry.setdefault("started_ts", room_entry["started_at"])  # ← para #rooms
-
-        # refrescar tablero y #rooms
-        rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None)
-        if rid is not None:
-            await self.update_room_board(interaction.guild, rid)
-            self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
-
-        # — 9) Confirmación efímera al invocador —
+        # Confirmación efímera al invocador
         await interaction.response.send_message(
-            f"✅ Votación iniciada en {thread.mention}", ephemeral=True
+            f"✅ Votación iniciada en {thread.mention}",
+            ephemeral=True
         )
+
 
     async def get_current_season(self) -> asyncpg.Record | None:
         """
@@ -1591,15 +1665,78 @@ class Matchmaking(commands.Cog):
                 f"You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role = data
+        mmr_delta_last10 = data["last10_mmr_delta"]
+        mmr_delta_str = f"{mmr_delta_last10:+d}"
+
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {interaction.user.mention}\n"
-            f"• **Position:** #{pos} of {total}\n"
-            f"• **MMR:** {mmr}\n"
-            f"• **Rank:** {role}"
+            f"• **Position:** #{data['pos']} of {data['total']}\n"
+            f"• **MMR:** {data['mmr']}\n"
+            f"• **Rank:** {data['role']}\n"
+            f"• **Matches Played:** {data['matches_played']}\n"
+            f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
+            f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
+            f"• **Peak MMR:** {data['peak_mmr']}\n"
         )
         await interaction.response.send_message(msg)
+
+
+    @app_commands.command(
+        name="searchresult",
+        description="Show a past results table by its global ID"
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(result_id="Result ID shown under the season name in the results embed")
+    async def searchresult(self, interaction: discord.Interaction, result_id: int):
+        # Buscar el result en la tabla
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT result_id, season_name, channel_id, message_id, gap_low, gap_high, created_at
+                FROM results
+                WHERE result_id = $1
+                """,
+                result_id
+            )
+
+        if not row:
+            return await interaction.response.send_message(
+                f"⚠️ No result found with ID `{result_id}`.",
+                ephemeral=True
+            )
+
+        channel = await self._resolve_channel(row["channel_id"], fallback=interaction.channel)
+        try:
+            msg = await channel.fetch_message(row["message_id"])
+        except discord.NotFound:
+            return await interaction.response.send_message(
+                "⚠️ The original result message could not be found (maybe deleted).",
+                ephemeral=True
+            )
+        except discord.Forbidden:
+            return await interaction.response.send_message(
+                "⚠️ I don't have permissions to view the channel of that result.",
+                ephemeral=True
+            )
+
+        content = (
+            f"Result **#{row['result_id']}** — **{row['season_name']}**\n"
+            f"[Jump to original message]({msg.jump_url})"
+        )
+
+        if msg.embeds:
+            await interaction.response.send_message(
+                content,
+                embed=msg.embeds[0],
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                content,
+                ephemeral=True
+            )
+
 
     @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
@@ -1623,15 +1760,22 @@ class Matchmaking(commands.Cog):
                 f"{user.mention} You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
-        pos, total, mmr, role = data
+        mmr_delta_last10 = data["last10_mmr_delta"]
+        mmr_delta_str = f"{mmr_delta_last10:+d}"
+
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {user.mention}\n"
-            f"• **Position:** #{pos} of {total}\n"
-            f"• **MMR:** {mmr}\n"
-            f"• **Rank:** {role}"
+            f"• **Position:** #{data['pos']} of {data['total']}\n"
+            f"• **MMR:** {data['mmr']}\n"
+            f"• **Rank:** {data['role']}\n"
+            f"• **Matches Played:** {data['matches_played']}\n"
+            f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
+            f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
+            f"• **Peak MMR:** {data['peak_mmr']}\n"
         )
         await interaction.response.send_message(msg)
+
 
     @app_commands.command(
         name="cutoffs",
@@ -1790,6 +1934,31 @@ class Matchmaking(commands.Cog):
                 for i, (title, level, diff) in enumerate(songs[:5])
             )
         )
+
+    # NEW: contador global de resultados (0,1,2,3,...) que NO se resetea por season
+    async def _next_result_id(self) -> int:
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT value FROM global_settings WHERE key = 'last_result_id'"
+            )
+            if not row:
+                next_id = 0
+                await conn.execute(
+                    """
+                    INSERT INTO global_settings(key, value)
+                    VALUES ('last_result_id', $1)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+                    """,
+                    next_id
+                )
+            else:
+                next_id = int(row["value"]) + 1
+                await conn.execute(
+                    "UPDATE global_settings SET value = $1 WHERE key = 'last_result_id'",
+                    next_id
+                )
+        return next_id
+
 
     @staticmethod
     def placement_seed_from_stats(stats) -> tuple[int, str]:
@@ -2176,6 +2345,10 @@ class Matchmaking(commands.Cog):
             # ==============================
             medals  = {1:"🥇",2:"🥈",3:"🥉"}
 
+            # New: obtenemos el ID global del result ANTES de procesar jugadores
+            result_id = await self._next_result_id()
+
+
             # 1) Mapear datos por user_id
             by_id = {}
             for ln in lines:
@@ -2210,6 +2383,8 @@ class Matchmaking(commands.Cog):
                     "old": old,
                     "role": current_role,
                     "display_flag": display_flag,  # ← usamos esto al imprimir resultados
+                    "was_placement": (current_role == "Placement"),
+                    "seed_mmr": None,
                 })
 
 
@@ -2217,10 +2392,15 @@ class Matchmaking(commands.Cog):
             for p in players_list:
                 if p["role"] == "Placement":
                     seed_mmr, seed_rank = self.placement_seed_from_stats(p["stats"])
-                    p["mmr_actual"] = seed_mmr
-                    p["seed_rank"]  = seed_rank
+                    p["mmr_actual"]     = seed_mmr
+                    p["seed_rank"]      = seed_rank
+                    p["was_placement"]  = True
+                    p["seed_mmr"]       = seed_mmr
                 else:
-                    p["mmr_actual"] = p["old"]
+                    p["mmr_actual"]     = p["old"]
+                    p["was_placement"]  = False
+                    p["seed_mmr"]       = None
+
 
 
             # Fase 2: Elo por pares con K fijo
@@ -2238,6 +2418,9 @@ class Matchmaking(commands.Cog):
 
                 season_row  = await self.get_current_season()
                 season_id   = season_row["id"]
+
+                stats = p["stats"]  # [P,G,G2,B,M]
+                s_p, s_g, s_g2, s_b, s_m = stats
 
                 # Asegura la tabla con constraint único (solo una vez; puedes moverlo a cog_load si prefieres)
                 await self.db_pool.execute("""
@@ -2259,6 +2442,50 @@ class Matchmaking(commands.Cog):
                     DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
                     """,
                     season_id, p["member"].id, mmr_final, role_name
+                )
+
+                # NEW: registrar esta partida en el histórico (match_history)
+                # Definimos "win" = quedar 1º en los resultados
+                await self.db_pool.execute(
+                    """
+                    INSERT INTO match_history (
+                        season_id, user_id, mmr_before, mmr_after, mmr_delta, is_win
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    season_id,
+                    p["member"].id,
+                    mmr_prev,
+                    mmr_final,
+                    mmr_delta,
+                    mmr_delta >= 0,  # ✅ Win si gana MMR o queda en 0
+                )
+
+                # NEW: registrar esta partida en histórica con result_id + stats + posición
+                await self.db_pool.execute(
+                    """
+                    INSERT INTO match_history (
+                        season_id,
+                        result_id,
+                        user_id,
+                        pos,
+                        s_perfect, s_great, s_good, s_bad, s_miss,
+                        mmr_before, mmr_after, mmr_delta,
+                        was_placement,
+                        is_win
+                    )
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    """,
+                    season_id,
+                    result_id,
+                    p["member"].id,
+                    idx,
+                    s_p, s_g, s_g2, s_b, s_m,
+                    mmr_prev,
+                    mmr_final,
+                    mmr_delta,
+                    p["was_placement"],
+                    mmr_delta >= 0,
                 )
 
                 # Actualización de roles en Discord
@@ -2287,7 +2514,6 @@ class Matchmaking(commands.Cog):
 
                 # ← medalla / posición: usa 🥇🥈🥉 para top3 y número para el resto
                 pos_str = medals.get(idx) or f"{idx}."
-
                 name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append((
                     pos_str,
@@ -2296,27 +2522,64 @@ class Matchmaking(commands.Cog):
                     p["stats"],
                     mmr_prev,
                     mmr_delta,
-                    mmr_final
+                    mmr_final,
+                    p["was_placement"]   # ✅ extra field
                 ))
 
 
             # Publicar resultados en canal de resultados y en el hilo (como board)
             season_row    = await self.get_current_season()
             season_name   = season_row["name"] if season_row else "N/A"
-            join_parent = ctx.channel.parent
+            join_parent   = ctx.channel.parent
             result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-            result_chan = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
+            result_chan   = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
+
+            # NEW: gap guardado en la sala (solo niveles)
+            gap_low  = room.get("gap_low")
+            gap_high = room.get("gap_high")
+
 
             board_block = self._format_results_board(summary)
+
+            # Línea que va DEBAJO del nombre de la season, con ID y gap a la derecha
+            gap_text = ""
+            if gap_low is not None and gap_high is not None:
+                gap_text = f" · Lv {gap_low}–{gap_high}"
+
+            header_line = f"ID: {result_id}{gap_text}"
+
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
-                description=board_block,
+                description=header_line + "\n" + board_block,
                 color=0x00f7ff
             )
-            await result_chan.send(embed=embed)
+
+            # Enviar al canal de results y guardar mensaje para /searchresult
+            msg_result = await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
+
+            room_mmr = None
+            if players_list:
+                room_mmr = round(sum(p["mmr_actual"] for p in players_list) / len(players_list))
+
+            # NEW: guardar el result en la tabla results
+            await self.db_pool.execute(
+                """
+                INSERT INTO results (result_id, season_id, season_name, channel_id, message_id, gap_low, gap_high)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """,
+                result_id,
+                season_row["id"] if season_row else 0,
+                season_name,
+                msg_result.channel.id,
+                msg_result.id,
+                gap_low,
+                gap_high,
+                room_mmr,
+            )
+
 
 
             # Bloquear futuros submit en esta sala y permitir /c en otra
@@ -2342,4 +2605,4 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
- #ed2
+ #ed
