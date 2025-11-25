@@ -2381,11 +2381,13 @@ class Matchmaking(commands.Cog):
                     "stats": stats,
                     "total": total_points,
                     "old": old,
+                    "mmr_actual": old,         # ✅ valor por defecto: su MMR actual
                     "role": current_role,
-                    "display_flag": display_flag,  # ← usamos esto al imprimir resultados
+                    "display_flag": display_flag,
                     "was_placement": (current_role == "Placement"),
                     "seed_mmr": None,
                 })
+
 
 
             # Fase 1: bonus de Placement
