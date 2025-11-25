@@ -66,9 +66,9 @@ SP_HAS_WINS: bool          = False
 SP_HAS_LOSSES: bool        = False
 SP_HAS_GAMES_PLAYED: bool  = False
 
-# matches / matchplayers
+# matches / match_history
 HAS_MATCHES_TABLE: bool        = False
-HAS_MATCHPLAYERS_TABLE: bool   = False
+HAS_MATCHPLAYERS_TABLE: bool   = False  # legacy, no se usa ya
 
 # Tipo SQL efectivo del user_id ("text" o "bigint")
 USER_ID_SQLTYPE: str = "text"   # default seguro
@@ -115,13 +115,12 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         SP_HAS_GAMES_PLAYED = await _has_col(conn, "seasonplayers", "games_played") \
                               or await _has_col(conn, "seasonplayers", "games")
 
-        # matches / matchplayers (si no existen, no consultamos esas tablas)
-        # Usar la tabla que realmente llena el bot (match_history)
+        # matches / match_history
         HAS_MATCHES_TABLE      = await _has_col(conn, "match_history", "season_id")
         HAS_MATCHPLAYERS_TABLE = False  # ya no la vamos a usar
 
         # Detectar tipo de user_id: si player_pfps existe usa su tipo; si no, usa el de players
-        pfps_type = await _col_type(conn, "player_pfps", "user_id")
+        pfps_type    = await _col_type(conn, "player_pfps", "user_id")
         players_type = await _col_type(conn, "players", "user_id")
         USER_ID_SQLTYPE = pfps_type or players_type or "text"
 
@@ -139,6 +138,21 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
             f" matchplayers_table={HAS_MATCHPLAYERS_TABLE}"
             f" | user_id_type={USER_ID_SQLTYPE}"
         )
+    except Exception:
+        traceback.print_exc()
+
+async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
+    """
+    Re-detecta match_history en caliente.
+    Arregla el caso donde el bot crea la tabla después de que el backend ya arrancó.
+    """
+    global HAS_MATCHES_TABLE
+    if HAS_MATCHES_TABLE:
+        return
+    try:
+        HAS_MATCHES_TABLE = await _has_col(conn, "match_history", "season_id")
+        if HAS_MATCHES_TABLE:
+            print("✅ match_history detected at runtime")
     except Exception:
         traceback.print_exc()
 
@@ -485,6 +499,12 @@ async def get_players(
     limit: int = Query(10000, ge=1, le=100000),
     offset: int = Query(0, ge=0),
 ):
+    """
+    Devuelve el leaderboard de players para una season.
+    Calcula:
+      - matchesPlayed desde match_history (si existe) o seasonplayers.games*
+      - last10Games / last10Wins / last10Losses / last10MmrDelta desde match_history
+    """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
@@ -494,6 +514,9 @@ async def get_players(
 
     try:
         async with db_pool.acquire() as conn:
+            # Re-detectar match_history si el bot la creó después del startup
+            await _ensure_matches_table(conn)
+
             picked = await _pick_effective_season(conn, season_id)
 
             select_cols = [
@@ -529,7 +552,7 @@ async def get_players(
             """
             rows = await conn.fetch(q, picked, limit, offset)
 
-            # NEW: contar partidas y W-L last 10 desde match_history
+            # Contar partidas y W-L / MMR last 10 desde match_history
             if HAS_MATCHES_TABLE and rows:
                 try:
                     uid_ints: List[int] = []
@@ -543,7 +566,7 @@ async def get_players(
                             continue
 
                     if uid_ints:
-                        # Total games per user en la season
+                        # Total games per user en la season (histórico completo)
                         stats_rows = await conn.fetch("""
                             SELECT user_id, COUNT(*) AS games_played
                             FROM public.match_history
@@ -692,18 +715,20 @@ async def get_matches(
 ):
     """
     Devuelve las partidas desde match_history, agrupadas por result_id (una entrada por match),
-    ordenadas de más vieja a más nueva.
+    ordenadas de más vieja a más nueva (para que el historial se lea cronológicamente).
     Si user_id está presente, solo devuelve matches donde participa ese jugador,
     pero cada match incluye a TODOS los jugadores en el campo players[].
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    if not HAS_MATCHES_TABLE:
-        # No existe match_history en este schema → devolvemos lista vacía
-        return []
-
     async with db_pool.acquire() as conn:
+        # Re-detectar match_history si todavía no lo conocíamos
+        await _ensure_matches_table(conn)
+        if not HAS_MATCHES_TABLE:
+            # No existe match_history en este schema → devolvemos lista vacía
+            return []
+
         try:
             picked = await _pick_effective_season(conn, season_id)
         except HTTPException:
@@ -824,7 +849,7 @@ async def get_matches(
             "s_miss": r["s_miss"],
             "sMiss": r["s_miss"],
         }
-        m["players"].append(player_entry)
+        matches_by_result[rid].setdefault("players", []).append(player_entry)
 
     # ---- 4) Calcular avg_mmr por match (room MMR) ----
     for m in matches_by_result.values():
