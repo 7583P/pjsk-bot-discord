@@ -2544,10 +2544,12 @@ class Matchmaking(commands.Cog):
             # Línea que va DEBAJO del nombre de la season, con ID y gap a la derecha
             gap_text = ""
             if gap_low is not None and gap_high is not None:
-                gap_text = f" · Lv {gap_low}–{gap_high}"
+                if room_mmr is not None:
+                    gap_text = f" · Lv {gap_low}-{gap_high} · Avg MMR {room_mmr}"
+                else:
+                    gap_text = f" · Lv {gap_low}-{gap_high}"
 
             header_line = f"ID: {result_id}{gap_text}"
-
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
                 description=header_line + "\n" + board_block,
@@ -2564,11 +2566,20 @@ class Matchmaking(commands.Cog):
             if players_list:
                 room_mmr = round(sum(p["mmr_actual"] for p in players_list) / len(players_list))
 
-            # NEW: guardar el result en la tabla results
+            # NEW! guardan el result en la tabla results
             await self.db_pool.execute(
                 """
-                INSERT INTO results (result_id, season_id, season_name, channel_id, message_id, gap_low, gap_high)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO results (
+                    result_id,
+                    season_id,
+                    season_name,
+                    channel_id,
+                    message_id,
+                    gap_low,
+                    gap_high,
+                    room_mmr
+                )
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 """,
                 result_id,
                 season_row["id"] if season_row else 0,
@@ -2579,6 +2590,7 @@ class Matchmaking(commands.Cog):
                 gap_high,
                 room_mmr,
             )
+
 
 
 
