@@ -273,9 +273,12 @@ async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
 def _valid_https_url(u: str) -> bool:
     try:
         p = urlparse(u)
-        if p.scheme != "https": return False
-        if not p.netloc: return False
-        if any(c.isspace() for c in u) or '"' in u or "'" in u: return False
+        if p.scheme != "https":
+            return False
+        if not p.netloc:
+            return False
+        if any(c.isspace() for c in u) or '"' in u or "'" in u:
+            return False
         return True
     except Exception:
         return False
@@ -283,13 +286,16 @@ def _valid_https_url(u: str) -> bool:
 def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
     if user_id:
         url = PFP_BY_ID.get(str(user_id))
-        if url: return url
+        if url:
+            return url
     if discord_id:
         url = PFP_BY_DISCORD.get(str(discord_id))
-        if url: return url
+        if url:
+            return url
     if name:
         url = PFP_BY_NAME.get((name or "").lower())
-        if url: return url
+        if url:
+            return url
     return None
 
 def _uid_for_sql(user_id_like: Optional[str]):
@@ -419,9 +425,12 @@ async def set_pfp(request: Request):
 
     # Borrado
     if url == "":
-        if user_id:    PFP_BY_ID.pop(user_id, None)
-        if discord_id: PFP_BY_DISCORD.pop(discord_id, None)
-        if name_lower: PFP_BY_NAME.pop(name_lower, None)
+        if user_id:
+            PFP_BY_ID.pop(user_id, None)
+        if discord_id:
+            PFP_BY_DISCORD.pop(discord_id, None)
+        if name_lower:
+            PFP_BY_NAME.pop(name_lower, None)
         if db_pool and user_id:
             async with db_pool.acquire() as conn:
                 await conn.execute(
@@ -440,9 +449,12 @@ async def set_pfp(request: Request):
         raise HTTPException(429, "pfp store is full")
 
     # Guardar en memoria
-    if user_id:    PFP_BY_ID[user_id] = url
-    if discord_id: PFP_BY_DISCORD[discord_id] = url
-    if name_lower: PFP_BY_NAME[name_lower] = url
+    if user_id:
+        PFP_BY_ID[user_id] = url
+    if discord_id:
+        PFP_BY_DISCORD[discord_id] = url
+    if name_lower:
+        PFP_BY_NAME[name_lower] = url
 
     # Persistir en BD (sin casts; parámetro con tipo correcto)
     if db_pool:
@@ -478,6 +490,7 @@ async def get_players(
 
     rows = []
     games_by_user: Dict[int, int] = {}
+    last10_by_user: Dict[int, Dict[str, int]] = {}
 
     try:
         async with db_pool.acquire() as conn:
@@ -516,7 +529,7 @@ async def get_players(
             """
             rows = await conn.fetch(q, picked, limit, offset)
 
-            # NEW: contar partidas desde match_history para cada user en la season
+            # NEW: contar partidas y W-L last 10 desde match_history
             if HAS_MATCHES_TABLE and rows:
                 try:
                     uid_ints: List[int] = []
@@ -530,6 +543,7 @@ async def get_players(
                             continue
 
                     if uid_ints:
+                        # Total games per user en la season
                         stats_rows = await conn.fetch("""
                             SELECT user_id, COUNT(*) AS games_played
                             FROM public.match_history
@@ -541,9 +555,47 @@ async def get_players(
                             int(sr["user_id"]): sr["games_played"]
                             for sr in stats_rows
                         }
+
+                        # W-L / MMR delta en las últimas 10 partidas por usuario
+                        last10_rows = await conn.fetch("""
+                            WITH ranked AS (
+                                SELECT
+                                    user_id,
+                                    is_win,
+                                    mmr_delta,
+                                    played_at,
+                                    id,
+                                    row_number() OVER (
+                                        PARTITION BY user_id
+                                        ORDER BY played_at DESC, id DESC
+                                    ) AS rn
+                                FROM public.match_history
+                                WHERE season_id = $1
+                                  AND user_id = ANY($2::bigint[])
+                            )
+                            SELECT
+                                user_id,
+                                COUNT(*) FILTER (WHERE rn <= 10) AS last10_games,
+                                COUNT(*) FILTER (WHERE rn <= 10 AND is_win = TRUE) AS last10_wins,
+                                COUNT(*) FILTER (WHERE rn <= 10 AND (is_win = FALSE OR is_win IS NULL)) AS last10_losses,
+                                COALESCE(SUM(mmr_delta) FILTER (WHERE rn <= 10), 0) AS last10_mmr_delta
+                            FROM ranked
+                            WHERE rn <= 10
+                            GROUP BY user_id
+                        """, picked, uid_ints)
+                        last10_by_user = {
+                            int(r["user_id"]): {
+                                "games": r["last10_games"],
+                                "wins": r["last10_wins"],
+                                "losses": r["last10_losses"],
+                                "mmr_delta": r["last10_mmr_delta"],
+                            }
+                            for r in last10_rows
+                        }
                 except Exception:
                     traceback.print_exc()
                     games_by_user = {}
+                    last10_by_user = {}
 
     except HTTPException:
         raise
@@ -590,6 +642,18 @@ async def get_players(
         elif SP_HAS_GAMES_PLAYED:
             games_played = r.get("games_played")
 
+        # W-L last 10 / mmrDelta last 10
+        last10_games = None
+        last10_wins = None
+        last10_losses = None
+        last10_mmr_delta = None
+        if uid_int is not None and uid_int in last10_by_user:
+            s = last10_by_user[uid_int]
+            last10_games = s.get("games")
+            last10_wins = s.get("wins")
+            last10_losses = s.get("losses")
+            last10_mmr_delta = s.get("mmr_delta")
+
         out.append({
             "id": user_id,
             "discordId": discord_id,
@@ -604,6 +668,11 @@ async def get_players(
             "gamesPlayed": games_played,
             "matchesPlayed": games_played,
             "matches": games_played,
+            # last 10 info
+            "last10Games": last10_games,
+            "last10Wins": last10_wins,
+            "last10Losses": last10_losses,
+            "last10MmrDelta": last10_mmr_delta,
         })
     return out
 
@@ -622,9 +691,10 @@ async def get_matches(
     offset: int = Query(0, ge=0),
 ):
     """
-    Devuelve las partidas desde match_history (una fila por jugador/partida),
+    Devuelve las partidas desde match_history, agrupadas por result_id (una entrada por match),
     ordenadas de más vieja a más nueva.
-    Si user_id está presente, solo devuelve las de ese jugador.
+    Si user_id está presente, solo devuelve matches donde participa ese jugador,
+    pero cada match incluye a TODOS los jugadores en el campo players[].
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
@@ -640,58 +710,147 @@ async def get_matches(
             # si no hay seasons, devolvemos [] para no romper el front
             return []
 
-        # Construir WHERE dinámico
-        params = [picked]
-        where_clauses = ["season_id = $1"]
+        # ---- 1) Determinar qué result_ids entran en esta página (limit/offset por match) ----
+        base_where = ["season_id = $1"]
+        params: List = [picked]
 
+        uid_int: Optional[int] = None
         if user_id is not None:
-            # match_history.user_id es BIGINT → casteamos
             if not user_id.isdigit():
                 raise HTTPException(400, "user_id debe ser numérico")
-            params.append(int(user_id))
-            where_clauses.append(f"user_id = ${len(params)}")
+            uid_int = int(user_id)
+            params.append(uid_int)
+            base_where.append(f"user_id = ${len(params)}")
 
-        # Añadimos limit y offset
         params.append(limit)
         params.append(offset)
         limit_idx  = len(params) - 1
         offset_idx = len(params)
 
-        sql = f"""
-            SELECT
-                id,
-                season_id,
-                result_id,
-                user_id,
-                pos,
-                s_perfect,
-                s_great,
-                s_good,
-                s_bad,
-                s_miss,
-                mmr_before,
-                mmr_after,
-                mmr_delta,
-                was_placement,
-                is_win,
-                played_at
+        sql_results = f"""
+            SELECT result_id,
+                   MIN(played_at) AS first_played_at
             FROM public.match_history
-            WHERE {' AND '.join(where_clauses)}
-            ORDER BY played_at ASC, id ASC
+            WHERE {' AND '.join(base_where)}
+            GROUP BY result_id
+            ORDER BY first_played_at ASC, result_id ASC
             LIMIT ${limit_idx} OFFSET ${offset_idx}
         """
 
-        rows = await conn.fetch(sql, *params)
+        res_rows = await conn.fetch(sql_results, *params)
+        if not res_rows:
+            return []
 
-    out = []
+        result_ids: List[int] = [
+            int(r["result_id"]) for r in res_rows if r["result_id"] is not None
+        ]
+        if not result_ids:
+            return []
+
+        # ---- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----
+        rows = await conn.fetch("""
+            SELECT
+                mh.id,
+                mh.season_id,
+                mh.result_id,
+                mh.user_id,
+                mh.pos,
+                mh.s_perfect,
+                mh.s_great,
+                mh.s_good,
+                mh.s_bad,
+                mh.s_miss,
+                mh.mmr_before,
+                mh.mmr_after,
+                mh.mmr_delta,
+                mh.was_placement,
+                mh.is_win,
+                mh.played_at,
+                p.name    AS player_name,
+                p.country AS player_country
+            FROM public.match_history mh
+            LEFT JOIN public.players p ON p.user_id = mh.user_id
+            WHERE mh.result_id = ANY($1::bigint[])
+            ORDER BY mh.played_at ASC, mh.result_id ASC, mh.pos ASC, mh.id ASC
+        """, result_ids)
+
+    # ---- 3) Agrupar en matches[result_id].players[] ----
+    matches_by_result: Dict[int, Dict] = {}
+
     for r in rows:
-        d = dict(r)
-        # Para mantener compat con el front, añadimos players vacíos
-        # (antes venía de matchplayers)
-        d["players"] = []
-        out.append(d)
+        rid = int(r["result_id"])
+        played_dt: Optional[datetime] = r["played_at"]
 
-    return out
+        m = matches_by_result.get(rid)
+        if not m:
+            m = {
+                "id": rid,
+                "season_id": r["season_id"],
+                "seasonId": r["season_id"],
+                "result_id": rid,
+                "resultId": rid,
+                "played_at": played_dt,
+                "playedAt": played_dt.isoformat() if played_dt else None,
+                "avg_mmr": None,
+                "avgMmr": None,
+                "players": [],
+            }
+            matches_by_result[rid] = m
+
+        player_entry = {
+            "user_id": r["user_id"],
+            "userId": r["user_id"],
+            "name": r["player_name"],
+            "country": r["player_country"],
+            "pos": r["pos"],
+            "mmr_before": r["mmr_before"],
+            "mmrBefore": r["mmr_before"],
+            "mmr_after": r["mmr_after"],
+            "mmrAfter": r["mmr_after"],
+            "mmr_delta": r["mmr_delta"],
+            "mmrDelta": r["mmr_delta"],
+            "is_win": r["is_win"],
+            "isWin": r["is_win"],
+            "was_placement": r["was_placement"],
+            "wasPlacement": r["was_placement"],
+            "s_perfect": r["s_perfect"],
+            "sPerfect": r["s_perfect"],
+            "s_great": r["s_great"],
+            "sGreat": r["s_great"],
+            "s_good": r["s_good"],
+            "sGood": r["s_good"],
+            "s_bad": r["s_bad"],
+            "sBad": r["s_bad"],
+            "s_miss": r["s_miss"],
+            "sMiss": r["s_miss"],
+        }
+        m["players"].append(player_entry)
+
+    # ---- 4) Calcular avg_mmr por match (room MMR) ----
+    for m in matches_by_result.values():
+        mmrs = [p["mmr_before"] for p in m["players"] if p["mmr_before"] is not None]
+        if mmrs:
+            avg = int(sum(mmrs) / len(mmrs))
+        else:
+            avg = None
+        m["avg_mmr"] = avg
+        m["avgMmr"] = avg
+
+    # ---- 5) Ordenar por played_at ASC (más viejas primero) ----
+    matches_list = list(matches_by_result.values())
+    matches_list.sort(
+        key=lambda x: (
+            x["played_at"] if isinstance(x["played_at"], datetime) else datetime.min,
+            x["id"],
+        )
+    )
+    # convertir played_at datetime -> iso string definitivo
+    for m in matches_list:
+        dt = m.get("played_at")
+        m["played_at"] = dt.isoformat() if isinstance(dt, datetime) else None
+        m["playedAt"] = m["played_at"]
+
+    return matches_list
 
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
@@ -736,21 +895,27 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
-            params2 = dict(params); params2.setdefault("origin", "*")
+            params2 = dict(params)
+            params2.setdefault("origin", "*")
             r = await client.get(url, params=params2, headers=headers, follow_redirects=True, timeout=30)
             if r.status_code in (403, 429):
-                await asyncio.sleep(1.2 + attempt * 0.6); continue
+                await asyncio.sleep(1.2 + attempt * 0.6)
+                continue
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == 4: raise
+            if attempt == 4:
+                raise
             await asyncio.sleep(0.8 + attempt * 0.5)
     return {}
 
 def _abs_sekaipedia(u: str) -> str:
-    if not u: return ""
-    if u.startswith("//"): return "https:" + u
-    if u.startswith("/"):  return "https://sekaipedia.org" + u
+    if not u:
+        return ""
+    if u.startswith("//"):
+        return "https:" + u
+    if u.startswith("/"):
+        return "https://sekaipedia.org" + u
     return u
 
 # =================== Persistencia: helpers BD (cartas / variantes) ===================
@@ -763,7 +928,8 @@ async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
     return [{"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]} for r in rows]
 
 async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> None:
-    if not items: return
+    if not items:
+        return
     await conn.executemany("""
         INSERT INTO public.sekaicards(page_id, name, href, thumb, updated_at)
         VALUES ($1, $2, $3, $4, now())
@@ -776,7 +942,8 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
 
 async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
     row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
-    if not row or not row["ts"]: return False
+    if not row or not row["ts"]:
+        return False
     # row["ts"] ya viene aware (timestamptz)
     return (datetime.now(timezone.utc) - row["ts"]) < CARDS_TTL
 
@@ -793,7 +960,8 @@ async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List
 
 async def _variants_db_save(conn: asyncpg.Connection, page_id: int, variants: List[Dict]) -> None:
     await conn.execute("DELETE FROM public.sekaicard_variants WHERE page_id=$1", page_id)
-    if not variants: return
+    if not variants:
+        return
     await conn.executemany("""
         INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
         VALUES ($1, $2, $3, now())
@@ -806,22 +974,30 @@ _BAD_KEYWORDS = [
     "profile","story","stamp","april","joke"
 ]
 def _filename_from_url(u: str) -> str:
-    try: return urlparse(u).path.rsplit("/", 1)[-1].lower()
-    except Exception: return u.lower()
+    try:
+        return urlparse(u).path.rsplit("/", 1)[-1].lower()
+    except Exception:
+        return u.lower()
 
 def _is_trained(fn: str) -> bool:
-    s = fn.lower(); return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+    s = fn.lower()
+    return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+
 def _is_untrained(fn: str) -> bool:
-    s = fn.lower(); return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
+    s = fn.lower()
+    return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
+
 def _looks_card_image(fn: str) -> bool:
-    if any(bad in fn for bad in _BAD_KEYWORDS): return False
+    if any(bad in fn for bad in _BAD_KEYWORDS):
+        return False
     return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
 def _prefer_square(links: List[str]) -> List[str]:
     seen, out = set(), []
     for u in links:
         if u and u not in seen:
-            seen.add(u); out.append(u)
+            seen.add(u)
+            out.append(u)
     return out
 
 def _page_title_from_href(href: str) -> str:
@@ -833,7 +1009,8 @@ def _page_title_from_href(href: str) -> str:
         return ""
 
 async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
-    if not page_title: return []
+    if not page_title:
+        return []
     data1 = await _get_json(client, SEKAIPEDIA_API, {
         "action":"query","prop":"images","titles":page_title,"imlimit":"500","format":"json"
     })
@@ -844,7 +1021,8 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
             t = it.get("title", "")
             if t.startswith("File:"):
                 file_titles.append(t)
-    if not file_titles: return []
+    if not file_titles:
+        return []
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i:i+50]
@@ -855,7 +1033,8 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
             for ii in (finfo.get("imageinfo") or []):
                 url = ii.get("thumburl") or ii.get("url")
-                if url: urls.append(_abs_sekaipedia(url))
+                if url:
+                    urls.append(_abs_sekaipedia(url))
         await _sleep_jitter(0.2, 0.5)
     return _prefer_square(urls)
 
@@ -864,13 +1043,19 @@ async def _scrape_card_variants(href: str) -> Dict:
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
     clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
-    trained_links: List[str] = []; untrained_links: List[str] = []
+    trained_links: List[str] = []
+    untrained_links: List[str] = []
     for u in clean_urls:
         fn = _filename_from_url(u)
-        if _is_trained(fn): trained_links.append(u)
-        elif _is_untrained(fn): untrained_links.append(u)
+        if _is_trained(fn):
+            trained_links.append(u)
+        elif _is_untrained(fn):
+            untrained_links.append(u)
     trained_url = trained_links[0] if trained_links else None
-    return {"name": page_title, "variants": ([] + ([{"label":"Trained","url":trained_url}] if trained_url else []))}
+    return {
+        "name": page_title,
+        "variants": ([] + ([{"label": "Trained", "url": trained_url}] if trained_url else []))
+    }
 
 # ---------- STUB: listado de cartas ----------
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
@@ -915,7 +1100,8 @@ async def auth02_cards():
                 if db_pool:
                     async with db_pool.acquire() as conn:
                         existing = await _cards_db_all(conn)
-                        if existing: return existing
+                        if existing:
+                            return existing
                 raise HTTPException(status_code=503, detail="Upstream unavailable or parse error")
 
             _cards_cache["items"] = items
@@ -933,7 +1119,8 @@ async def auth02_cards():
             if db_pool:
                 async with db_pool.acquire() as conn:
                     existing = await _cards_db_all(conn)
-                    if existing: return existing
+                    if existing:
+                        return existing
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
 # =================== API: /auth02/card-variants ===================
@@ -951,7 +1138,6 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                # ✅ AQUÍ EL ARREGLO: usar "and" en vez de "&&"
                 if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
@@ -982,5 +1168,3 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-
-
