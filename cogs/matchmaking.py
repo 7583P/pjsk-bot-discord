@@ -2401,6 +2401,23 @@ class Matchmaking(commands.Cog):
                     p["was_placement"]  = False
                     p["seed_mmr"]       = None
 
+            # 👇 AÑADE ESTO AQUÍ
+            room_mmr = None
+            if players_list:
+                # usamos mmr_actual (ya incluye el seed de placement)
+                room_mmr = round(
+                    sum(int(p.get("mmr_actual", p["old"])) for p in players_list) 
+                    / len(players_list)
+                )
+
+            # Fase 2: Elo por pares con K fijo
+            players_list.sort(key=lambda x: x["total"], reverse=True)
+
+            ratings = [int(p.get("mmr_actual", p["old"])) for p in players_list]
+            order   = list(range(len(players_list)))
+            deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
+
+
 
             # 2) Construir players_list (en el orden lógico de sala)
             players_list = []
@@ -2432,11 +2449,13 @@ class Matchmaking(commands.Cog):
 
 
 
-            # Fase 2: Elo por pares con K fijo
             players_list.sort(key=lambda x: x["total"], reverse=True)
-            ratings = [p["mmr_actual"] for p in players_list]
+
+            # usar mmr_actual si existe, si no, usar old como fallback
+            ratings = [int(p.get("mmr_actual", p["old"])) for p in players_list]
             order   = list(range(len(players_list)))
             deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
+
 
             summary = []
             for idx, p in enumerate(players_list, start=1):
