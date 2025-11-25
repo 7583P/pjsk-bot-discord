@@ -2402,6 +2402,35 @@ class Matchmaking(commands.Cog):
                     p["seed_mmr"]       = None
 
 
+            # 2) Construir players_list (en el orden lógico de sala)
+            players_list = []
+            for member in players:
+                uid = member.id
+                cc, stats = by_id[uid]
+                old, current_role = await self.fetch_player(uid)
+                ...
+                players_list.append({
+                    "member": member,
+                    "cc": cc,
+                    "stats": stats,
+                    "total": total_points,
+                    "old": old,
+                    "role": current_role,
+                    "display_flag": display_flag,
+                    "was_placement": (current_role == "Placement"),
+                    "seed_mmr": None,
+                })
+
+            # 🔹 PROMEDIO DE MMR DEL ROOM **ANTES** DEL CAMBIO DE MMR
+            room_mmr = None
+            if players_list:
+                room_mmr = round(sum(p["old"] for p in players_list) / len(players_list))
+
+            # Fase 1: bonus de Placement
+            for p in players_list:
+                ...
+
+
 
             # Fase 2: Elo por pares con K fijo
             players_list.sort(key=lambda x: x["total"], reverse=True)
@@ -2538,16 +2567,14 @@ class Matchmaking(commands.Cog):
             gap_low  = room.get("gap_low")
             gap_high = room.get("gap_high")
 
-
             board_block = self._format_results_board(summary)
 
-            # Línea que va DEBAJO del nombre de la season, con ID y gap a la derecha
+            # Línea que va DEBAJO del nombre de la season, con ID, gap y Avg MMR
             gap_text = ""
             if gap_low is not None and gap_high is not None:
+                gap_text = f" · Lv {gap_low}-{gap_high}"
                 if room_mmr is not None:
-                    gap_text = f" · Lv {gap_low}-{gap_high} · Avg MMR {room_mmr}"
-                else:
-                    gap_text = f" · Lv {gap_low}-{gap_high}"
+                    gap_text += f" · Avg MMR {room_mmr}"
 
             header_line = f"ID: {result_id}{gap_text}"
             embed = discord.Embed(
@@ -2556,15 +2583,13 @@ class Matchmaking(commands.Cog):
                 color=0x00f7ff
             )
 
+
             # Enviar al canal de results y guardar mensaje para /searchresult
             msg_result = await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
 
-            room_mmr = None
-            if players_list:
-                room_mmr = round(sum(p["mmr_actual"] for p in players_list) / len(players_list))
 
             # NEW! guardan el result en la tabla results
             await self.db_pool.execute(
@@ -2590,6 +2615,7 @@ class Matchmaking(commands.Cog):
                 gap_high,
                 room_mmr,
             )
+
 
 
 
