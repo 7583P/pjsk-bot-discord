@@ -73,6 +73,7 @@ HAS_MATCHPLAYERS_TABLE: bool   = False  # legacy, no se usa ya
 # Tipo SQL efectivo del user_id ("text" o "bigint")
 USER_ID_SQLTYPE: str = "text"   # default seguro
 
+
 async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
     row = await conn.fetchrow("""
         SELECT 1
@@ -80,6 +81,7 @@ async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
     """, table, column)
     return bool(row)
+
 
 async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Optional[str]:
     row = await conn.fetchrow("""
@@ -94,6 +96,7 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
     if "bigint" in dt or "int8" in dt:
         return "bigint"
     return "text"
+
 
 async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
@@ -141,6 +144,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
     except Exception:
         traceback.print_exc()
 
+
 async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
     """
     Re-detecta match_history en caliente.
@@ -155,6 +159,7 @@ async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
             print("✅ match_history detected at runtime")
     except Exception:
         traceback.print_exc()
+
 
 @app.on_event("startup")
 async def startup():
@@ -202,6 +207,7 @@ async def startup():
         END$$;
         """)
 
+
 @app.on_event("shutdown")
 async def shutdown():
     if db_pool:
@@ -212,6 +218,7 @@ async def shutdown():
 async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     row = await conn.fetchrow("SELECT 1 FROM public.seasons WHERE id=$1", season_id)
     return bool(row)
+
 
 async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: int) -> int:
     """
@@ -273,6 +280,7 @@ PFP_BY_DISCORD: Dict[str, str] = {}
 STATE_STORE: Dict[str, datetime] = {}
 STATE_TTL = timedelta(minutes=10)
 
+
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
     if not (db_pool and HAS_DISCORD_ID_COL and discord_id):
         return None
@@ -283,6 +291,7 @@ async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
         if row:
             return str(row["user_id"])
     return None
+
 
 def _valid_https_url(u: str) -> bool:
     try:
@@ -296,6 +305,7 @@ def _valid_https_url(u: str) -> bool:
         return True
     except Exception:
         return False
+
 
 def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
     if user_id:
@@ -312,6 +322,7 @@ def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], n
             return url
     return None
 
+
 def _uid_for_sql(user_id_like: Optional[str]):
     """
     Devuelve el parámetro listo para la query según el tipo de columna:
@@ -325,6 +336,7 @@ def _uid_for_sql(user_id_like: Optional[str]):
         return int(s)
     return s  # TEXT
 
+
 @app.get("/health")
 async def health():
     db_ok = False
@@ -336,6 +348,7 @@ async def health():
     except Exception:
         db_ok = False
     return {"ok": True, "tip": "auth02 up", "db": db_ok}
+
 
 @app.get("/auth02")
 async def auth02_start():
@@ -350,6 +363,7 @@ async def auth02_start():
     }
     q = str(httpx.QueryParams(params))
     return RedirectResponse(url=f"https://discord.com/oauth2/authorize?{q}")
+
 
 @app.get("/auth02/callback")
 async def auth02_callback(code: Optional[str] = None, state: Optional[str] = None):
@@ -393,6 +407,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
     set_session_cookie(resp, sid)
     return resp
 
+
 @app.get("/auth02/me")
 async def auth02_me(request: Request):
     sid = request.cookies.get(COOKIE_NAME)
@@ -402,6 +417,7 @@ async def auth02_me(request: Request):
     payload = dict(SESSIONS[sid])
     payload["resolvedUserId"] = await _resolve_user_id_from_discord(payload.get("id", ""))
     return payload
+
 
 @app.post("/auth02/logout")
 async def auth02_logout(request: Request):
@@ -414,6 +430,7 @@ async def auth02_logout(request: Request):
 
 # =================== /auth02/pfps ===================
 MAX_PFPS = 5000
+
 
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
@@ -488,6 +505,7 @@ async def set_pfp(request: Request):
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
+
 @app.get("/auth02/pfps")
 async def list_pfps():
     return JSONResponse({"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME})
@@ -509,8 +527,8 @@ async def get_players(
         raise HTTPException(500, "DB pool not initialized")
 
     rows = []
-    games_by_user: Dict[int, int] = {}
-    last10_by_user: Dict[int, Dict[str, int]] = {}
+    games_by_user: Dict[str, int] = {}
+    last10_by_user: Dict[str, Dict[str, int]] = {}
 
     try:
         async with db_pool.acquire() as conn:
@@ -555,27 +573,24 @@ async def get_players(
             # Contar partidas y W-L / MMR last 10 desde match_history
             if HAS_MATCHES_TABLE and rows:
                 try:
-                    uid_ints: List[int] = []
+                    uid_strs: List[str] = []
                     for rr in rows:
                         uid = rr.get("user_id")
                         if uid is None:
                             continue
-                        try:
-                            uid_ints.append(int(uid))
-                        except Exception:
-                            continue
+                        uid_strs.append(str(uid))
 
-                    if uid_ints:
+                    if uid_strs:
                         # Total games per user en la season (histórico completo)
                         stats_rows = await conn.fetch("""
                             SELECT user_id, COUNT(*) AS games_played
                             FROM public.match_history
                             WHERE season_id = $1
-                              AND user_id = ANY($2::bigint[])
+                              AND user_id::text = ANY($2::text[])
                             GROUP BY user_id
-                        """, picked, uid_ints)
+                        """, picked, uid_strs)
                         games_by_user = {
-                            int(sr["user_id"]): sr["games_played"]
+                            str(sr["user_id"]): sr["games_played"]
                             for sr in stats_rows
                         }
 
@@ -594,7 +609,7 @@ async def get_players(
                                     ) AS rn
                                 FROM public.match_history
                                 WHERE season_id = $1
-                                  AND user_id = ANY($2::bigint[])
+                                  AND user_id::text = ANY($2::text[])
                             )
                             SELECT
                                 user_id,
@@ -603,11 +618,10 @@ async def get_players(
                                 COUNT(*) FILTER (WHERE rn <= 10 AND (is_win = FALSE OR is_win IS NULL)) AS last10_losses,
                                 COALESCE(SUM(mmr_delta) FILTER (WHERE rn <= 10), 0) AS last10_mmr_delta
                             FROM ranked
-                            WHERE rn <= 10
                             GROUP BY user_id
-                        """, picked, uid_ints)
+                        """, picked, uid_strs)
                         last10_by_user = {
-                            int(r["user_id"]): {
+                            str(r["user_id"]): {
                                 "games": r["last10_games"],
                                 "wins": r["last10_wins"],
                                 "losses": r["last10_losses"],
@@ -629,6 +643,7 @@ async def get_players(
     out = []
     for r in rows:
         user_id    = r.get("user_id")
+        user_key   = str(user_id) if user_id is not None else None
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
         name       = r.get("name")
 
@@ -655,13 +670,8 @@ async def get_players(
 
         # Preferimos el conteo real desde match_history; si no, usamos la columna de seasonplayers (si existe)
         games_played = None
-        try:
-            uid_int = int(user_id) if user_id is not None else None
-        except Exception:
-            uid_int = None
-
-        if uid_int is not None and uid_int in games_by_user:
-            games_played = games_by_user[uid_int]
+        if user_key is not None and user_key in games_by_user:
+            games_played = games_by_user[user_key]
         elif SP_HAS_GAMES_PLAYED:
             games_played = r.get("games_played")
 
@@ -670,8 +680,8 @@ async def get_players(
         last10_wins = None
         last10_losses = None
         last10_mmr_delta = None
-        if uid_int is not None and uid_int in last10_by_user:
-            s = last10_by_user[uid_int]
+        if user_key is not None and user_key in last10_by_user:
+            s = last10_by_user[user_key]
             last10_games = s.get("games")
             last10_wins = s.get("wins")
             last10_losses = s.get("losses")
@@ -739,13 +749,11 @@ async def get_matches(
         base_where = ["season_id = $1"]
         params: List = [picked]
 
-        uid_int: Optional[int] = None
         if user_id is not None:
-            if not user_id.isdigit():
-                raise HTTPException(400, "user_id debe ser numérico")
-            uid_int = int(user_id)
-            params.append(uid_int)
-            base_where.append(f"user_id = ${len(params)}")
+            uid_str = str(user_id)
+            params.append(uid_str)
+            # siempre comparamos como texto
+            base_where.append(f"user_id::text = ${len(params)}")
 
         params.append(limit)
         params.append(offset)
@@ -766,10 +774,10 @@ async def get_matches(
         if not res_rows:
             return []
 
-        result_ids: List[int] = [
-            int(r["result_id"]) for r in res_rows if r["result_id"] is not None
+        result_ids_text: List[str] = [
+            str(r["result_id"]) for r in res_rows if r["result_id"] is not None
         ]
-        if not result_ids:
+        if not result_ids_text:
             return []
 
         # ---- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----
@@ -795,15 +803,20 @@ async def get_matches(
                 p.country AS player_country
             FROM public.match_history mh
             LEFT JOIN public.players p ON p.user_id = mh.user_id
-            WHERE mh.result_id = ANY($1::bigint[])
+            WHERE mh.result_id::text = ANY($1::text[])
             ORDER BY mh.played_at ASC, mh.result_id ASC, mh.pos ASC, mh.id ASC
-        """, result_ids)
+        """, result_ids_text)
 
     # ---- 3) Agrupar en matches[result_id].players[] ----
     matches_by_result: Dict[int, Dict] = {}
 
     for r in rows:
-        rid = int(r["result_id"])
+        rid_raw = r["result_id"]
+        try:
+            rid = int(rid_raw)
+        except Exception:
+            rid = rid_raw  # fallback, por si alguna vez no es numérico
+
         played_dt: Optional[datetime] = r["played_at"]
 
         m = matches_by_result.get(rid)
