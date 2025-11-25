@@ -500,6 +500,125 @@ async def get_players(
         })
     return out
 
+# ======================= API: Matches =======================
+async def _fetch_matches(
+    season_id: int,
+    user_id: Optional[str],
+    limit: int,
+    offset: int,
+) -> List[Dict]:
+    """
+    Devuelve la lista de matches (ordenados por más antiguo primero), opcionalmente
+    filtrados por user_id.
+    """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    async with db_pool.acquire() as conn:
+        picked = await _pick_effective_season(conn, season_id)
+
+        params: List[object] = [picked]
+        where_extra = ""
+        if user_id:
+            where_extra = "AND mp.user_id = $2"
+            params.append(_uid_for_sql(user_id))
+
+        # posiciones de LIMIT/OFFSET según si hay filtro por user_id
+        limit_pos = len(params) + 1
+        offset_pos = len(params) + 2
+        params.extend([limit, offset])
+
+        # IMPORTANTE: ajusta los nombres de columnas si en tu BD se llaman distinto
+        q = f"""
+            SELECT
+              m.id          AS match_id,
+              m.season_id   AS season_id,
+              m.created_at  AS created_at,
+              json_agg(
+                json_build_object(
+                  'userId',      mp.user_id,
+                  'name',        p.name,
+                  'country',     p.country,
+                  'mmrBefore',   mp.mmr_before,
+                  'mmrAfter',    mp.mmr_after,
+                  'mmrDelta',    (mp.mmr_after - mp.mmr_before),
+                  'isWin',       mp.is_win,
+                  'isPlacement', mp.is_placement,
+                  'position',    mp.position
+                )
+                ORDER BY mp.position NULLS LAST, mp.user_id
+              ) AS players
+            FROM public.matches m
+            JOIN public.matchplayers mp ON mp.match_id = m.id
+            JOIN public.players      p  ON p.user_id   = mp.user_id
+            WHERE m.season_id = $1
+              {where_extra}
+            GROUP BY m.id, m.season_id, m.created_at
+            ORDER BY m.created_at ASC, m.id ASC
+            LIMIT ${limit_pos} OFFSET ${offset_pos}
+        """
+
+        try:
+            rows = await conn.fetch(q, *params)
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(500, f"DB error (matches): {e}")
+
+    out: List[Dict] = []
+    for r in rows:
+        created_at = r.get("created_at")
+        if isinstance(created_at, datetime):
+            played_at = created_at.astimezone(timezone.utc).isoformat()
+        else:
+            played_at = None
+
+        # asyncpg ya decodifica json_agg(json_build_object) a list[dict]
+        players = r.get("players") or []
+
+        out.append({
+            "id": r.get("match_id"),
+            "seasonId": r.get("season_id"),
+            "playedAt": played_at,
+            "players": players,
+        })
+    return out
+
+@app.get("/api/matches")
+async def api_get_matches(
+    season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
+    user_id: Optional[str] = Query(None, description="User ID para filtrar matches de un jugador"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Endpoint principal que usa el front:
+    - /api/matches?season_id=1            -> todos los matches de la season
+    - /api/matches?season_id=1&user_id=X  -> sólo los matches de ese jugador
+    """
+    return await _fetch_matches(season_id=season_id, user_id=user_id, limit=limit, offset=offset)
+
+@app.get("/api/matches/{user_path}")
+async def api_get_matches_weird_path(
+    user_path: str,
+    season_id: int = Query(0, description="Season ID (0 = season actual activa)"),
+    limit: int = Query(200, ge=1, le=1000),
+    offset: int = Query(0, ge=0),
+):
+    """
+    Soporta rutas viejas del front del tipo:
+      /api/matches/user_id=873821409872904200
+
+    Extrae el userId del segmento y reutiliza la misma lógica que /api/matches.
+    """
+    m = re.match(r"user_id=(.+)", user_path)
+    if not m:
+        raise HTTPException(404, "Invalid matches path")
+    user_id = m.group(1)
+    if season_id <= 0:
+        season_id = 0  # se resolverá a season activa en _fetch_matches
+
+    return await _fetch_matches(season_id=season_id, user_id=user_id, limit=limit, offset=offset)
+
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
@@ -787,4 +906,3 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#test
