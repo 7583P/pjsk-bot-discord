@@ -116,8 +116,9 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
                               or await _has_col(conn, "seasonplayers", "games")
 
         # matches / matchplayers (si no existen, no consultamos esas tablas)
-        HAS_MATCHES_TABLE      = await _has_col(conn, "matches", "season_id")
-        HAS_MATCHPLAYERS_TABLE = await _has_col(conn, "matchplayers", "match_id")
+        # Usar la tabla que realmente llena el bot (match_history)
+        HAS_MATCHES_TABLE      = await _has_col(conn, "match_history", "season_id")
+        HAS_MATCHPLAYERS_TABLE = False  # ya no la vamos a usar
 
         # Detectar tipo de user_id: si player_pfps existe usa su tipo; si no, usa el de players
         pfps_type = await _col_type(conn, "player_pfps", "user_id")
@@ -475,6 +476,9 @@ async def get_players(
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
+    rows = []
+    games_by_user: Dict[int, int] = {}
+
     try:
         async with db_pool.acquire() as conn:
             picked = await _pick_effective_season(conn, season_id)
@@ -512,6 +516,35 @@ async def get_players(
             """
             rows = await conn.fetch(q, picked, limit, offset)
 
+            # NEW: contar partidas desde match_history para cada user en la season
+            if HAS_MATCHES_TABLE and rows:
+                try:
+                    uid_ints: List[int] = []
+                    for rr in rows:
+                        uid = rr.get("user_id")
+                        if uid is None:
+                            continue
+                        try:
+                            uid_ints.append(int(uid))
+                        except Exception:
+                            continue
+
+                    if uid_ints:
+                        stats_rows = await conn.fetch("""
+                            SELECT user_id, COUNT(*) AS games_played
+                            FROM public.match_history
+                            WHERE season_id = $1
+                              AND user_id = ANY($2::bigint[])
+                            GROUP BY user_id
+                        """, picked, uid_ints)
+                        games_by_user = {
+                            int(sr["user_id"]): sr["games_played"]
+                            for sr in stats_rows
+                        }
+                except Exception:
+                    traceback.print_exc()
+                    games_by_user = {}
+
     except HTTPException:
         raise
     except Exception as e:
@@ -524,6 +557,7 @@ async def get_players(
         discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
         name       = r.get("name")
 
+        # PFP
         pfp_url = r.get("pfp_url")
         pfp_ts  = r.get("pfp_updated_at")
         if pfp_url:
@@ -541,9 +575,20 @@ async def get_players(
                 name
             )
 
-        wins         = r.get("wins") if SP_HAS_WINS else None
-        losses       = r.get("losses") if SP_HAS_LOSSES else None
-        games_played = r.get("games_played") if SP_HAS_GAMES_PLAYED else None
+        wins   = r.get("wins")   if SP_HAS_WINS   else None
+        losses = r.get("losses") if SP_HAS_LOSSES else None
+
+        # Preferimos el conteo real desde match_history; si no, usamos la columna de seasonplayers (si existe)
+        games_played = None
+        try:
+            uid_int = int(user_id) if user_id is not None else None
+        except Exception:
+            uid_int = None
+
+        if uid_int is not None and uid_int in games_by_user:
+            games_played = games_by_user[uid_int]
+        elif SP_HAS_GAMES_PLAYED:
+            games_played = r.get("games_played")
 
         out.append({
             "id": user_id,
@@ -571,86 +616,80 @@ async def get_matches(
     ),
     user_id: Optional[str] = Query(
         None,
-        description="Filtra solo partidos donde participa este user_id (opcional)"
+        description="Filtra solo partidas donde participa este user_id (opcional)"
     ),
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
 ):
     """
-    Devuelve los matches ordenados del más viejo al más nuevo.
-    - Si user_id está presente, solo devuelve matches donde ese jugador aparece en matchplayers.
-    - El JSON incluye todas las columnas de la tabla matches + una lista 'players'
-      con todas las columnas de matchplayers para ese match.
-    Si la tabla matches no existe en el schema actual, devuelve [] sin error.
+    Devuelve las partidas desde match_history (una fila por jugador/partida),
+    ordenadas de más vieja a más nueva.
+    Si user_id está presente, solo devuelve las de ese jugador.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    # Si tu DB no tiene tabla matches, no reventamos: devolvemos lista vacía.
     if not HAS_MATCHES_TABLE:
+        # No existe match_history en este schema → devolvemos lista vacía
         return []
 
     async with db_pool.acquire() as conn:
         try:
             picked = await _pick_effective_season(conn, season_id)
         except HTTPException:
-            # si no hay seasons, devolvemos lista vacía para no petar el front
+            # si no hay seasons, devolvemos [] para no romper el front
             return []
 
-        # 1) Traer matches de esa season
-        try:
-            matches_rows = await conn.fetch(
-                """
-                SELECT *
-                FROM public.matches
-                WHERE season_id = $1
-                ORDER BY id ASC
-                LIMIT $2 OFFSET $3
-                """,
-                picked,
-                limit,
-                offset,
-            )
-        except Exception as e:
-            traceback.print_exc()
-            # Si hay algún problema con la tabla, devolvemos [] en vez de 500
-            return []
+        # Construir WHERE dinámico
+        params = [picked]
+        where_clauses = ["season_id = $1"]
 
-        out: List[Dict] = []
+        if user_id is not None:
+            # match_history.user_id es BIGINT → casteamos
+            if not user_id.isdigit():
+                raise HTTPException(400, "user_id debe ser numérico")
+            params.append(int(user_id))
+            where_clauses.append(f"user_id = ${len(params)}")
 
-        for m in matches_rows:
-            m_dict = dict(m)
-            match_id = m_dict.get("id") or m_dict.get("match_id")
+        # Añadimos limit y offset
+        params.append(limit)
+        params.append(offset)
+        limit_idx  = len(params) - 1
+        offset_idx = len(params)
 
-            players: List[Dict] = []
+        sql = f"""
+            SELECT
+                id,
+                season_id,
+                result_id,
+                user_id,
+                pos,
+                s_perfect,
+                s_great,
+                s_good,
+                s_bad,
+                s_miss,
+                mmr_before,
+                mmr_after,
+                mmr_delta,
+                was_placement,
+                is_win,
+                played_at
+            FROM public.match_history
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY played_at ASC, id ASC
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
+        """
 
-            # Solo consultamos matchplayers si sabemos que la tabla existe
-            if match_id is not None and HAS_MATCHPLAYERS_TABLE:
-                try:
-                    players_rows = await conn.fetch(
-                        "SELECT * FROM public.matchplayers WHERE match_id = $1",
-                        match_id,
-                    )
-                except Exception:
-                    players_rows = []
+        rows = await conn.fetch(sql, *params)
 
-                for pr in players_rows:
-                    players.append(dict(pr))
-
-                # Si hay filtro por user_id, nos quedamos solo con partidos donde
-                # algún row de matchplayers tenga ese user_id.
-                if user_id:
-                    has_user = False
-                    for p in players:
-                        uid = p.get("user_id") or p.get("player_id")
-                        if uid is not None and str(uid) == str(user_id):
-                            has_user = True
-                            break
-                    if not has_user:
-                        continue
-
-            m_dict["players"] = players
-            out.append(m_dict)
+    out = []
+    for r in rows:
+        d = dict(r)
+        # Para mantener compat con el front, añadimos players vacíos
+        # (antes venía de matchplayers)
+        d["players"] = []
+        out.append(d)
 
     return out
 
@@ -911,7 +950,7 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 page_id = int(row["page_id"]); thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
+                if variants && ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
     data = {"name": page_title, "variants": []}
@@ -941,4 +980,3 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-#test
