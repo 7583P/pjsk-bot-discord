@@ -2234,24 +2234,31 @@ class Matchmaking(commands.Cog):
         if len(lines) != n:
             return await ctx.send(f"You should send {n} lines")
 
-        # Validar formato de cada línea y (si aplica) suma de notas
         players_set = {m.id for m in players}
         ids_in_lines = []
+        by_id: dict[int, tuple[str, list[int]]] = {}
+
         for idx, ln in enumerate(lines, start=1):
             mobj = ENTRY_RE.match(ln)
             if not mobj:
                 return await ctx.send(f"Incorrect format for: {ln}")
+
+            stats = list(map(int, mobj.group("stats").split(",")))
             if expected is not None:
-                stats = list(map(int, mobj.group("stats").split(",")))
                 if sum(stats) != expected:
                     return await ctx.send(
                         f"there is an error on the calculation on line {idx}: {sum(stats)} ≠ {expected}"
                     )
-            ids_in_lines.append(int(mobj.group("id")))
+
+            uid = int(mobj.group("id"))
+            cc  = mobj.group("cc")
+            ids_in_lines.append(uid)
+            by_id[uid] = (cc, stats)
 
         # Duplicados y miembros coincidentes con la sala
         if len(ids_in_lines) != len(set(ids_in_lines)):
             return await ctx.send("❌ Duplicate users in submit.")
+
         ids_set = set(ids_in_lines)
         missing = players_set - ids_set
         extra   = ids_set - players_set
@@ -2293,9 +2300,6 @@ class Matchmaking(commands.Cog):
 
             deadline = asyncio.get_event_loop().time() + float(VOTE_TIMEOUT_SUBMIT)
 
-            # Recolectar votos hasta que:
-            # - voten todos (y si todos ✅ ⇒ valida; si todos ❎ ⇒ declina), o
-            # - se acaben los 30s y decidir por mayoría
             while True:
                 remaining = deadline - asyncio.get_event_loop().time()
                 if remaining <= 0:
@@ -2305,7 +2309,6 @@ class Matchmaking(commands.Cog):
                 except asyncio.TimeoutError:
                     break
 
-                # Un solo voto por usuario
                 if user.id in voted:
                     continue
 
@@ -2313,7 +2316,6 @@ class Matchmaking(commands.Cog):
                 voted.add(user.id)
                 counts[choice] += 1
 
-                # Todos votaron y son unánimes → decisión inmediata
                 if len(voted) == total_voters:
                     if counts["✅"] == total_voters:
                         ganador = "✅"
@@ -2321,169 +2323,119 @@ class Matchmaking(commands.Cog):
                         ganador = "❎"
                     break
 
-            # Si no hubo unanimidad, decidir por mayoría al cierre
             if ganador is None:
                 if counts["✅"] > counts["❎"]:
                     ganador = "✅"
                 elif counts["❎"] > counts["✅"]:
                     ganador = "❎"
                 else:
-                    ganador = "❎"  # empate ⇒ se declina
+                    ganador = "❎"
 
-            # Cerrar visualmente la votación
             try:
-                await vote_msg.edit(content=f"🗳️ Voting closed → {ganador}  (✅ {counts['✅']} / ❎ {counts['❎']})")
+                await vote_msg.edit(
+                    content=f"🗳️ Voting closed → {ganador}  (✅ {counts['✅']} / ❎ {counts['❎']})"
+                )
             except Exception:
                 pass
 
-            # ---- Resultado de la votación ----
             if ganador != "✅":
                 return await ctx.send("Submit declined. There might be an error, try doing it again.")
 
             # ==============================
             # VOTO APROBADO → aplicar MMR
             # ==============================
-            medals  = {1:"🥇",2:"🥈",3:"🥉"}
+            medals  = {1: "🥇", 2: "🥈", 3: "🥉"}
 
-            # New: obtenemos el ID global del result ANTES de procesar jugadores
+            # ID global del result para la tabla results
             result_id = await self._next_result_id()
 
-
-            # 1) Mapear datos por user_id
-            by_id = {}
-            for ln in lines:
-                m = ENTRY_RE.match(ln)
-                uid   = int(m.group("id"))
-                cc    = m.group("cc")
-                stats = list(map(int, m.group("stats").split(",")))
-                by_id[uid] = (cc, stats)
-
-            # 2) Construir players_list (en el orden lógico de sala)
+            # 1) Construir players_list UNA sola vez
             players_list = []
             for member in players:
                 uid = member.id
                 cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
-                # Bandera oficial (DB) como fallback — NO se actualiza aquí
+                # bandera guardada en DB, como fallback
                 profile_cc = await self.db_pool.fetchval(
                     "SELECT country FROM players WHERE user_id=$1", uid
                 ) or ""
 
-                # Bandera SOLO para el mensaje de resultados (no persistente)
                 cc_up = (cc or "").upper()
                 display_flag = country_flag(cc_up) or country_flag(profile_cc)
 
-                total_points = sum(s*w for s, w in zip(stats, [4,3,2,1,0]))
-                players_list.append({
-                    "member": member,
-                    "cc": cc,                  # del submit (no persistir)
-                    "stats": stats,
-                    "total": total_points,
-                    "old": old,
-                    "mmr_actual": old,         # ✅ valor por defecto: su MMR actual
-                    "role": current_role,
-                    "display_flag": display_flag,
-                    "was_placement": (current_role == "Placement"),
-                    "seed_mmr": None,
-                })
+                total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
+                players_list.append(
+                    {
+                        "member": member,
+                        "cc": cc,
+                        "stats": stats,
+                        "total": total_points,
+                        "old": old,
+                        "mmr_actual": old,  # ← base, se ajusta con Placement
+                        "role": current_role,
+                        "display_flag": display_flag,
+                        "was_placement": (current_role == "Placement"),
+                        "seed_mmr": None,
+                        "seed_rank": None,
+                    }
+                )
 
-
-
-            # Fase 1: bonus de Placement
+            # Fase 1: aplicar seed si es Placement
             for p in players_list:
                 if p["role"] == "Placement":
                     seed_mmr, seed_rank = self.placement_seed_from_stats(p["stats"])
-                    p["mmr_actual"]     = seed_mmr
-                    p["seed_rank"]      = seed_rank
-                    p["was_placement"]  = True
-                    p["seed_mmr"]       = seed_mmr
+                    p["mmr_actual"] = seed_mmr
+                    p["seed_mmr"]   = seed_mmr
+                    p["seed_rank"]  = seed_rank
+                    p["was_placement"] = True
                 else:
-                    p["mmr_actual"]     = p["old"]
-                    p["was_placement"]  = False
-                    p["seed_mmr"]       = None
+                    p["mmr_actual"] = p["old"]
+                    p["seed_mmr"]   = None
+                    p["seed_rank"]  = None
 
-            # 👇 AÑADE ESTO AQUÍ
+            # MMR promedio del room (ya con seeds de Placement)
             room_mmr = None
             if players_list:
-                # usamos mmr_actual (ya incluye el seed de placement)
                 room_mmr = round(
-                    sum(int(p.get("mmr_actual", p["old"])) for p in players_list) 
-                    / len(players_list)
+                    sum(int(p["mmr_actual"]) for p in players_list) / len(players_list)
                 )
 
-            # Fase 2: Elo por pares con K fijo
+            # Fase 2: Elo por pares
             players_list.sort(key=lambda x: x["total"], reverse=True)
-
-            ratings = [int(p.get("mmr_actual", p["old"])) for p in players_list]
+            ratings = [int(p["mmr_actual"]) for p in players_list]
             order   = list(range(len(players_list)))
             deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
 
+            # Asegurar seasonplayers (por si acaso aún no existe)
+            await self.db_pool.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seasonplayers (
+                    season_id   INTEGER NOT NULL,
+                    user_id     BIGINT  NOT NULL,
+                    mmr         INTEGER NOT NULL DEFAULT 0,
+                    role        TEXT    NOT NULL DEFAULT 'Placement',
+                    PRIMARY KEY (season_id, user_id)
+                );
+                """
+            )
 
-
-            # 2) Construir players_list (en el orden lógico de sala)
-            players_list = []
-            for member in players:
-                uid = member.id
-                cc, stats = by_id[uid]
-                old, current_role = await self.fetch_player(uid)
-                ...
-                players_list.append({
-                    "member": member,
-                    "cc": cc,
-                    "stats": stats,
-                    "total": total_points,
-                    "old": old,
-                    "role": current_role,
-                    "display_flag": display_flag,
-                    "was_placement": (current_role == "Placement"),
-                    "seed_mmr": None,
-                })
-
-            # 🔹 PROMEDIO DE MMR DEL ROOM **ANTES** DEL CAMBIO DE MMR
-            room_mmr = None
-            if players_list:
-                room_mmr = round(sum(p["old"] for p in players_list) / len(players_list))
-
-            # Fase 1: bonus de Placement
-            for p in players_list:
-                ...
-
-
-
-            players_list.sort(key=lambda x: x["total"], reverse=True)
-
-            # usar mmr_actual si existe, si no, usar old como fallback
-            ratings = [int(p.get("mmr_actual", p["old"])) for p in players_list]
-            order   = list(range(len(players_list)))
-            deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
-
+            season_row  = await self.get_current_season()
+            season_id   = season_row["id"]
+            season_name = season_row["name"]
 
             summary = []
+
             for idx, p in enumerate(players_list, start=1):
                 mmr_prev  = int(p["mmr_actual"])
-                mmr_delta = int(deltas[idx-1])
+                mmr_delta = int(deltas[idx - 1])
                 mmr_final = mmr_prev + mmr_delta
                 role_name = get_rank_from_mmr(mmr_final)
 
-                season_row  = await self.get_current_season()
-                season_id   = season_row["id"]
-
-                stats = p["stats"]  # [P,G,G2,B,M]
+                stats = p["stats"]
                 s_p, s_g, s_g2, s_b, s_m = stats
 
-                # Asegura la tabla con constraint único (solo una vez; puedes moverlo a cog_load si prefieres)
-                await self.db_pool.execute("""
-                    CREATE TABLE IF NOT EXISTS seasonplayers (
-                        season_id   INTEGER NOT NULL,
-                        user_id     BIGINT  NOT NULL,
-                        mmr         INTEGER NOT NULL DEFAULT 0,
-                        role        TEXT    NOT NULL DEFAULT 'Placement',
-                        PRIMARY KEY (season_id, user_id)
-                    );
-                """)
-
-                # UPSERT por temporada
+                # UPSERT en seasonplayers
                 await self.db_pool.execute(
                     """
                     INSERT INTO seasonplayers (season_id, user_id, mmr, role)
@@ -2491,27 +2443,13 @@ class Matchmaking(commands.Cog):
                     ON CONFLICT (season_id, user_id)
                     DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
                     """,
-                    season_id, p["member"].id, mmr_final, role_name
-                )
-
-                # NEW: registrar esta partida en el histórico (match_history)
-                # Definimos "win" = quedar 1º en los resultados
-                await self.db_pool.execute(
-                    """
-                    INSERT INTO match_history (
-                        season_id, user_id, mmr_before, mmr_after, mmr_delta, is_win
-                    )
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    """,
                     season_id,
                     p["member"].id,
-                    mmr_prev,
                     mmr_final,
-                    mmr_delta,
-                    mmr_delta >= 0,  # ✅ Win si gana MMR o queda en 0
+                    role_name,
                 )
 
-                # NEW: registrar esta partida en histórica con result_id + stats + posición
+                # Insert único en match_history (con result_id + stats + pos)
                 await self.db_pool.execute(
                     """
                     INSERT INTO match_history (
@@ -2530,7 +2468,11 @@ class Matchmaking(commands.Cog):
                     result_id,
                     p["member"].id,
                     idx,
-                    s_p, s_g, s_g2, s_b, s_m,
+                    s_p,
+                    s_g,
+                    s_g2,
+                    s_b,
+                    s_m,
                     mmr_prev,
                     mmr_final,
                     mmr_delta,
@@ -2538,7 +2480,7 @@ class Matchmaking(commands.Cog):
                     mmr_delta >= 0,
                 )
 
-                # Actualización de roles en Discord
+                # Actualizar roles de rango en Discord
                 role_id = RANK_ROLE_IDS.get(role_name)
                 if role_id:
                     role_obj = ctx.guild.get_role(role_id)
@@ -2551,7 +2493,7 @@ class Matchmaking(commands.Cog):
                         except (discord.Forbidden, discord.HTTPException) as e:
                             await ctx.send(f"⚠️ No pude actualizar roles de {p['member'].mention}: {e}")
 
-                # Opcional: actualizar nick con el rango
+                # Cambiar nick opcionalmente
                 if ctx.guild.me.guild_permissions.manage_nicknames:
                     base = p["member"].display_name
                     nick = f"{base} [{role_name}]"
@@ -2562,35 +2504,31 @@ class Matchmaking(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException) as e:
                         await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
 
-                # ← medalla / posición: usa 🥇🥈🥉 para top3 y número para el resto
                 pos_str = medals.get(idx) or f"{idx}."
                 name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
-                summary.append((
-                    pos_str,
-                    name_with_flag,
-                    p["total"],
-                    p["stats"],
-                    mmr_prev,
-                    mmr_delta,
-                    mmr_final,
-                    p["was_placement"]   # ✅ extra field
-                ))
+                summary.append(
+                    (
+                        pos_str,
+                        name_with_flag,
+                        p["total"],
+                        p["stats"],
+                        mmr_prev,
+                        mmr_delta,
+                        mmr_final,
+                        p["was_placement"],
+                    )
+                )
 
+            # Publicar resultados
+            join_parent     = ctx.channel.parent
+            result_chan_id  = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
+            result_chan     = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
 
-            # Publicar resultados en canal de resultados y en el hilo (como board)
-            season_row    = await self.get_current_season()
-            season_name   = season_row["name"] if season_row else "N/A"
-            join_parent   = ctx.channel.parent
-            result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-            result_chan   = await self._resolve_channel(result_chan_id, fallback=ctx.channel) if result_chan_id else ctx.channel
-
-            # NEW: gap guardado en la sala (solo niveles)
             gap_low  = room.get("gap_low")
             gap_high = room.get("gap_high")
 
             board_block = self._format_results_board(summary)
 
-            # Línea que va DEBAJO del nombre de la season, con ID, gap y Avg MMR
             gap_text = ""
             if gap_low is not None and gap_high is not None:
                 gap_text = f" · Lv {gap_low}-{gap_high}"
@@ -2601,18 +2539,15 @@ class Matchmaking(commands.Cog):
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
                 description=header_line + "\n" + board_block,
-                color=0x00f7ff
+                color=0x00f7ff,
             )
 
-
-            # Enviar al canal de results y guardar mensaje para /searchresult
             msg_result = await result_chan.send(embed=embed)
             await ctx.send(embed=embed)
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
 
-
-            # NEW! guardan el result en la tabla results
+            # Guardar metadata del result
             await self.db_pool.execute(
                 """
                 INSERT INTO results (
@@ -2625,10 +2560,10 @@ class Matchmaking(commands.Cog):
                     gap_high,
                     room_mmr
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                 """,
                 result_id,
-                season_row["id"] if season_row else 0,
+                season_id,
                 season_name,
                 msg_result.channel.id,
                 msg_result.id,
@@ -2637,27 +2572,18 @@ class Matchmaking(commands.Cog):
                 room_mmr,
             )
 
-
-
-
-
-            # Bloquear futuros submit en esta sala y permitir /c en otra
-            room["closed"] = True           # ya no acepta entradas nuevas
-            room["finished"] = True         # _find_player_room_id ahora la ignora para el bloqueo de /c
+            room["closed"]   = True
+            room["finished"] = True
 
             await ctx.send("This room has been submited results")
 
-            # Notificar al resto de cogs (por ejemplo, Rooms) que la sala terminó
             rid = next((rid for rid, r in self.rooms.items() if r["thread"].id == ctx.channel.id), None)
             if rid is not None:
-                self.bot.dispatch('room_finished', rid)
+                self.bot.dispatch("room_finished", rid)
 
-            # Programar el cierre/borrado en segundo plano
             asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
 
-
         finally:
-            # Siempre liberar el bloqueo de votación
             room["vote_in_progress"] = False
 
 
