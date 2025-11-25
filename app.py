@@ -61,6 +61,11 @@ SEASONS_HAS_NAME: bool      = False
 SEASONS_HAS_STARTS_AT: bool = False
 SEASONS_HAS_ENDS_AT: bool   = False
 
+# seasonplayers extra stats
+SP_HAS_WINS: bool          = False
+SP_HAS_LOSSES: bool        = False
+SP_HAS_GAMES_PLAYED: bool  = False
+
 # Tipo SQL efectivo del user_id ("text" o "bigint")
 USER_ID_SQLTYPE: str = "text"   # default seguro
 
@@ -87,7 +92,10 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
     return "text"
 
 async def _detect_schema(conn: asyncpg.Connection) -> None:
-    global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME, SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
+    global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
+    global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
+    global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED
+
     try:
         HAS_DISCORD_ID_COL    = await _has_col(conn, "players", "discord_id")
         SEASONS_HAS_ACTIVE    = await _has_col(conn, "seasons", "active")
@@ -95,12 +103,30 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         SEASONS_HAS_STARTS_AT = await _has_col(conn, "seasons", "starts_at")
         SEASONS_HAS_ENDS_AT   = await _has_col(conn, "seasons", "ends_at")
 
+        # seasonplayers: columnas de stats
+        SP_HAS_WINS         = await _has_col(conn, "seasonplayers", "wins")
+        SP_HAS_LOSSES       = await _has_col(conn, "losses", "losses") \
+                              or await _has_col(conn, "seasonplayers", "losses")
+        SP_HAS_GAMES_PLAYED = await _has_col(conn, "seasonplayers", "games_played") \
+                              or await _has_col(conn, "seasonplayers", "games")
+
         # Detectar tipo de user_id: si player_pfps existe usa su tipo; si no, usa el de players
         pfps_type = await _col_type(conn, "player_pfps", "user_id")
         players_type = await _col_type(conn, "players", "user_id")
         USER_ID_SQLTYPE = pfps_type or players_type or "text"
 
-        print(f"🔎 Schema: players.discord_id={HAS_DISCORD_ID_COL} | seasons.active={SEASONS_HAS_ACTIVE} name={SEASONS_HAS_NAME} starts_at={SEASONS_HAS_STARTS_AT} ends_at={SEASONS_HAS_ENDS_AT} | user_id_type={USER_ID_SQLTYPE}")
+        print(
+            "🔎 Schema:"
+            f" players.discord_id={HAS_DISCORD_ID_COL}"
+            f" | seasons.active={SEASONS_HAS_ACTIVE}"
+            f" name={SEASONS_HAS_NAME}"
+            f" starts_at={SEASONS_HAS_STARTS_AT}"
+            f" ends_at={SEASONS_HAS_ENDS_AT}"
+            f" | seasonplayers.wins={SP_HAS_WINS}"
+            f" losses={SP_HAS_LOSSES}"
+            f" games_played={SP_HAS_GAMES_PLAYED}"
+            f" | user_id_type={USER_ID_SQLTYPE}"
+        )
     except Exception:
         traceback.print_exc()
 
@@ -162,6 +188,11 @@ async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     return bool(row)
 
 async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: int) -> int:
+    """
+    requested_season_id:
+      >0  -> se usa ese ID (si existe, si no, 404)
+      =0  -> season activa si existe, si no la última por ID
+    """
     if requested_season_id > 0:
         if await _season_exists(conn, requested_season_id):
             return requested_season_id
@@ -448,6 +479,16 @@ async def get_players(
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
+            if SP_HAS_WINS:
+                select_cols.append("sp.wins AS wins")
+            if SP_HAS_LOSSES:
+                select_cols.append("sp.losses AS losses")
+            if SP_HAS_GAMES_PLAYED:
+                # intentamos ambos nombres, el que exista
+                if await _has_col(conn, "seasonplayers", "games_played"):
+                    select_cols.append("sp.games_played AS games_played")
+                elif await _has_col(conn, "seasonplayers", "games"):
+                    select_cols.append("sp.games AS games_played")
 
             q = f"""
                 SELECT {", ".join(select_cols)}
@@ -489,6 +530,10 @@ async def get_players(
                 name
             )
 
+        wins         = r.get("wins") if SP_HAS_WINS else None
+        losses       = r.get("losses") if SP_HAS_LOSSES else None
+        games_played = r.get("games_played") if SP_HAS_GAMES_PLAYED else None
+
         out.append({
             "id": user_id,
             "discordId": discord_id,
@@ -497,127 +542,98 @@ async def get_players(
             "country": r.get("country"),
             "rank": r.get("rank"),
             "pfp": pfp_url,
+            # stats extra (para W-L y matches en el front)
+            "wins": wins,
+            "losses": losses,
+            "gamesPlayed": games_played,
+            "matchesPlayed": games_played,
+            "matches": games_played,
         })
     return out
 
 # ======================= API: Matches =======================
-async def _fetch_matches(
-    season_id: int,
-    user_id: Optional[str],
-    limit: int,
-    offset: int,
-) -> List[Dict]:
+@app.get("/api/matches")
+async def get_matches(
+    season_id: int = Query(
+        0,
+        description="Season ID (0 = season actual activa). Hacer GET /api/matches sin query ya no da 422."
+    ),
+    user_id: Optional[str] = Query(
+        None,
+        description="Filtra solo partidos donde participa este user_id (opcional)"
+    ),
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
     """
-    Devuelve la lista de matches (ordenados por más antiguo primero), opcionalmente
-    filtrados por user_id.
+    Devuelve los matches ordenados del más viejo al más nuevo.
+    - Si user_id está presente, solo devuelve matches donde ese jugador aparece en matchplayers.
+    - El JSON incluye todas las columnas de la tabla matches + una lista 'players'
+      con todas las columnas de matchplayers para ese match.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
     async with db_pool.acquire() as conn:
-        picked = await _pick_effective_season(conn, season_id)
-
-        params: List[object] = [picked]
-        where_extra = ""
-        if user_id:
-            where_extra = "AND mp.user_id = $2"
-            params.append(_uid_for_sql(user_id))
-
-        # posiciones de LIMIT/OFFSET según si hay filtro por user_id
-        limit_pos = len(params) + 1
-        offset_pos = len(params) + 2
-        params.extend([limit, offset])
-
-        # IMPORTANTE: ajusta los nombres de columnas si en tu BD se llaman distinto
-        q = f"""
-            SELECT
-              m.id          AS match_id,
-              m.season_id   AS season_id,
-              m.created_at  AS created_at,
-              json_agg(
-                json_build_object(
-                  'userId',      mp.user_id,
-                  'name',        p.name,
-                  'country',     p.country,
-                  'mmrBefore',   mp.mmr_before,
-                  'mmrAfter',    mp.mmr_after,
-                  'mmrDelta',    (mp.mmr_after - mp.mmr_before),
-                  'isWin',       mp.is_win,
-                  'isPlacement', mp.is_placement,
-                  'position',    mp.position
-                )
-                ORDER BY mp.position NULLS LAST, mp.user_id
-              ) AS players
-            FROM public.matches m
-            JOIN public.matchplayers mp ON mp.match_id = m.id
-            JOIN public.players      p  ON p.user_id   = mp.user_id
-            WHERE m.season_id = $1
-              {where_extra}
-            GROUP BY m.id, m.season_id, m.created_at
-            ORDER BY m.created_at ASC, m.id ASC
-            LIMIT ${limit_pos} OFFSET ${offset_pos}
-        """
-
         try:
-            rows = await conn.fetch(q, *params)
+            picked = await _pick_effective_season(conn, season_id)
+        except HTTPException:
+            # si no hay seasons, devolvemos lista vacía para no petar el front
+            return []
+
+        # 1) Traer matches de esa season
+        try:
+            matches_rows = await conn.fetch(
+                """
+                SELECT *
+                FROM public.matches
+                WHERE season_id = $1
+                ORDER BY id ASC
+                LIMIT $2 OFFSET $3
+                """,
+                picked,
+                limit,
+                offset,
+            )
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(500, f"DB error (matches): {e}")
 
-    out: List[Dict] = []
-    for r in rows:
-        created_at = r.get("created_at")
-        if isinstance(created_at, datetime):
-            played_at = created_at.astimezone(timezone.utc).isoformat()
-        else:
-            played_at = None
+        out: List[Dict] = []
 
-        # asyncpg ya decodifica json_agg(json_build_object) a list[dict]
-        players = r.get("players") or []
+        for m in matches_rows:
+            m_dict = dict(m)
+            match_id = m_dict.get("id") or m_dict.get("match_id")
 
-        out.append({
-            "id": r.get("match_id"),
-            "seasonId": r.get("season_id"),
-            "playedAt": played_at,
-            "players": players,
-        })
+            players: List[Dict] = []
+            if match_id is not None:
+                try:
+                    players_rows = await conn.fetch(
+                        "SELECT * FROM public.matchplayers WHERE match_id = $1",
+                        match_id,
+                    )
+                except Exception:
+                    players_rows = []
+
+                for pr in players_rows:
+                    players.append(dict(pr))
+
+                # Si hay filtro por user_id, nos quedamos solo con partidos donde
+                # algún row de matchplayers tenga ese user_id.
+                if user_id:
+                    has_user = False
+                    for p in players:
+                        uid = p.get("user_id") or p.get("player_id")
+                        if uid is not None and str(uid) == str(user_id):
+                            has_user = True
+                            break
+                    if not has_user:
+                        continue
+
+            m_dict["players"] = players
+            out.append(m_dict)
+
     return out
-
-@app.get("/api/matches")
-async def api_get_matches(
-    season_id: int = Query(..., description="Season ID (0 = season actual activa)"),
-    user_id: Optional[str] = Query(None, description="User ID para filtrar matches de un jugador"),
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    """
-    Endpoint principal que usa el front:
-    - /api/matches?season_id=1            -> todos los matches de la season
-    - /api/matches?season_id=1&user_id=X  -> sólo los matches de ese jugador
-    """
-    return await _fetch_matches(season_id=season_id, user_id=user_id, limit=limit, offset=offset)
-
-@app.get("/api/matches/{user_path}")
-async def api_get_matches_weird_path(
-    user_path: str,
-    season_id: int = Query(0, description="Season ID (0 = season actual activa)"),
-    limit: int = Query(200, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-):
-    """
-    Soporta rutas viejas del front del tipo:
-      /api/matches/user_id=873821409872904200
-
-    Extrae el userId del segmento y reutiliza la misma lógica que /api/matches.
-    """
-    m = re.match(r"user_id=(.+)", user_path)
-    if not m:
-        raise HTTPException(404, "Invalid matches path")
-    user_id = m.group(1)
-    if season_id <= 0:
-        season_id = 0  # se resolverá a season activa en _fetch_matches
-
-    return await _fetch_matches(season_id=season_id, user_id=user_id, limit=limit, offset=offset)
 
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
@@ -906,3 +922,4 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+#test
