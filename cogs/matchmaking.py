@@ -1343,6 +1343,7 @@ class Matchmaking(commands.Cog):
 
         server_code = room_info.get("server", "en")
 
+        # 1) Contar rangos (por rol primero, luego por MMR)
         counts = {rank: 0 for rank in BRACKET_RANGES}
         for m in players:
             # 1) Intentar detectar rango por rol
@@ -1361,40 +1362,39 @@ class Matchmaking(commands.Cog):
 
             counts[user_rank] = counts.get(user_rank, 0) + 1
 
-
-        # — 2) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
-        if counts.get("Placement", 0) > 0:
-            low, high = BRACKET_RANGES["Placement"]  # (25, 28)
+        # 2) Determinar rango base según MMR promedio del room
+        has_placement = counts.get("Placement", 0) > 0
+        if has_placement:
+            base_rank = "Placement"
         else:
-            low, high = dynamic_range(counts)
+            # usa el MMR promedio de la sala para determinar el rango
+            base_rank = await self._get_room_rank_by_avg_mmr(players)
+            if base_rank not in BRACKET_RANGES:
+                base_rank = "Diamond"  # fallback neutro por si acaso
 
-        # — 2.1) Dificultades permitidas según el (low,high) elegido —
-        #        (si se forzó Placement, esto devolverá ("hard","expert","master"))
-        allowed_diffs = DIFFICULTY_PRIORITY
-        for rank, (lo_r, hi_r) in BRACKET_RANGES.items():
-            if lo_r == low and hi_r == high:
-                allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
-                break
+        low, high = BRACKET_RANGES[base_rank]
+        allowed_diffs = ALLOWED_DIFFS_BY_RANK.get(base_rank, DIFFICULTY_PRIORITY)
 
-
-        # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
-        if counts.get("Placement", 0) > 0:
+        # 3) Selección de canciones
+        #    - si la sala es Placement → modo especial 24–28 EXPERT
+        #    - en otro caso → gap base y append también según base_rank (MMR promedio)
+        if base_rank == "Placement":
+            # Regla especial de Placement: 1 canción por nivel 24–28, solo EXPERT
             picks = await self._pick_placement_songs_levels_24_to_28(server=server_code)
             low, high = 24, 28
         else:
-            # a) gap base para non-append
+            # a) gap base para non-append (según rango por MMR promedio)
             base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Determinar (opcional) el gap de append usando el RANGO DEL ROOM
+            # b) Determinar (opcional) el gap de append usando el MISMO rango del room (avg MMR)
             append_lo_hi = None
             append_limit = 0
+            room_rank_for_append = base_rank  # ya es el rango basado en avg MMR
             if "append" in allowed_diffs:
-                # 🔥 usar rango según MMR promedio del room, NO el más alto
-                room_rank = await self._get_room_rank_by_avg_mmr(players)
-                append_lo_hi = APPEND_RANGES.get(room_rank)
-                append_limit = get_append_pool_limit_for_rank(room_rank)
-                prob        = get_append_probability_for_rank(room_rank)
+                append_lo_hi = APPEND_RANGES.get(room_rank_for_append)
+                append_limit = get_append_pool_limit_for_rank(room_rank_for_append)
+                prob         = get_append_probability_for_rank(room_rank_for_append)
 
                 # si no hay rango o la tirada de prob falla → no usar append
                 if not append_lo_hi or append_limit <= 0 or random.random() >= prob:
@@ -1418,10 +1418,11 @@ class Matchmaking(commands.Cog):
                     server=server_code,
                 )
                 pool.extend(non_append_pool)
-                taken_titles = {t for (t, *_ ) in non_append_pool}
+                taken_titles = {t for (t, *_) in non_append_pool}
             else:
                 taken_titles = set()
 
+            # Append en su propio rango (también basado en avg MMR)
             if append_lo_hi is not None and append_limit > 0:
                 alo, ahi = append_lo_hi
                 append_pool = await self._get_random_songs(
@@ -1439,12 +1440,10 @@ class Matchmaking(commands.Cog):
             # f) El rango mostrado es SIEMPRE el base final (ya expandido)
             low, high = base_lo, base_hi
 
-
-
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
 
-        # NEW: guardar también el gap de niveles y total de notas en la sala
+        # Guardar info de la sala
         room_info["total_notes"] = total_notes
         room_info["gap_low"]     = low
         room_info["gap_high"]    = high
@@ -1472,6 +1471,7 @@ class Matchmaking(commands.Cog):
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
             self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
+
 
 
 
