@@ -712,13 +712,19 @@ async def get_players(
 # ======================= API: Matches =======================
 @app.get("/api/matches")
 async def get_matches(
-    season_id: int = Query(
-        0,
-        description="Season ID (0 = season actual activa). Hacer GET /api/matches sin query ya no da 422."
+    request: Request,
+    season_id: Optional[int] = Query(
+        None,
+        description=(
+            "Season ID: "
+            "omitir = todas las seasons, "
+            "0 = season activa/última, "
+            ">0 = season específica"
+        ),
     ),
     user_id: Optional[str] = Query(
         None,
-        description="Filtra solo partidas donde participa este user_id (opcional)"
+        description="Filtra solo partidas donde participa este user_id (opcional)",
     ),
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
@@ -726,6 +732,11 @@ async def get_matches(
     """
     Devuelve las partidas desde match_history, agrupadas por result_id (una entrada por match),
     ordenadas de más vieja a más nueva (para que el historial se lea cronológicamente).
+
+    Comportamiento de season_id:
+      - No enviado -> todas las seasons.
+      - 0         -> season activa/última (_pick_effective_season(0)).
+      - >0        -> season específica (valida que exista).
     Si user_id está presente, solo devuelve matches donde participa ese jugador,
     pero cada match incluye a TODOS los jugadores en el campo players[].
     """
@@ -739,32 +750,54 @@ async def get_matches(
             # No existe match_history en este schema → devolvemos lista vacía
             return []
 
-        try:
-            picked = await _pick_effective_season(conn, season_id)
-        except HTTPException:
-            # si no hay seasons, devolvemos [] para no romper el front
-            return []
+        # ---------- Resolver season (o todas) ----------
+        picked_season: Optional[int] = None
+        raw_q_season = request.query_params.get("season_id")
 
-        # ---- 1) Determinar qué result_ids entran en esta página (limit/offset por match) ----
-        base_where = ["season_id = $1"]
-        params: List = [picked]
+        if raw_q_season is not None:
+            # El cliente SÍ envió season_id (puede ser 0 o >0)
+            # Usamos el valor ya parseado por FastAPI (season_id)
+            try:
+                requested = int(season_id or 0)
+            except (TypeError, ValueError):
+                raise HTTPException(400, "season_id must be an integer")
+
+            try:
+                # 0 => current/última; >0 => específica
+                picked_season = await _pick_effective_season(conn, requested)
+            except HTTPException:
+                # Si la season no existe o no hay seasons, para no romper el front devolvemos []
+                return []
+
+        # ---------- Construir WHERE dinámico ----------
+        where_clauses = []
+        params: List = []
+
+        if picked_season is not None:
+            where_clauses.append(f"season_id = ${len(params) + 1}")
+            params.append(picked_season)
 
         if user_id is not None:
-            uid_str = str(user_id)
-            params.append(uid_str)
-            # siempre comparamos como texto
-            base_where.append(f"user_id::text = ${len(params)}")
+            # Siempre comparamos como texto para soportar user_id bigint/text
+            where_clauses.append(f"user_id::text = ${len(params) + 1}")
+            params.append(str(user_id))
 
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        # Añadimos limit / offset al final
         params.append(limit)
         params.append(offset)
-        limit_idx  = len(params) - 1
+        limit_idx = len(params) - 1
         offset_idx = len(params)
 
+        # ---------- 1) Determinar qué result_ids entran en esta página ----------
         sql_results = f"""
             SELECT result_id,
                    MIN(played_at) AS first_played_at
             FROM public.match_history
-            WHERE {' AND '.join(base_where)}
+            {where_sql}
             GROUP BY result_id
             ORDER BY first_played_at ASC, result_id ASC
             LIMIT ${limit_idx} OFFSET ${offset_idx}
@@ -780,11 +813,13 @@ async def get_matches(
         if not result_ids_text:
             return []
 
-        # ---- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----
-        rows = await conn.fetch("""
+        # ---------- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----------
+        rows = await conn.fetch(
+            """
             SELECT
                 mh.id,
                 mh.season_id,
+                s.name AS season_name,
                 mh.result_id,
                 mh.user_id,
                 mh.pos,
@@ -803,11 +838,14 @@ async def get_matches(
                 p.country AS player_country
             FROM public.match_history mh
             LEFT JOIN public.players p ON p.user_id = mh.user_id
+            LEFT JOIN public.seasons s ON s.id = mh.season_id
             WHERE mh.result_id::text = ANY($1::text[])
             ORDER BY mh.played_at ASC, mh.result_id ASC, mh.pos ASC, mh.id ASC
-        """, result_ids_text)
+            """,
+            result_ids_text,
+        )
 
-    # ---- 3) Agrupar en matches[result_id].players[] ----
+    # ---------- 3) Agrupar en matches[result_id].players[] ----------
     matches_by_result: Dict[int, Dict] = {}
 
     for r in rows:
@@ -815,7 +853,7 @@ async def get_matches(
         try:
             rid = int(rid_raw)
         except Exception:
-            rid = rid_raw  # fallback, por si alguna vez no es numérico
+            rid = rid_raw  # fallback por si alguna vez no es numérico
 
         played_dt: Optional[datetime] = r["played_at"]
 
@@ -825,6 +863,7 @@ async def get_matches(
                 "id": rid,
                 "season_id": r["season_id"],
                 "seasonId": r["season_id"],
+                "season_name": r.get("season_name"),
                 "result_id": rid,
                 "resultId": rid,
                 "played_at": played_dt,
@@ -864,7 +903,7 @@ async def get_matches(
         }
         matches_by_result[rid].setdefault("players", []).append(player_entry)
 
-    # ---- 4) Calcular avg_mmr por match (room MMR) ----
+    # ---------- 4) Calcular avg_mmr por match (ROOM MMR) ----------
     for m in matches_by_result.values():
         mmrs = [p["mmr_before"] for p in m["players"] if p["mmr_before"] is not None]
         if mmrs:
@@ -874,7 +913,7 @@ async def get_matches(
         m["avg_mmr"] = avg
         m["avgMmr"] = avg
 
-    # ---- 5) Ordenar por played_at ASC (más viejas primero) ----
+    # ---------- 5) Ordenar por played_at ASC (más viejas primero) ----------
     matches_list = list(matches_by_result.values())
     matches_list.sort(
         key=lambda x: (

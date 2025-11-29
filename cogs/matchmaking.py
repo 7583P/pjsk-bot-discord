@@ -161,7 +161,7 @@ ALLOWED_DIFFS_BY_RANK = {
     "Master ⬆":    ("expert", "master", "append"),
     "Champion":      ("expert", "master", "append"),
     "Grand Champion": ("expert", "master", "append"),
-    "Legend":        ("master", "append"),
+    "Legend":        ("expert", "master", "append"),
 }
 
 # Nuevos rangos con gap exacto
@@ -1192,7 +1192,7 @@ class Matchmaking(commands.Cog):
 
                 bundles: list[tuple[str, list[dict], list[dict]]] = []
 
-                # Intentamos EN
+                # EN
                 try:
                     musics_en = await grab(self.RAW_EN, "musics")
                     diffs_en  = await grab(self.RAW_EN, "musicDifficulties")
@@ -1200,7 +1200,7 @@ class Matchmaking(commands.Cog):
                 except Exception as e:
                     log.warning(f"[songs] EN fetch failed ({e})")
 
-                # Intentamos JP
+                # JP
                 try:
                     musics_jp = await grab(self.RAW_JP, "musics")
                     diffs_jp  = await grab(self.RAW_JP, "musicDifficulties")
@@ -1213,10 +1213,14 @@ class Matchmaking(commands.Cog):
                     return
 
             now_ts = int(datetime.datetime.utcnow().timestamp())
-            all_rows: list[tuple[int, str, str, int, int, str]] = []
+
+            # agrupamos filas por servidor, para poder reemplazar por servidor
+            by_server: dict[str, list[tuple[int, str, str, int, int, str]]] = {}
 
             for server_code, musics, diffs in bundles:
                 music_by_id = {m["id"]: m for m in musics}
+
+                rows_for_server: list[tuple[int, str, str, int, int, str]] = []
 
                 for d in diffs:
                     if d.get("musicDifficulty") not in self.DIFFS:
@@ -1225,7 +1229,7 @@ class Matchmaking(commands.Cog):
                     music = music_by_id.get(d["musicId"], {})
                     title = music.get("title", f"ID {d['musicId']}")
 
-                    # Fecha de release (del servidor correspondiente)
+                    # Fecha de release del servidor correspondiente
                     raw_release = (
                         music.get("publishedAt")
                         or music.get("startAt")
@@ -1233,13 +1237,20 @@ class Matchmaking(commands.Cog):
                         or 0
                     )
 
+                    # normalizamos a segundos
                     if raw_release and raw_release > 10_000_000_000:
                         release_ts = int(raw_release // 1000)
                     else:
                         release_ts = int(raw_release or 0)
 
-                    # Delay 1 día: solo entra al pool si pasó 1 día desde release
-                    if release_ts and (release_ts + 24 * 60 * 60) > now_ts:
+                    # 🔴 REGLA NUEVA:
+                    #  - si NO hay fecha (release_ts == 0) → asumimos que NO está en el juego todavía → no la usamos
+                    #  - si todavía no ha pasado 1 día desde el release → tampoco la usamos
+                    if release_ts == 0:
+                        continue
+
+                    if (release_ts + 24 * 60 * 60) > now_ts:
+                        # aún no ha pasado 1 día desde el release
                         continue
 
                     # Cálculo robusto de notas
@@ -1260,30 +1271,40 @@ class Matchmaking(commands.Cog):
                         if isinstance(notes_map, dict):
                             notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
 
-                    all_rows.append((
+                    rows_for_server.append((
                         d["musicId"],
                         title,
                         d["musicDifficulty"],
                         int(d["playLevel"]),
                         int(notes_total or 0),
-                        server_code,      # 👈 EN o JP
+                        server_code,      # 'en' o 'jp'
                     ))
 
+                by_server[server_code] = rows_for_server
+
             async with self.db_pool.acquire() as conn:
-                await conn.executemany(
-                    """
-                    INSERT INTO songs (id, title, diff, level, notes_count, server)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT ON CONSTRAINT songs_id_diff_server_key DO UPDATE
-                    SET title = EXCLUDED.title,
-                        level = EXCLUDED.level,
-                        notes_count = EXCLUDED.notes_count
-                    """,
-                    all_rows
-                )
+                # Solo tocamos los servidores que sí pudimos refrescar en este ciclo
+                for server_code, rows in by_server.items():
+                    # Limpiamos catálogo viejo de ese servidor
+                    await conn.execute(
+                        "DELETE FROM songs WHERE server = $1",
+                        server_code
+                    )
 
-        print("[songs] Catálogo EN/JP actualizado (UPSERT por servidor)")
+                    if not rows:
+                        log.warning(f"[songs] No hay canciones válidas para server={server_code} tras filtrar por release+1d.")
+                        continue
 
+                    # Insertamos solo las canciones que YA cumplieron el día de gracia
+                    await conn.executemany(
+                        """
+                        INSERT INTO songs (id, title, diff, level, notes_count, server)
+                        VALUES ($1, $2, $3, $4, $5, $6)
+                        """,
+                        rows
+                    )
+
+        print("[songs] Catálogo EN/JP actualizado (reemplazo por servidor, con filtro release+1d)")
 
 
 
