@@ -835,15 +835,20 @@ async def get_matches(
                 mh.is_win,
                 mh.played_at,
                 p.name    AS player_name,
-                p.country AS player_country
+                p.country AS player_country,
+                r.gap_low   AS gap_low,
+                r.gap_high  AS gap_high,
+                r.room_mmr  AS room_mmr
             FROM public.match_history mh
             LEFT JOIN public.players p ON p.user_id = mh.user_id
             LEFT JOIN public.seasons s ON s.id = mh.season_id
+            LEFT JOIN public.results  r ON r.result_id = mh.result_id
             WHERE mh.result_id::text = ANY($1::text[])
             ORDER BY mh.played_at ASC, mh.result_id ASC, mh.pos ASC, mh.id ASC
             """,
             result_ids_text,
         )
+
 
     # ---------- 3) Agrupar en matches[result_id].players[] ----------
     matches_by_result: Dict[int, Dict] = {}
@@ -868,11 +873,28 @@ async def get_matches(
                 "resultId": rid,
                 "played_at": played_dt,
                 "playedAt": played_dt.isoformat() if played_dt else None,
+                # LV range (gap) que usaste al hacer el RESULT en Discord
+                "gap_low": r.get("gap_low"),
+                "gapLow": r.get("gap_low"),
+                "gap_high": r.get("gap_high"),
+                "gapHigh": r.get("gap_high"),
+                # Room MMR guardado por el bot (si no está, luego usamos avg_mmr)
+                "room_mmr": r.get("room_mmr"),
+                "roomMmr": r.get("room_mmr"),
                 "avg_mmr": None,
                 "avgMmr": None,
                 "players": [],
             }
             matches_by_result[rid] = m
+
+
+        # PTS = P*4 + G*3 + G2*2 + B*1 + M*0
+        s_p = int(r["s_perfect"] or 0)
+        s_g = int(r["s_great"] or 0)
+        s_g2 = int(r["s_good"] or 0)
+        s_b = int(r["s_bad"] or 0)
+        s_m = int(r["s_miss"] or 0)
+        points = s_p * 4 + s_g * 3 + s_g2 * 2 + s_b * 1  # miss * 0
 
         player_entry = {
             "user_id": r["user_id"],
@@ -890,17 +912,21 @@ async def get_matches(
             "isWin": r["is_win"],
             "was_placement": r["was_placement"],
             "wasPlacement": r["was_placement"],
-            "s_perfect": r["s_perfect"],
-            "sPerfect": r["s_perfect"],
-            "s_great": r["s_great"],
-            "sGreat": r["s_great"],
-            "s_good": r["s_good"],
-            "sGood": r["s_good"],
-            "s_bad": r["s_bad"],
-            "sBad": r["s_bad"],
-            "s_miss": r["s_miss"],
-            "sMiss": r["s_miss"],
+            "s_perfect": s_p,
+            "sPerfect": s_p,
+            "s_great": s_g,
+            "sGreat": s_g,
+            "s_good": s_g2,
+            "sGood": s_g2,
+            "s_bad": s_b,
+            "sBad": s_b,
+            "s_miss": s_m,
+            "sMiss": s_m,
+            # 🔹 nuevo campo: puntos totales del jugador en este match
+            "points": points,
+            "pts": points,
         }
+
         matches_by_result[rid].setdefault("players", []).append(player_entry)
 
     # ---------- 4) Calcular avg_mmr por match (ROOM MMR) ----------
@@ -912,6 +938,11 @@ async def get_matches(
             avg = None
         m["avg_mmr"] = avg
         m["avgMmr"] = avg
+
+        if m.get("room_mmr") is None:
+            m["room_mmr"] = avg
+            m["roomMmr"] = avg
+
 
     # ---------- 5) Ordenar por played_at ASC (más viejas primero) ----------
     matches_list = list(matches_by_result.values())

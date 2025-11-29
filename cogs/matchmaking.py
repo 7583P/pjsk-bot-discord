@@ -167,24 +167,24 @@ ALLOWED_DIFFS_BY_RANK = {
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
     "Placement":     (24, 28),
-    "Iron":          (17, 22),
-    "Bronze":        (18, 23),
-    "Bronze ⬆":      (19, 24),
-    "Silver":        (20, 25),
-    "Silver ⬆":      (21, 26),
-    "Gold":          (22, 27),
-    "Gold ⬆":        (23, 28),
-    "Platinum":      (24, 29),
-    "Platinum ⬆":    (25, 29),
-    "Diamond":       (26, 30),
+    "Iron":          (17, 20),
+    "Bronze":        (18, 21),
+    "Bronze ⬆":      (19, 22),
+    "Silver":        (20, 23),
+    "Silver ⬆":      (21, 24),
+    "Gold":          (22, 25),
+    "Gold ⬆":        (23, 26),
+    "Platinum":      (24, 27),
+    "Platinum ⬆":    (25, 28),
+    "Diamond":       (26, 29),
     "Diamond ⬆":     (27, 30), 
     "Crystal":       (28, 31),
-    "Crystal ⬆":     (28, 32),
-    "Master":        (29, 33),
-    "Master ⬆":      (30, 34),
-    "Champion":      (31, 34),
-    "Grand Champion": (31, 35),
-    "Legend":        (32, 37),
+    "Crystal ⬆":     (29, 32),
+    "Master":        (30, 33),
+    "Master ⬆":      (31, 34),
+    "Champion":      (32, 35),
+    "Grand Champion": (33, 36),
+    "Legend":        (34, 37),
 }
 
 MIN_LEVEL_GAP = 3
@@ -1024,6 +1024,50 @@ class Matchmaking(commands.Cog):
         for g in self.bot.guilds:
             if g.get_member(after.id):
                 await self.refresh_rooms_board_for_guild(g)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member):
+        # Solo nos importa el main guild
+        if member.guild.id != GUILD_ID:
+            return
+
+        season = await self.get_current_season()
+        if not season:
+            return
+
+        season_id = season["id"]
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT role FROM seasonplayers WHERE season_id = $1 AND user_id = $2",
+                season_id,
+                member.id,
+            )
+            if not row:
+                return  # no estaba en la season actual
+
+            role = row["role"]
+
+            # Siempre lo sacamos de la season actual
+            await conn.execute(
+                "DELETE FROM seasonplayers WHERE season_id = $1 AND user_id = $2",
+                season_id,
+                member.id,
+            )
+
+            # Si además seguía en Placement, limpiamos players si ya no tiene ninguna season
+            if role == "Placement":
+                await conn.execute(
+                    """
+                    DELETE FROM players
+                    WHERE user_id = $1
+                      AND NOT EXISTS (
+                        SELECT 1 FROM seasonplayers WHERE user_id = $1
+                      )
+                    """,
+                    member.id,
+                )
+
 
 
     async def cog_load(self):
@@ -2536,19 +2580,34 @@ class Matchmaking(commands.Cog):
                 cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
-                # bandera guardada en DB, como fallback
+                # Normalizamos el country code (PE, US, JP, etc.)
+                cc_up = (cc or "").upper()
+
+                # 🔹 Persistir el país en la tabla players
+                await self.db_pool.execute(
+                    """
+                    INSERT INTO players (user_id, country)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET country = EXCLUDED.country
+                    """,
+                    uid,
+                    cc_up,
+                )
+
+                # Leemos lo que quedó guardado como fallback
                 profile_cc = await self.db_pool.fetchval(
                     "SELECT country FROM players WHERE user_id=$1", uid
                 ) or ""
 
-                cc_up = (cc or "").upper()
+                # Bandera que se usará en el embed de Discord
                 display_flag = country_flag(cc_up) or country_flag(profile_cc)
 
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
                 players_list.append(
                     {
                         "member": member,
-                        "cc": cc,
+                        "cc": cc_up,
                         "stats": stats,
                         "total": total_points,
                         "old": old,
@@ -2560,6 +2619,7 @@ class Matchmaking(commands.Cog):
                         "seed_rank": None,
                     }
                 )
+
 
             # Fase 1: aplicar seed si es Placement
             for p in players_list:
