@@ -2577,41 +2577,26 @@ class Matchmaking(commands.Cog):
             players_list = []
             for member in players:
                 uid = member.id
-                cc, stats = by_id[uid]
+                cc, stats = by_id[uid]          # cc solo se usa para el regex/formato, NO para bandera
                 old, current_role = await self.fetch_player(uid)
 
-                # Normalizamos el country code (PE, US, JP, etc.)
-                cc_up = (cc or "").upper()
-
-                # 🔹 Persistir el país en la tabla players
-                await self.db_pool.execute(
-                    """
-                    INSERT INTO players (user_id, country)
-                    VALUES ($1, $2)
-                    ON CONFLICT (user_id)
-                    DO UPDATE SET country = EXCLUDED.country
-                    """,
-                    uid,
-                    cc_up,
-                )
-
-                # Leemos lo que quedó guardado como fallback
+                # 1) país SIEMPRE desde el perfil (/register)
                 profile_cc = await self.db_pool.fetchval(
                     "SELECT country FROM players WHERE user_id=$1", uid
                 ) or ""
 
-                # Bandera que se usará en el embed de Discord
-                display_flag = country_flag(cc_up) or country_flag(profile_cc)
+                # 2) la bandera solo viene del perfil; si no tiene /register → sin bandera
+                display_flag = country_flag(profile_cc)
 
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
                 players_list.append(
                     {
                         "member": member,
-                        "cc": cc_up,
+                        "cc": profile_cc,          # información de perfil, no se cambia aquí
                         "stats": stats,
                         "total": total_points,
                         "old": old,
-                        "mmr_actual": old,  # ← base, se ajusta con Placement
+                        "mmr_actual": old,         # luego se ajusta con Placement
                         "role": current_role,
                         "display_flag": display_flag,
                         "was_placement": (current_role == "Placement"),
