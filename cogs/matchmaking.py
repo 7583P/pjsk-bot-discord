@@ -1117,13 +1117,19 @@ class Matchmaking(commands.Cog):
                     title        TEXT    NOT NULL,
                     diff         TEXT    NOT NULL,
                     level        INTEGER NOT NULL,
-                    notes_count  INTEGER NOT NULL DEFAULT 0,
-                    server       TEXT    NOT NULL DEFAULT 'en'
+                    notes_count  INTEGER NOT NULL DEFAULT 0
+                    -- OJO: sin server aquí o con server, da igual
+                    -- si ya existe no toca la tabla.
                 );
             """)
 
-            #Elimina duplicados previos (por (id,diff,server) una vez que tengamos server=en por defecto)
-            
+            # 1️⃣ Primero aseguro que la columna server exista
+            await conn.execute("""
+                ALTER TABLE songs
+                ADD COLUMN IF NOT EXISTS server TEXT NOT NULL DEFAULT 'en';
+            """)
+
+            # 2️⃣ Ahora sí puedo borrar duplicados por (id,diff,server)
             await conn.execute("""
                 DELETE FROM songs a
                 USING songs b
@@ -1133,13 +1139,7 @@ class Matchmaking(commands.Cog):
                   AND a.ctid > b.ctid;
             """)
 
-            #Asegura que exista la columna server en instalaciones antiguas
-            await conn.execute("""
-                ALTER TABLE songs
-                ADD COLUMN IF NOT EXISTS server TEXT NOT NULL DEFAULT 'en';
-            """)
-
-            #Unique en (id, diff, server) para poder tener EN y JP
+            # 3️⃣ Unique en (id, diff, server) para EN/JP
             await conn.execute("""
                 DO $$
                 BEGIN
@@ -1167,6 +1167,7 @@ class Matchmaking(commands.Cog):
 
             # Índices útiles
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_level_server ON songs(level, server);")
+
 
 
 
