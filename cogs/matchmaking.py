@@ -161,7 +161,7 @@ ALLOWED_DIFFS_BY_RANK = {
     "Master ⬆":    ("expert", "master", "append"),
     "Champion":      ("expert", "master", "append"),
     "Grand Champion": ("expert", "master", "append"),
-    "Legend":        ("expert", "master", "append"),
+    "Legend":        ("master", "append"),
 }
 
 # Nuevos rangos con gap exacto
@@ -426,25 +426,15 @@ class Matchmaking(commands.Cog):
         return get_rank_from_mmr(avg_mmr)
 
     
-    async def _get_random_songs(
-        self,
-        low: int,
-        high: int,
-        diffs: tuple[str, ...],
-        limit: int,
-        *,
-        server: str = "en",
-        exclude_titles: set[str] | None = None
-    ):
+    async def _get_random_songs(self, low: int, high: int, diffs: tuple[str, ...], limit: int, exclude_titles: set[str] | None = None):
         """
-        Devuelve hasta 'limit' canciones aleatorias (title, level, diff_capitalized, notes)
-        en [low, high] y diffs dadas, filtrando por server ('en' o 'jp').
+        Devuelve hasta 'limit' canciones aleatorias (title, level, diff_capitalized, notes) en [low, high] y diffs dadas.
         """
         exclude_titles = exclude_titles or set()
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
-                placeholders = ",".join(f"${i+4}" for i in range(len(diffs)))
-                params: list = [low, high, server, *diffs]
+                placeholders = ",".join(f"${i+3}" for i in range(len(diffs)))
+                params = [low, high, *diffs]
                 extra_where = ""
                 if exclude_titles:
                     notin = ",".join(f"${len(params)+i+1}" for i in range(len(exclude_titles)))
@@ -456,9 +446,8 @@ class Matchmaking(commands.Cog):
                     SELECT title, level, diff, notes_count
                     FROM songs
                     WHERE level BETWEEN $1 AND $2
-                      AND server = $3
-                      AND diff IN ({placeholders})
-                      {extra_where}
+                    AND diff IN ({placeholders})
+                    {extra_where}
                     ORDER BY random()
                     LIMIT {int(limit)}
                     """,
@@ -470,19 +459,13 @@ class Matchmaking(commands.Cog):
             out.append((r["title"], int(r["level"]), r["diff"].capitalize(), int(r["notes_count"])))
         return out
 
-
-    async def _pick_placement_songs_levels_24_to_28(
-        self,
-        *,
-        server: str = "en"
-    ) -> list[tuple[str, int, str, int]]:
+    async def _pick_placement_songs_levels_24_to_28(self) -> list[tuple[str, int, str, int]]:
         """
         Regla especial Placement:
         - EXACTAMENTE 1 canción por nivel: 24, 25, 26, 27 y 28
         - Solo EXPERT
         - Evita repetir títulos
         - Si un nivel no tiene canciones Expert en el catálogo, intenta fallback aleatorio dentro 24–28.
-        Filtra por server ('en' o 'jp').
         """
         levels = [24, 25, 26, 27, 28]
         picks: list[tuple[str, int, str, int]] = []
@@ -491,19 +474,20 @@ class Matchmaking(commands.Cog):
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
                 for L in levels:
+                    # Intenta 1 canción EXACTA de ese nivel (Expert/Master)
                     rows = await conn.fetch(
                         """
                         SELECT title, level, diff, notes_count
                         FROM songs
                         WHERE level = $1
                           AND diff IN ('expert')
-                          AND server = $2
                         ORDER BY random()
                         LIMIT 5
                         """,
-                        L, server
+                        L
                     )
 
+                    # toma la primera cuyo título no esté usado
                     picked = None
                     for r in rows:
                         if r["title"] not in chosen_titles:
@@ -511,17 +495,16 @@ class Matchmaking(commands.Cog):
                             break
 
                     if picked is None:
+                        # Fallback: cualquiera en 24–28 Expert/Master que no repita título
                         fb = await conn.fetch(
                             """
                             SELECT title, level, diff, notes_count
                             FROM songs
                             WHERE level BETWEEN 24 AND 28
                               AND diff IN ('expert')
-                              AND server = $1
                             ORDER BY random()
                             LIMIT 10
-                            """,
-                            server
+                            """
                         )
                         for r in fb:
                             if r["title"] not in chosen_titles:
@@ -536,10 +519,11 @@ class Matchmaking(commands.Cog):
                             picked["diff"].capitalize(),
                             int(picked["notes_count"])
                         ))
+                    # Si ni siquiera el fallback trae algo, simplemente sigue (dejará <5, muy raro)
 
+        # Mezcla para no salir siempre en orden 24→28
         random.shuffle(picks)
         return picks[:5]
-
 
 
 
@@ -1118,57 +1102,36 @@ class Matchmaking(commands.Cog):
                     diff         TEXT    NOT NULL,
                     level        INTEGER NOT NULL,
                     notes_count  INTEGER NOT NULL DEFAULT 0
-                    -- OJO: sin server aquí o con server, da igual
-                    -- si ya existe no toca la tabla.
                 );
             """)
 
-            # 1️⃣ Primero aseguro que la columna server exista
-            await conn.execute("""
-                ALTER TABLE songs
-                ADD COLUMN IF NOT EXISTS server TEXT NOT NULL DEFAULT 'en';
-            """)
-
-            # 2️⃣ Ahora sí puedo borrar duplicados por (id,diff,server)
+            # — 1) Elimina duplicados previos (deja 1 fila por (id,diff)) —
             await conn.execute("""
                 DELETE FROM songs a
                 USING songs b
                 WHERE a.id = b.id
-                  AND a.diff = b.diff
-                  AND a.server = b.server
-                  AND a.ctid > b.ctid;
+                AND a.diff = b.diff
+                AND a.ctid > b.ctid;
             """)
 
-            # 3️⃣ Unique en (id, diff, server) para EN/JP
+            # — 2) Crea restricción única para que ON CONFLICT funcione —
             await conn.execute("""
                 DO $$
                 BEGIN
-                    IF EXISTS (
-                        SELECT 1
-                        FROM   pg_constraint
-                        WHERE  conname = 'songs_id_diff_key'
-                        AND    conrelid = 'songs'::regclass
-                    ) THEN
-                        ALTER TABLE songs
-                        DROP CONSTRAINT songs_id_diff_key;
-                    END IF;
-
                     IF NOT EXISTS (
                         SELECT 1
                         FROM   pg_constraint
-                        WHERE  conname = 'songs_id_diff_server_key'
-                        AND    conrelid = 'songs'::regclass
+                        WHERE  conname = 'songs_id_diff_key'
+                        AND conrelid = 'songs'::regclass
                     ) THEN
                         ALTER TABLE songs
-                        ADD CONSTRAINT songs_id_diff_server_key UNIQUE (id, diff, server);
+                        ADD CONSTRAINT songs_id_diff_key UNIQUE (id, diff);
                     END IF;
                 END$$;
             """)
 
-            # Índices útiles
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_level_server ON songs(level, server);")
-
-
+            # — 3) Índices útiles —
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_songs_level ON songs(level);")
 
 
         # arranca el loop que refresca las canciones
@@ -1190,121 +1153,90 @@ class Matchmaking(commands.Cog):
                         r.raise_for_status()
                         return await r.json(content_type=None)
 
-                bundles: list[tuple[str, list[dict], list[dict]]] = []
-
-                # EN
                 try:
-                    musics_en = await grab(self.RAW_EN, "musics")
-                    diffs_en  = await grab(self.RAW_EN, "musicDifficulties")
-                    bundles.append(("en", musics_en, diffs_en))
+                    # Catálogo GLOBAL (EN)
+                    musics = await grab(self.RAW_EN, "musics")
+                    diffs  = await grab(self.RAW_EN, "musicDifficulties")
                 except Exception as e:
-                    log.warning(f"[songs] EN fetch failed ({e})")
+                    log.warning(f"[songs] EN fetch failed ({e}); trying JP fallback…")
+                    musics = await grab(self.RAW_JP, "musics")
+                    diffs  = await grab(self.RAW_JP, "musicDifficulties")
 
-                # JP
-                try:
-                    musics_jp = await grab(self.RAW_JP, "musics")
-                    diffs_jp  = await grab(self.RAW_JP, "musicDifficulties")
-                    bundles.append(("jp", musics_jp, diffs_jp))
-                except Exception as e:
-                    log.warning(f"[songs] JP fetch failed ({e})")
+            # --------- NUEVO: necesitamos todo el objeto music, no solo el título ---------
+            music_by_id = {m["id"]: m for m in musics}
+            now_ts = int(datetime.datetime.utcnow().timestamp())  # segundos epoch actuales
+            # ---------------------------------------------------------------------------
 
-                if not bundles:
-                    log.error("[songs] No se pudo obtener ni EN ni JP.")
-                    return
+            rows = []
+            for d in diffs:
+                if d.get("musicDifficulty") not in DIFFICULTY_PRIORITY:
+                    continue
 
-            now_ts = int(datetime.datetime.utcnow().timestamp())
+                # --------- NUEVO: tomar fecha de release del juego y aplicar delay 24h -----
+                music = music_by_id.get(d["musicId"], {})
+                # título como antes
+                title = music.get("title", f"ID {d['musicId']}")
 
-            # agrupamos filas por servidor, para poder reemplazar por servidor
-            by_server: dict[str, list[tuple[int, str, str, int, int, str]]] = {}
+                # en los JSON de Sekai suele ser publishedAt (ms); por si acaso probamos varias claves
+                raw_release = (
+                    music.get("publishedAt") or
+                    music.get("startAt") or
+                    music.get("releaseAt") or
+                    0
+                )
 
-            for server_code, musics, diffs in bundles:
-                music_by_id = {m["id"]: m for m in musics}
+                # convertir a segundos (si viene en milisegundos)
+                if raw_release and raw_release > 10_000_000_000:
+                    # probablemente milisegundos
+                    release_ts = int(raw_release // 1000)
+                else:
+                    release_ts = int(raw_release or 0)
 
-                rows_for_server: list[tuple[int, str, str, int, int, str]] = []
+                # si tenemos fecha de release y aún no han pasado 24h → NO la metemos al pool
+                if release_ts and (release_ts + 24 * 60 * 60) > now_ts:
+                    # todavía es "demasiado nueva" en el juego → la saltamos
+                    continue
+                # ---------------------------------------------------------------------------
 
-                for d in diffs:
-                    if d.get("musicDifficulty") not in self.DIFFS:
-                        continue
+                # Total de notas robusto (mantengo tu lógica)
+                notes_total = d.get("notesCount", None)
+                if isinstance(notes_total, dict):
+                    notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
+                elif isinstance(notes_total, list):
+                    t = 0
+                    for it in notes_total:
+                        if isinstance(it, dict):
+                            v = it.get("count") or it.get("notes") or 0
+                            if isinstance(v, int):
+                                t += v
+                    notes_total = t
+                if not isinstance(notes_total, int):
+                    notes_total = d.get("noteCount") or d.get("totalNoteCount") or 0
+                    notes_map   = d.get("notes")
+                    if isinstance(notes_map, dict):
+                        notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
 
-                    music = music_by_id.get(d["musicId"], {})
-                    title = music.get("title", f"ID {d['musicId']}")
-
-                    # Fecha de release del servidor correspondiente
-                    raw_release = (
-                        music.get("publishedAt")
-                        or music.get("startAt")
-                        or music.get("releaseAt")
-                        or 0
-                    )
-
-                    # normalizamos a segundos
-                    if raw_release and raw_release > 10_000_000_000:
-                        release_ts = int(raw_release // 1000)
-                    else:
-                        release_ts = int(raw_release or 0)
-
-                    # 🔴 REGLA NUEVA:
-                    #  - si NO hay fecha (release_ts == 0) → asumimos que NO está en el juego todavía → no la usamos
-                    #  - si todavía no ha pasado 1 día desde el release → tampoco la usamos
-                    if release_ts == 0:
-                        continue
-
-                    if (release_ts + 24 * 60 * 60) > now_ts:
-                        # aún no ha pasado 1 día desde el release
-                        continue
-
-                    # Cálculo robusto de notas
-                    notes_total = d.get("notesCount", None)
-                    if isinstance(notes_total, dict):
-                        notes_total = sum(v for v in notes_total.values() if isinstance(v, int))
-                    elif isinstance(notes_total, list):
-                        t = 0
-                        for it in notes_total:
-                            if isinstance(it, dict):
-                                v = it.get("count") or it.get("notes") or 0
-                                if isinstance(v, int):
-                                    t += v
-                        notes_total = t
-                    if not isinstance(notes_total, int):
-                        notes_total = d.get("noteCount") or d.get("totalNoteCount") or 0
-                        notes_map   = d.get("notes")
-                        if isinstance(notes_map, dict):
-                            notes_total = sum(v for v in notes_map.values() if isinstance(v, int))
-
-                    rows_for_server.append((
-                        d["musicId"],
-                        title,
-                        d["musicDifficulty"],
-                        int(d["playLevel"]),
-                        int(notes_total or 0),
-                        server_code,      # 'en' o 'jp'
-                    ))
-
-                by_server[server_code] = rows_for_server
+                rows.append((
+                    d["musicId"],
+                    title,
+                    d["musicDifficulty"],
+                    int(d["playLevel"]),
+                    int(notes_total or 0),
+                ))
 
             async with self.db_pool.acquire() as conn:
-                # Solo tocamos los servidores que sí pudimos refrescar en este ciclo
-                for server_code, rows in by_server.items():
-                    # Limpiamos catálogo viejo de ese servidor
-                    await conn.execute(
-                        "DELETE FROM songs WHERE server = $1",
-                        server_code
-                    )
-
-                    if not rows:
-                        log.warning(f"[songs] No hay canciones válidas para server={server_code} tras filtrar por release+1d.")
-                        continue
-
-                    # Insertamos solo las canciones que YA cumplieron el día de gracia
-                    await conn.executemany(
-                        """
-                        INSERT INTO songs (id, title, diff, level, notes_count, server)
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        """,
-                        rows
-                    )
-
-        print("[songs] Catálogo EN/JP actualizado (reemplazo por servidor, con filtro release+1d)")
+                await conn.executemany(
+                    """
+                    INSERT INTO songs (id, title, diff, level, notes_count)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT ON CONSTRAINT songs_id_diff_key DO UPDATE
+                    SET title = EXCLUDED.title,
+                        level = EXCLUDED.level,
+                        notes_count = EXCLUDED.notes_count
+                    """,
+                    rows
+                )
+        print("[songs] Catálogo global actualizado (UPSERT)")
 
 
 
@@ -1312,7 +1244,7 @@ class Matchmaking(commands.Cog):
     async def _wait_ready(self):
         await self.bot.wait_until_ready()
 
-    async def _get_10_songs(self, low, high, diffs=None):
+    async def _get_9_songs(self, low, high, diffs=None):
         if diffs is None:
             diffs = DIFFICULTY_PRIORITY
 
@@ -1344,9 +1276,9 @@ class Matchmaking(commands.Cog):
             k = min(3, len(pool))
             picks.extend(random.sample(pool, k))
 
-        # Mezcla global y recorta a 10
+        # Mezcla global y recorta a 9
         random.shuffle(picks)
-        return picks[:10]
+        return picks[:9]
 
 
 
@@ -1363,9 +1295,6 @@ class Matchmaking(commands.Cog):
         thread  = room_info["thread"]
         players = room_info["players"]
 
-        server_code = room_info.get("server", "en")
-
-        # 1) Contar rangos (por rol primero, luego por MMR)
         counts = {rank: 0 for rank in BRACKET_RANGES}
         for m in players:
             # 1) Intentar detectar rango por rol
@@ -1384,39 +1313,41 @@ class Matchmaking(commands.Cog):
 
             counts[user_rank] = counts.get(user_rank, 0) + 1
 
-        # 2) Determinar rango base según MMR promedio del room
-        has_placement = counts.get("Placement", 0) > 0
-        if has_placement:
-            base_rank = "Placement"
+
+        # — 2) FORZAR GAP DE PLACEMENT SI HAY ALGUNO EN LA SALA —
+        if counts.get("Placement", 0) > 0:
+            low, high = BRACKET_RANGES["Placement"]  # (25, 28)
         else:
-            # usa el MMR promedio de la sala para determinar el rango
-            base_rank = await self._get_room_rank_by_avg_mmr(players)
-            if base_rank not in BRACKET_RANGES:
-                base_rank = "Diamond"  # fallback neutro por si acaso
+            low, high = dynamic_range(counts)
 
-        low, high = BRACKET_RANGES[base_rank]
-        allowed_diffs = ALLOWED_DIFFS_BY_RANK.get(base_rank, DIFFICULTY_PRIORITY)
+        # — 2.1) Dificultades permitidas según el (low,high) elegido —
+        #        (si se forzó Placement, esto devolverá ("hard","expert","master"))
+        allowed_diffs = DIFFICULTY_PRIORITY
+        for rank, (lo_r, hi_r) in BRACKET_RANGES.items():
+            if lo_r == low and hi_r == high:
+                allowed_diffs = ALLOWED_DIFFS_BY_RANK[rank]
+                break
 
-        # 3) Selección de canciones
-        #    - si la sala es Placement → modo especial 24–28 EXPERT
-        #    - en otro caso → gap base y append también según base_rank (MMR promedio)
-        if base_rank == "Placement":
-            # Regla especial de Placement: 1 canción por nivel 24–28, solo EXPERT
-            picks = await self._pick_placement_songs_levels_24_to_28(server=server_code)
+
+        # 3) Selección de canciones (gap base = BRACKET_RANGES; gap especial SOLO para append)
+        if counts.get("Placement", 0) > 0:
+            # Regla especial placement: 1 por nivel 24–28, solo Expert; el mensaje mostrará 24–28
+            picks = await self._pick_placement_songs_levels_24_to_28()
             low, high = 24, 28
         else:
-            # a) gap base para non-append (según rango por MMR promedio)
+            # a) gap base para non-append
             base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Determinar (opcional) el gap de append usando el MISMO rango del room (avg MMR)
+            # b) Determinar (opcional) el gap de append usando el RANGO DEL ROOM
             append_lo_hi = None
             append_limit = 0
-            room_rank_for_append = base_rank  # ya es el rango basado en avg MMR
             if "append" in allowed_diffs:
-                append_lo_hi = APPEND_RANGES.get(room_rank_for_append)
-                append_limit = get_append_pool_limit_for_rank(room_rank_for_append)
-                prob         = get_append_probability_for_rank(room_rank_for_append)
+                # 🔥 usar rango según MMR promedio del room, NO el más alto
+                room_rank = await self._get_room_rank_by_avg_mmr(players)
+                append_lo_hi = APPEND_RANGES.get(room_rank)
+                append_limit = get_append_pool_limit_for_rank(room_rank)
+                prob        = get_append_probability_for_rank(room_rank)
 
                 # si no hay rango o la tirada de prob falla → no usar append
                 if not append_lo_hi or append_limit <= 0 or random.random() >= prob:
@@ -1435,23 +1366,18 @@ class Matchmaking(commands.Cog):
             # Non-append (hard/expert/master) en gap base (posiblemente expandido)
             if non_append_diffs:
                 non_append_pool = await self._get_random_songs(
-                    base_lo, base_hi, non_append_diffs,
-                    limit=NON_APPEND_POOL_LIMIT,
-                    server=server_code,
+                    base_lo, base_hi, non_append_diffs, limit=NON_APPEND_POOL_LIMIT
                 )
                 pool.extend(non_append_pool)
-                taken_titles = {t for (t, *_) in non_append_pool}
+                taken_titles = {t for (t, *_ ) in non_append_pool}
             else:
                 taken_titles = set()
 
-            # Append en su propio rango (también basado en avg MMR)
+            # Append en su rango propio (que ahora está contenido dentro del base expandido)
             if append_lo_hi is not None and append_limit > 0:
                 alo, ahi = append_lo_hi
                 append_pool = await self._get_random_songs(
-                    alo, ahi, ("append",),
-                    limit=append_limit,
-                    server=server_code,
-                    exclude_titles=taken_titles,
+                    alo, ahi, ("append",), limit=append_limit, exclude_titles=taken_titles
                 )
                 pool.extend(append_pool)
 
@@ -1462,10 +1388,12 @@ class Matchmaking(commands.Cog):
             # f) El rango mostrado es SIEMPRE el base final (ya expandido)
             low, high = base_lo, base_hi
 
+
+
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
 
-        # Guardar info de la sala
+        # NEW: guardar también el gap de niveles y total de notas en la sala
         room_info["total_notes"] = total_notes
         room_info["gap_low"]     = low
         room_info["gap_high"]    = high
@@ -1493,7 +1421,6 @@ class Matchmaking(commands.Cog):
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
             self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
-
 
 
 
@@ -1646,22 +1573,21 @@ class Matchmaking(commands.Cog):
                 ephemeral=True
             )
 
-        # Determinar server en función del canal #join
-        if ch.id == 1378215330979254402:   # jp-pjsk → #join JP
-            server_code = "jp"
-        else:
-            server_code = "en"
+        # Determinar la categoría padre (si viene de Thread)
+        parent_chan = ch
+        if isinstance(parent_chan, Thread) and parent_chan.parent:
+            parent_chan = parent_chan.parent
+        current_cat = parent_chan.category_id or 0
 
         mmr_val, _ = await self.fetch_player(member.id)
 
-        # Buscar sala NO cerrada cuyo padre sea EXACTAMENTE este canal #join
+        # Buscar sala NO cerrada en esta categoría
         best_rid = None
         for rid, info in self.rooms.items():
-            thread_parent_id = info["thread"].parent_id
             if (
-                thread_parent_id == ch.id
-                and not info.get("closed", False)
-                and not info.get("started", False)
+                info["category_id"] == current_cat
+                and not info.get("closed", False)      # ignorar salas cerradas
+                and not info.get("started", False)     # no meter a salas iniciadas
                 and len(info["players"]) < 5
             ):
                 best_rid = rid
@@ -1679,11 +1605,10 @@ class Matchmaking(commands.Cog):
             self.rooms[new_id] = {
                 "players": [],
                 "thread": thread,
-                "category_id": ch.category_id or 0,
+                "category_id": current_cat,
                 "closed": False,
                 "started": False,
                 "finished": False,
-                "server": server_code,   # 👈 EN o JP, se guarda en la sala
             }
             best_rid = new_id
 
@@ -1715,7 +1640,6 @@ class Matchmaking(commands.Cog):
         # Auto-start si llega a 5
         if len(room["players"]) == 5:
             asyncio.create_task(self.launch_song_poll(room))
-
 
 
     @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
@@ -1999,7 +1923,7 @@ class Matchmaking(commands.Cog):
 
     @commands.command(name="debug_poll")
     async def debug_poll(self, ctx: commands.Context):
-        songs = await self._get_10_songs(1, 99)
+        songs = await self._get_9_songs(1, 99)
         await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones")
         if not songs:
             return await ctx.send("⚠️ No hay canciones en debug_poll.")
@@ -2048,146 +1972,42 @@ class Matchmaking(commands.Cog):
         if other == 0:  # All perfect (5 songs)
             return 800, "Champion"
         if other == 1:
-            return 790, "Master ⬆"
-        if other == 2:
-            return 780, "Master ⬆"
-        if other == 3:
-            return 770, "Master ⬆"
-        if other == 4:
-            return 760, "Master ⬆"
-        if other == 5:
             return 750, "Master ⬆"
-        if other == 6:
+        if other == 2:
             return 740, "Master"
-        if other == 7:
+        if other == 3:
             return 730, "Master"
-        if other == 8:
+        if other == 4:
             return 720, "Master"
-        if other == 9:
+        if other == 5:
             return 710, "Master"
-        if other == 10:
+        if 6 <= other <= 10:
             return 700, "Master"
-        if other == 11:
-            return 690, "Crystal ⬆"
-        if other == 12:
-            return 680, "Crystal ⬆"
-        if other == 13:
-            return 670, "Crystal ⬆"
-        if other == 14:
-            return 660, "Crystal ⬆"
-        if other == 15:
+        if 11 <= other <= 15:
             return 650, "Crystal ⬆"
-        if other == 16:
-            return 640, "Crystal"
-        if other == 17:
-            return 630, "Crystal"
-        if other == 18:
-            return 620, "Crystal"
-        if other == 19:
-            return 610, "Crystal"
-        if other == 20:
+        if 16 <= other <= 20:
             return 600, "Crystal"
-        if 21 <= other <= 23:
-            return 590, "Diamond ⬆"
-        if 24 <= other <= 26:
-            return 580, "Diamond ⬆"
-        if 27 <= other <= 29:
-            return 570, "Diamond ⬆"
-        if 30 <= other <= 32:
-            return 560, "Diamond ⬆"
-        if 33 <= other <= 35:
+        if 21 <= other <= 30:
             return 550, "Diamond ⬆"
-        if 36 <= other <= 38:
-            return 540, "Diamond"
-        if 39 <= other <= 41:
-            return 530, "Diamond"
-        if 42 <= other <= 44:
-            return 520, "Diamond"
-        if 45 <= other <= 47:
-            return 510, "Diamond"
-        if 48 <= other <= 50:
+        if 31 <= other <= 50:
             return 500, "Diamond"
-        if 51 <= other <= 55:
-            return 490, "Platinum ⬆"
-        if 56 <= other <= 60:
-            return 480, "Platinum ⬆"
-        if 61 <= other <= 65:
-            return 470, "Platinum ⬆"
-        if 66 <= other <= 70:
-            return 460, "Platinum ⬆"
-        if 71 <= other <= 75:
+        if 51 <= other <= 70:
             return 450, "Platinum ⬆"
-        if 76 <= other <= 80:
-            return 440, "Platinum"
-        if 81 <= other <= 85:
-            return 430, "Platinum"
-        if 86 <= other <= 90:
-            return 420, "Platinum"
-        if 91 <= other <= 95:
-            return 410, "Platinum"
-        if 96 <= other <= 100:
+        if 71 <= other <= 100:
             return 400, "Platinum"
-        if 101 <= other <= 120:
-            return 390, "Gold ⬆"
-        if 121 <= other <= 140:
-            return 380, "Gold ⬆"
-        if 141 <= other <= 160:
-            return 370, "Gold ⬆"
-        if 161 <= other <= 180:
-            return 360, "Gold ⬆"
-        if 181 <= other <= 200:
+        if 101 <= other <= 150:
             return 350, "Gold ⬆"
-        if 201 <= other <= 220:
-            return 340, "Gold"
-        if 221 <= other <= 240:
-            return 330, "Gold"
-        if 241 <= other <= 260:
-            return 320, "Gold"
-        if 261 <= other <= 280:
-            return 310, "Gold"
-        if 281 <= other <= 300:
-            return 300, "Gold"     
-        if 301 <= other <= 330:
-            return 290, "Silver ⬆"
-        if 331 <= other <= 360:
-            return 280, "Silver ⬆"
-        if 361 <= other <= 390:
-            return 270, "Silver ⬆"
-        if 391 <= other <= 420:
-            return 260, "Silver ⬆"
-        if 421 <= other <= 450:
+        if 151 <= other <= 300:
+            return 300, "Gold"
+        if 301 <= other <= 450:
             return 250, "Silver ⬆"
-        if 451 <= other <= 480:
-            return 240, "Silver"
-        if 481 <= other <= 510:
-            return 230, "Silver"
-        if 511 <= other <= 540:
-            return 220, "Silver"
-        if 541 <= other <= 570:
-            return 210, "Silver"
-        if 571 <= other <= 600:
+        if 451 <= other <= 600:
             return 200, "Silver"
-        if 601 <= other <= 640:
-            return 190, "Bronze ⬆"     
-        if 641 <= other <= 680:
-            return 180, "Bronze ⬆"
-        if 681 <= other <= 720:
-            return 170, "Bronze ⬆"
-        if 721 <= other <= 760:
-            return 160, "Bronze ⬆"
-        if 761 <= other <= 800:
+        if 601 <= other <= 800:
             return 150, "Bronze ⬆"
-        if 801 <= other <= 840:
-            return 140, "Bronze"
-        if 841 <= other <= 880:
-            return 130, "Bronze"
-        if 881 <= other <= 920:
-            return 120, "Bronze"
-        if 921 <= other <= 960:
-            return 110, "Bronze"
-        if 961 <= other <= 999:
+        if 801 <= other <= 999:
             return 100, "Bronze"
-        return 50, "Iron" # 1000 - infinite
+        return 50, "Iron"  # 1000 - infinite
 
 
     async def _resolve_channel(self, channel_id: int, *, fallback: discord.abc.Messageable) -> discord.abc.Messageable:
