@@ -1027,64 +1027,54 @@ class Matchmaking(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_remove(self, member: discord.Member):
-        """
-        Limpia registros cuando un usuario abandona el servidor:
-
-        - Si NUNCA jugó en ninguna season (solo tiene registros Placement/0 MMR
-          y sin match_history), se borra de TODAS las seasons y de players.
-        - Si jugó en alguna season:
-          * Se mantiene en las seasons donde jugó (mmr>0 o rank!=Placement o tiene historial).
-          * Se elimina solo de las seasons donde está como Placement/0 MMR
-            y no tiene historial (nunca jugó ahí).
-        """
+        # Solo nos importa el main guild
         if member.guild.id != GUILD_ID:
             return
 
         async with self.db_pool.acquire() as conn:
-            # Todas las seasons donde aparece en seasonplayers
+            # 1) Todas las seasons donde aparece en seasonplayers
             sp_rows = await conn.fetch(
-                "SELECT season_id, mmr, role FROM seasonplayers WHERE user_id = $1",
+                """
+                SELECT season_id, mmr, role
+                FROM seasonplayers
+                WHERE user_id = $1
+                """,
                 member.id,
             )
 
-            # Si no tiene ninguna season registrada, solo intentamos limpiar players
             if not sp_rows:
-                await conn.execute(
-                    "DELETE FROM players WHERE user_id = $1",
-                    member.id,
-                )
+                # Nunca estuvo registrado en ninguna season → nada que hacer
                 return
 
-            # Seasons donde tiene historial de partidas
-            mh_rows = await conn.fetch(
-                "SELECT DISTINCT season_id FROM match_history WHERE user_id = $1",
-                member.id,
-            )
-            mh_seasons = {r["season_id"] for r in mh_rows}
+            seasons_to_delete: set[int] = set()
+            played_somewhere = False
 
-            # Seasons donde NUNCA jugó:
-            #   mmr = 0, role = 'Placement' y sin historial en esa season
-            never_played_seasons = [
-                r["season_id"]
-                for r in sp_rows
-                if r["mmr"] == 0
-                and r["role"] == "Placement"
-                and r["season_id"] not in mh_seasons
-            ]
+            # 2) Para cada season, ver si jugó al menos una partida
+            for r in sp_rows:
+                sid  = int(r["season_id"])
+                mmr  = int(r["mmr"])
+                role = r["role"]
 
-            # Seasons donde SÍ jugó (o al menos tiene algo significativo)
-            played_seasons = [
-                r["season_id"]
-                for r in sp_rows
-                if not (
-                    r["mmr"] == 0
-                    and r["role"] == "Placement"
-                    and r["season_id"] not in mh_seasons
+                played = await conn.fetchval(
+                    """
+                    SELECT 1
+                    FROM match_history
+                    WHERE user_id = $1 AND season_id = $2
+                    LIMIT 1
+                    """,
+                    member.id,
+                    sid,
                 )
-            ]
 
-            # 1) Borrar solo las seasons "fantasma" (Placement + 0 MMR + sin historial)
-            if never_played_seasons:
+                if played:
+                    # Jugó en esta season → la conservamos
+                    played_somewhere = True
+                else:
+                    # Nunca jugó en esta season → se puede limpiar
+                    seasons_to_delete.add(sid)
+
+            # 3) Borrar de seasonplayers solo las seasons donde nunca jugó
+            if seasons_to_delete:
                 await conn.execute(
                     """
                     DELETE FROM seasonplayers
@@ -1092,20 +1082,41 @@ class Matchmaking(commands.Cog):
                       AND season_id = ANY($2::int[])
                     """,
                     member.id,
-                    never_played_seasons,
+                    list(seasons_to_delete),
                 )
 
-            # 2) Si después de eso NO le queda ninguna season "real" ni historial:
-            #    → nunca jugó en ninguna season → se borra del todo
-            if not mh_seasons and not played_seasons:
-                await conn.execute(
-                    "DELETE FROM seasonplayers WHERE user_id = $1",
-                    member.id,
-                )
-                await conn.execute(
-                    "DELETE FROM players WHERE user_id = $1",
-                    member.id,
-                )
+            # 4) ¿Le queda al menos una season después de limpiar?
+            still_has_seasons = await conn.fetchval(
+                """
+                SELECT 1
+                FROM seasonplayers
+                WHERE user_id = $1
+                LIMIT 1
+                """,
+                member.id,
+            )
+
+            if still_has_seasons:
+                # Tiene historial en alguna season → NO tocamos players
+                return
+
+            # 5) Si llega aquí, no le queda ninguna season.
+            #    Miramos si era un ghost: todo Placement / 0 MMR.
+            #    (usamos los datos de sp_rows originales antes del borrado)
+            all_placement_zero = all(
+                int(r["mmr"]) == 0 and r["role"] == "Placement"
+                for r in sp_rows
+            )
+
+            if not all_placement_zero:
+                # No es ghost (por ejemplo, jugó pero en otra DB antes, etc.) → no borramos players
+                return
+
+            # 6) Es un ghost real → lo quitamos de players
+            await conn.execute(
+                "DELETE FROM players WHERE user_id = $1",
+                member.id,
+            )
 
 
 
