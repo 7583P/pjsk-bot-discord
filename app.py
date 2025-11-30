@@ -1222,7 +1222,13 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                     if "! Card" in row or "! #" in row:
                         continue  # encabezados
 
-                    lines = [ln for ln in row.splitlines() if ln.startswith("|")]
+                    # 🔹 NUEVO: aceptar líneas con espacios antes del "|"
+                    lines: List[str] = []
+                    for ln in row.splitlines():
+                        stripped = ln.lstrip()   # quita espacios/tabs al inicio
+                        if stripped.startswith("|"):
+                            lines.append(stripped)
+
                     if not lines:
                         continue
 
