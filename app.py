@@ -7,7 +7,7 @@ import random
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import asyncpg
 import httpx
@@ -849,7 +849,6 @@ async def get_matches(
             result_ids_text,
         )
 
-
     # ---------- 3) Agrupar en matches[result_id].players[] ----------
     matches_by_result: Dict[int, Dict] = {}
 
@@ -886,7 +885,6 @@ async def get_matches(
                 "players": [],
             }
             matches_by_result[rid] = m
-
 
         # PTS = P*4 + G*3 + G2*2 + B*1 + M*0
         s_p = int(r["s_perfect"] or 0)
@@ -942,7 +940,6 @@ async def get_matches(
         if m.get("room_mmr") is None:
             m["room_mmr"] = avg
             m["roomMmr"] = avg
-
 
     # ---------- 5) Ordenar por played_at ASC (más viejas primero) ----------
     matches_list = list(matches_by_result.values())
@@ -1165,14 +1162,131 @@ async def _scrape_card_variants(href: str) -> Dict:
         "variants": ([] + ([{"label": "Trained", "url": trained_url}] if trained_url else []))
     }
 
-# ---------- STUB: listado de cartas ----------
+def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
+    """
+    Convierte "Card_xxx.png" en una URL directa usando Special:FilePath.
+    """
+    safe_name = quote(filename)
+    return f"https://sekaipedia.org/wiki/Special:FilePath/{safe_name}?width={width}"
+
+# ---------- Scraper real: listado de cartas (dinámico, sin límite 1300) ----------
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     """
-    Stub mínimo para evitar NameError.
-    Si ya tienes tu propia implementación, reemplaza esta función.
-    Debe devolver: [{"id": "<page_id>", "name": "...", "href": "https://...", "thumb": "https://..."}]
+    Recorre dinámicamente las páginas:
+      List_of_cards_(1-100), (101-200), (201-300), ...
+    hasta que encuentra varias páginas seguidas sin tabla de cartas.
+
+    Así, si mañana aparece List_of_cards_(1301-1400) o (1401-1500),
+    se leerá automáticamente sin tocar código.
     """
-    return []  # deja que el endpoint haga fallback a BD si existe información
+    items: List[Dict] = []
+
+    async with httpx.AsyncClient() as client:
+        start = 1           # primer ID
+        step = 100          # tamaño de cada rango (1-100, 101-200, ...)
+        max_limit = 3000    # techo de seguridad (lo puedes subir en el futuro)
+        empty_streak = 0    # cuántas páginas seguidas encontramos “vacías”
+
+        while start <= max_limit and empty_streak < 3:
+            page = f"List_of_cards_({start}-{start+step-1})"
+            print(f"[cards] parsing {page}")
+
+            try:
+                data = await _get_json(client, SEKAIPEDIA_API, {
+                    "action": "parse",
+                    "page": page,
+                    "prop": "wikitext",
+                    "format": "json",
+                    "formatversion": 2,
+                })
+            except Exception:
+                traceback.print_exc()
+                break  # si falla feo, salimos del bucle
+
+            parse = (data or {}).get("parse") or {}
+            wikitext: str = parse.get("wikitext") or ""
+            if not wikitext:
+                empty_streak += 1
+                start += step
+                continue
+
+            tables = re.split(r"\n\|\}", wikitext)
+            rows_found = 0
+
+            for table in tables:
+                if "! Card" not in table and "! Card name" not in table:
+                    continue  # no es la tabla principal de cartas
+
+                rows = re.split(r"\n\|-+", table)
+                for row in rows:
+                    if "! Card" in row or "! #" in row:
+                        continue  # encabezados
+
+                    lines = [ln for ln in row.splitlines() if ln.startswith("|")]
+                    if not lines:
+                        continue
+
+                    row_text = " ".join(lines)
+                    cells = [c.strip() for c in row_text.lstrip("|").split("||")]
+                    if len(cells) < 2:
+                        continue
+
+                    # 1) ID
+                    m_id = re.search(r"\b(\d{1,4})\b", cells[0])
+                    if not m_id:
+                        continue
+                    card_id = m_id.group(1)
+
+                    # 2) nombre y title
+                    name_cell = cells[1]
+                    m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
+                    if m_name:
+                        page_title   = m_name.group(1)
+                        display_name = m_name.group(2) or m_name.group(1)
+                    else:
+                        tmp = re.sub(r"\{\{.*?\}\}", "", name_cell)
+                        tmp = re.sub(r"<.*?>", "", tmp)
+                        display_name = tmp.strip()
+                        page_title   = display_name.replace(" ", "_")
+
+                    href = f"https://sekaipedia.org/wiki/{page_title}"
+
+                    # 3) imagen
+                    m_file = re.search(r"\[\[File:([^|\]]+)", row)
+                    thumb_url = None
+                    if m_file:
+                        filename = m_file.group(1)
+                        thumb_url = _build_thumb_from_filename(filename, width=256)
+
+                    items.append({
+                        "id": card_id,
+                        "name": display_name,
+                        "href": href,
+                        "thumb": thumb_url,
+                    })
+                    rows_found += 1
+
+            if rows_found == 0:
+                empty_streak += 1
+            else:
+                empty_streak = 0  # reseteamos si encontramos cartas en este rango
+
+            # pequeña pausa entre páginas para no spamear
+            await _sleep_jitter(0.3, 0.7)
+            start += step
+
+    # Quitar duplicados por id
+    seen = set()
+    out: List[Dict] = []
+    for it in items:
+        cid = str(it.get("id"))
+        if cid in seen:
+            continue
+        seen.add(cid)
+        out.append(it)
+
+    out.sort(key=lambda x: int(str(x["id"])))
+    return out
 
 # =================== API: /auth02/cards (con persistencia) ===================
 @app.get("/auth02/cards")
