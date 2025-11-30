@@ -1043,38 +1043,42 @@ class Matchmaking(commands.Cog):
             )
 
             if not sp_rows:
-                # Nunca estuvo registrado en ninguna season → nada que hacer
+                # Nunca estuvo registrado en ninguna season → no tocamos nada
                 return
 
-            seasons_to_delete: set[int] = set()
-            played_somewhere = False
+            # 2) Seasons donde tiene historial en match_history
+            mh_rows = await conn.fetch(
+                """
+                SELECT DISTINCT season_id
+                FROM match_history
+                WHERE user_id = $1
+                """,
+                member.id,
+            )
+            mh_seasons = {r["season_id"] for r in mh_rows}
 
-            # 2) Para cada season, ver si jugó al menos una partida
-            for r in sp_rows:
-                sid  = int(r["season_id"])
-                mmr  = int(r["mmr"])
-                role = r["role"]
+            # 3) Seasons "ghost": Placement, mmr=0 y sin historial
+            never_played_seasons = [
+                r["season_id"]
+                for r in sp_rows
+                if int(r["mmr"]) == 0
+                and r["role"] == "Placement"
+                and r["season_id"] not in mh_seasons
+            ]
 
-                played = await conn.fetchval(
-                    """
-                    SELECT 1
-                    FROM match_history
-                    WHERE user_id = $1 AND season_id = $2
-                    LIMIT 1
-                    """,
-                    member.id,
-                    sid,
+            # 4) Seasons "reales": cualquier cosa que NO sea ghost
+            played_seasons = [
+                r["season_id"]
+                for r in sp_rows
+                if not (
+                    int(r["mmr"]) == 0
+                    and r["role"] == "Placement"
+                    and r["season_id"] not in mh_seasons
                 )
+            ]
 
-                if played:
-                    # Jugó en esta season → la conservamos
-                    played_somewhere = True
-                else:
-                    # Nunca jugó en esta season → se puede limpiar
-                    seasons_to_delete.add(sid)
-
-            # 3) Borrar de seasonplayers solo las seasons donde nunca jugó
-            if seasons_to_delete:
+            # 5) Borrar solo las seasons ghost de seasonplayers
+            if never_played_seasons:
                 await conn.execute(
                     """
                     DELETE FROM seasonplayers
@@ -1082,37 +1086,21 @@ class Matchmaking(commands.Cog):
                       AND season_id = ANY($2::int[])
                     """,
                     member.id,
-                    list(seasons_to_delete),
+                    never_played_seasons,
                 )
 
-            # 4) ¿Le queda al menos una season después de limpiar?
-            still_has_seasons = await conn.fetchval(
-                """
-                SELECT 1
-                FROM seasonplayers
-                WHERE user_id = $1
-                LIMIT 1
-                """,
+            # 6) Si todavía tiene alguna season real o historial, NO tocamos players
+            if mh_seasons or played_seasons:
+                return
+
+            # 7) Si llega aquí:
+            #    - no tiene historial en match_history
+            #    - y todas sus seasons eran ghost (Placement / 0 MMR sin partidas)
+            #    → lo borramos completamente
+            await conn.execute(
+                "DELETE FROM seasonplayers WHERE user_id = $1",
                 member.id,
             )
-
-            if still_has_seasons:
-                # Tiene historial en alguna season → NO tocamos players
-                return
-
-            # 5) Si llega aquí, no le queda ninguna season.
-            #    Miramos si era un ghost: todo Placement / 0 MMR.
-            #    (usamos los datos de sp_rows originales antes del borrado)
-            all_placement_zero = all(
-                int(r["mmr"]) == 0 and r["role"] == "Placement"
-                for r in sp_rows
-            )
-
-            if not all_placement_zero:
-                # No es ghost (por ejemplo, jugó pero en otra DB antes, etc.) → no borramos players
-                return
-
-            # 6) Es un ghost real → lo quitamos de players
             await conn.execute(
                 "DELETE FROM players WHERE user_id = $1",
                 member.id,
