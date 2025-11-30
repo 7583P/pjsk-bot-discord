@@ -2574,29 +2574,45 @@ class Matchmaking(commands.Cog):
             result_id = await self._next_result_id()
 
             # 1) Construir players_list UNA sola vez
+            # 1) Construir players_list UNA sola vez
             players_list = []
             for member in players:
                 uid = member.id
-                cc, stats = by_id[uid]          # cc solo se usa para el regex/formato, NO para bandera
+                cc, stats = by_id[uid]          # cc viene del submit, ej. "pe", "jp", "us"
                 old, current_role = await self.fetch_player(uid)
 
-                # 1) país SIEMPRE desde el perfil (/register)
+                # País actual en BD (si se registró antes)
                 profile_cc = await self.db_pool.fetchval(
-                    "SELECT country FROM players WHERE user_id=$1", uid
+                    "SELECT country FROM players WHERE user_id = $1",
+                    uid,
                 ) or ""
 
-                # 2) la bandera solo viene del perfil; si no tiene /register → sin bandera
+                # Si no tiene país guardado pero en el submit vino [CC],
+                # lo normalizamos (mayúsculas) y lo persistimos en players.country.
+                if not profile_cc and cc:
+                    profile_cc = cc.upper()
+                    await self.db_pool.execute(
+                        """
+                        UPDATE players
+                        SET country = $2
+                        WHERE user_id = $1
+                        """,
+                        uid,
+                        profile_cc,
+                    )
+
+                # Bandera siempre calculada desde el country final
                 display_flag = country_flag(profile_cc)
 
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
                 players_list.append(
                     {
                         "member": member,
-                        "cc": profile_cc,          # información de perfil, no se cambia aquí
+                        "cc": profile_cc,
                         "stats": stats,
                         "total": total_points,
                         "old": old,
-                        "mmr_actual": old,         # luego se ajusta con Placement
+                        "mmr_actual": old,  # luego se ajusta con Placement
                         "role": current_role,
                         "display_flag": display_flag,
                         "was_placement": (current_role == "Placement"),
@@ -2604,6 +2620,7 @@ class Matchmaking(commands.Cog):
                         "seed_rank": None,
                     }
                 )
+
 
 
             # Fase 1: aplicar seed si es Placement
