@@ -95,47 +95,139 @@ APPEND_RANGES = {
 NON_APPEND_POOL_LIMIT = 10
 
 # Cuántas canciones append se meten al pool según el rango más alto presente
-APPEND_POOL_CONFIG = {
-    "Diamond":        5,  # ~500 MMR
-    "Diamond ⬆":      5,  # ~550 MMR
-    "Crystal":        5,  # ~600
-    "Crystal ⬆":      5,  # ~650
-    "Master":         5,  # ~700
-    "Master ⬆":       5,  # ~750
-    "Champion":       5,  # ~800
-    "Grand Champion": 5,  # ~900
-    "Legend":         5,  # 1000+
-}
+# Siempre intentamos meter hasta 5 canciones append en el pool
+APPEND_POOL_LIMIT = 10
 
-# Probabilidad de usar append según el rango más alto presente
-APPEND_PROBABILITIES = {
-    "Diamond":        0.10,
-    "Diamond ⬆":        0.15,
-    "Crystal":        0.20,
-    "Crystal ⬆":        0.25,
-    "Master":         0.30,
-    "Master ⬆":         0.35,
-    "Champion":       0.40,
-    "Grand Champion": 0.45,
-    "Legend":         0.50,
+# Probabilidad (en %) de que la sala tenga appends (al menos 1) según el rango del room
+APPEND_PROBABILITIES_PERCENT = {
+    "Diamond":        10,  # 10% de salas con append
+    "Diamond ⬆":      15,
+    "Crystal":        20,
+    "Crystal ⬆":      25,
+    "Master":         30,
+    "Master ⬆":       35,
+    "Champion":       40,
+    "Grand Champion": 45,
+    "Legend":         50,
 }
 
 def get_append_probability_for_rank(rank: str) -> float:
-    """Devuelve la probabilidad de habilitar canciones append para el rango dado."""
-    return APPEND_PROBABILITIES.get(rank, 0.0)
+    """
+    Devuelve la probabilidad de que la selección final tenga
+    appends (al menos 1), como valor entre 0.0 y 1.0.
+    """
+    pct = APPEND_PROBABILITIES_PERCENT.get(rank, 0)
+    return pct / 100.0
 
 
-def get_append_pool_limit_for_rank(rank: str) -> int:
-    """Devuelve cuántas canciones append meter al pool según el rango alto."""
-    return APPEND_POOL_CONFIG.get(rank, 0)
+# Distribución de cuántos appends quiero CUANDO toca append.
+# En este ejemplo:
+# - Diamond: 70% de esas salas tendrán 1 append, 30% tendrán 2 appends.
+APPEND_COUNTS_DISTRIB = {
+    "Diamond": {
+        1: 1,  # 10% de los rooms con append → 1 append
+        2: 0.5,  # 5% → 2 appends
+        3: 0.1,  # 1% de los rooms con append → 1 append
+        4: 0.05,  # 0.5% → 2 appends
+        5: 0.01,  # 0.01% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Diamond ⬆": {
+        1: 1,  # 15% de los rooms con append → 1 append
+        2: 0.5,  # 7.5% → 2 appends
+        3: 0.1,  # 1.15% de los rooms con append → 1 append
+        4: 0.05,  # 0.15% → 2 appends
+        5: 0.01,  # 0.015% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Crystal": {
+        1: 1,  # 20% de los rooms con append → 1 append
+        2: 0.5,  # 10% → 2 appends
+        3: 0.1,  # 2% de los rooms con append → 1 append
+        4: 0.05,  # 0.20% → 2 appends
+        5: 0.01,  # 0.020% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Crystal ⬆": {
+        1: 1,  # 25% de los rooms con append → 1 append
+        2: 0.5,  # 12.5% → 2 appends
+        3: 0.1,  # 2.5% de los rooms con append → 1 append
+        4: 0.05,  # 1.25% → 2 appends
+        5: 0.01,  # 0.25% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Master": {
+        1: 1,  # 30% de los rooms con append → 1 append
+        2: 0.5,  # 15% → 2 appends
+        3: 0.1,  # 3% de los rooms con append → 1 append
+        4: 0.05,  # 1.5% → 2 appends
+        5: 0.01,  # 0.030% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Master ⬆": {
+        1: 1,   # 35% de los rooms con append → 1 append
+        2: 0.5,  # 17.5% → 2 appends
+        3: 0.1,  # 3.5% de los rooms con append → 1 append
+        4: 0.05,  # 1.75% → 2 appends
+        5: 0.01,  # 0.35% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Champion": {
+        1: 1,  # 40% de los rooms con append → 1 append
+        2: 0.5,  # 20% → 2 appends
+        3: 0.1,  # 4% de los rooms con append → 1 append
+        4: 0.05,  # 2% → 2 appends
+        5: 0.01,  # 0.40% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Grand Champion": {
+        1: 1,  # 45% de los rooms con append → 1 append
+        2: 0.5,  # 22.5% → 2 appends
+        3: 0.1,  # 4.5% de los rooms con append → 1 append
+        4: 0.05,  # 2.25% → 2 appends
+        5: 0.01,  # 0.45% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+        "Legend": {
+        1: 1,  # 50% de los rooms con append → 1 append
+        2: 0.5,  # 25% → 2 appends
+        3: 0.1,  # 5% de los rooms con append → 1 append
+        4: 0.05,  # 2.50% → 2 appends
+        5: 0.01,  # 0.50% de los rooms con append → 1 append
+
+    },
+    # puedes ir definiendo otros rangos aquí si quieres
+}
+
+def pick_append_count_for_rank(rank: str, max_available: int) -> int:
+    """
+    Devuelve cuántos appends usar (1,2,...) condicionado al rango,
+    respetando el máximo disponible en pool_append.
+    """
+    distrib = APPEND_COUNTS_DISTRIB.get(rank)
+    if not distrib:
+        # fallback: siempre 1 append si hay disponibles
+        return min(1, max_available)
+
+    r = random.random()
+    acc = 0.0
+    for k, p in sorted(distrib.items()):
+        acc += p
+        if r < acc:
+            return min(k, max_available)
+
+    # Por si la suma no da exactamente 1.0 redondeando
+    return min(max(distrib.keys()), max_available)
 
 
-def _highest_high_rank(counts: dict[str, int]) -> str | None:
-    """Devuelve el rango más alto presente entre Diamond..Legend, o None si no hay."""
-    for r in APPEND_RANKS_ORDER:
-        if counts.get(r, 0) > 0:
-            return r
-    return None
 
 
 # Prioridad global de dificultades, ahora incluyendo hard
@@ -1491,58 +1583,83 @@ class Matchmaking(commands.Cog):
             base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Determinar (opcional) el gap de append usando el MISMO rango del room (avg MMR)
+            # b) Determinar el rango de append usando el MISMO rango del room (avg MMR)
             append_lo_hi = None
-            append_limit = 0
-            room_rank_for_append = base_rank  # ya es el rango basado en avg MMR
+            room_rank_for_append = base_rank  # rango basado en el MMR promedio de la sala
             if "append" in allowed_diffs:
                 append_lo_hi = APPEND_RANGES.get(room_rank_for_append)
-                append_limit = get_append_pool_limit_for_rank(room_rank_for_append)
-                prob         = get_append_probability_for_rank(room_rank_for_append)
 
-                # si no hay rango o la tirada de prob falla → no usar append
-                if not append_lo_hi or append_limit <= 0 or random.random() >= prob:
-                    append_lo_hi = None
-                    append_limit = 0
-
-            # c) si vamos a usar append y su rango sale del base, EXPANDIR el base
-            if append_lo_hi is not None and append_limit > 0:
+            # c) si hay rango de append y se sale del base, EXPANDIR el base
+            if append_lo_hi is not None:
                 alo, ahi = append_lo_hi
                 base_lo = min(base_lo, alo)
                 base_hi = max(base_hi, ahi)
 
-            # d) Traer canciones por tipo de diff
-            pool = []
+            # d) Traer canciones por tipo de diff (pools separados)
+            pool_non_append: list[tuple[str, int, str, int]] = []
+            pool_append: list[tuple[str, int, str, int]] = []
 
             # Non-append (hard/expert/master) en gap base (posiblemente expandido)
             if non_append_diffs:
-                non_append_pool = await self._get_random_songs(
+                pool_non_append = await self._get_random_songs(
                     base_lo, base_hi, non_append_diffs,
                     limit=NON_APPEND_POOL_LIMIT,
                     server=server_code,
                 )
-                pool.extend(non_append_pool)
-                taken_titles = {t for (t, *_) in non_append_pool}
+                taken_titles = {t for (t, *_) in pool_non_append}
             else:
                 taken_titles = set()
 
-            # Append en su propio rango (también basado en avg MMR)
-            if append_lo_hi is not None and append_limit > 0:
+            # Append en su propio rango (basado en avg MMR), SIEMPRE intentando meter hasta 5
+            if append_lo_hi is not None:
                 alo, ahi = append_lo_hi
-                append_pool = await self._get_random_songs(
+                pool_append = await self._get_random_songs(
                     alo, ahi, ("append",),
-                    limit=append_limit,
+                    limit=APPEND_POOL_LIMIT,   # ← SIEMPRE intentamos 5 append
                     server=server_code,
                     exclude_titles=taken_titles,
                 )
-                pool.extend(append_pool)
 
-            # e) Mezclar y tomar 5
-            random.shuffle(pool)
-            picks = pool[:5]
+            # e) Selección final con probabilidad de AL MENOS 1 append
+            prob = get_append_probability_for_rank(room_rank_for_append)
+            picks: list[tuple[str, int, str, int]] = []
+
+            # Sólo tiene sentido forzar append si realmente hay canciones append disponibles
+            if pool_append and random.random() < prob:
+                # Forzamos al menos 1 append
+                random.shuffle(pool_append)
+                random.shuffle(pool_non_append)
+
+                # 1 append garantizado
+                picks.append(pool_append[0])
+                remaining = 5 - len(picks)
+
+                # Rellenamos primero con non-append
+                if remaining > 0 and pool_non_append:
+                    picks.extend(pool_non_append[:remaining])
+                    remaining = 5 - len(picks)
+
+                # Si aún faltan espacios y sobran append, usamos más append
+                if remaining > 0 and len(pool_append) > 1:
+                    extra_append = pool_append[1:1+remaining]
+                    picks.extend(extra_append)
+            else:
+                # Intentamos NO usar append: sólo non-append,
+                # y si no alcanzan 5, rellenamos con append como fallback.
+                random.shuffle(pool_non_append)
+                picks = pool_non_append[:5]
+                remaining = 5 - len(picks)
+
+                if remaining > 0 and pool_append:
+                    random.shuffle(pool_append)
+                    picks.extend(pool_append[:remaining])
+
+            # Por seguridad, máximo 5 canciones
+            picks = picks[:5]
 
             # f) El rango mostrado es SIEMPRE el base final (ya expandido)
             low, high = base_lo, base_hi
+
 
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
