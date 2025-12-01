@@ -1256,6 +1256,27 @@ class Matchmaking(commands.Cog):
                 "ALTER TABLE results ADD COLUMN IF NOT EXISTS songs_block TEXT;"
             )
 
+            # NEW: tabla de canciones por resultado para la web
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS match_songs (
+                    id          BIGSERIAL PRIMARY KEY,
+                    result_id   BIGINT       NOT NULL,
+                    song_name   TEXT         NOT NULL,
+                    level       INTEGER      NOT NULL,
+                    difficulty  TEXT         NOT NULL,
+                    notes_count INTEGER      NOT NULL,
+                    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_match_songs_result
+                ON match_songs (result_id);
+                """
+            )
 
             # Historial de partidas por jugador y temporada
             await conn.execute("""
@@ -3044,6 +3065,26 @@ class Matchmaking(commands.Cog):
             gap_low  = room.get("gap_low")
             gap_high = room.get("gap_high")
             songs    = room.get("songs") or []  # 👈 NEW
+
+            # NEW: persistir canciones en match_songs para la página web
+            if songs:
+                await self.db_pool.executemany(
+                    """
+                    INSERT INTO match_songs (
+                        result_id,
+                        song_name,
+                        level,
+                        difficulty,
+                        notes_count
+                    )
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    [
+                        (result_id, title, lvl, diff, notes)
+                        for (title, lvl, diff, notes) in songs
+                    ]
+                )
+
 
             board_block = self._format_results_board(summary)
 
