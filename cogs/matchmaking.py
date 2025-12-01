@@ -802,17 +802,19 @@ class Matchmaking(commands.Cog):
             last10_losses = sum(1 for r in recent_rows if not r["is_win"])
             last10_delta  = sum(int(r["mmr_delta"]) for r in recent_rows) if recent_rows else 0
 
-            # Peak MMR dentro de la season (máximo mmr_after)
+            # Peak MMR dentro de la season (máximo MMR alcanzado en cualquier momento)
             peak_mmr = await conn.fetchval(
                 """
-                SELECT MAX(mmr_after)
+                SELECT GREATEST(MAX(mmr_before), MAX(mmr_after))
                 FROM match_history
                 WHERE season_id = $1 AND user_id = $2
                 """,
                 season_id, user_id
             )
+
+            # Si no tiene histórico, usamos el MMR actual
             if peak_mmr is None:
-                peak_mmr = mmr  # si no tiene histórico, usamos el MMR actual
+                peak_mmr = mmr
 
         return {
             "pos": pos,
