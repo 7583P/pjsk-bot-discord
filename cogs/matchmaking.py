@@ -700,8 +700,9 @@ class Matchmaking(commands.Cog):
         """
         Devuelve (season_id, season_name) según la elección del usuario.
         - None o "current/actual" => temporada activa (get_current_season)
-        - "AlphaSeason"                  => busca por nombre 'AlphaSeason' (case-insensitive)
-        - "Beta"             => busca por 'Beta'/'Beta'/'Beta' (case-insensitive)
+        - "Pre Season"                  => busca por nombre 'PreSeason' (case-insensitive)
+        - "Alpha Test Season"                  => busca por nombre 'Alpha Test Season' (case-insensitive)
+        - "Beta Test Season"             => busca por nombre 'Beta Test Season' (case-insensitive)
         - Si no coincide, intenta buscar por nombre exacto (case-insensitive) o por ID numérico.
         """
         val = (season_choice or "current").strip()
@@ -714,8 +715,9 @@ class Matchmaking(commands.Cog):
 
         # Mapas de alias por conveniencia
         aliases = {
-            "alphaseason": ["alphaseason"],
-            "beta": ["beta", "beta", "beta"],
+            "preseason": ["preseason"],
+            "alphatestseason": ["alphatestseason"],
+            "betatestseason": ["betatestseason"],
         }
         candidate_names = aliases.get(key, [val])
 
@@ -1927,12 +1929,13 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Season: Current, AlphaSeason or Beta")
+    @app_commands.describe(season="Season: Current, PreSeason, Alpha Test Season or Beta Test Season")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Beta",   value="beta"),
-            app_commands.Choice(name="AlphaSeason",   value="alphaseason"),
+            app_commands.Choice(name="PreSeason",   value="preseason"),
+            app_commands.Choice(name="Beta Test Season",   value="betatestseason"),
+            app_commands.Choice(name="Alpha Test Season",   value="alphastesteason"),
         ]
     )
     async def stats(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
@@ -2023,12 +2026,13 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats_user", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(user="Player", season="Season: Current, AlphaSeason or Beta")
+    @app_commands.describe(user="Player", season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Beta",   value="beta"),
-            app_commands.Choice(name="AlphaSeason",   value="alphaseason"),
+            app_commands.Choice(name="Pre Season",   value="preseason"),
+            app_commands.Choice(name="Beta Test Season",   value="betatestseason"),
+            app_commands.Choice(name="Alpha Test Season",   value="alphatestseason"),
         ]
     )
     async def stats_user(self, interaction: discord.Interaction, user: discord.Member, season: app_commands.Choice[str] | None = None):
@@ -2065,12 +2069,13 @@ class Matchmaking(commands.Cog):
         description="Shows the MMR Cutoff of T10, T20, T30, T40, T50 y T100 for the selected season"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Temporada: Current, AlphaSeason or Beta")
+    @app_commands.describe(season="Temporada: Current, Pre Season, Alpha Test Season or Beta Test Season")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Beta", value="beta"),
-            app_commands.Choice(name="AlphaSeason", value="alphaseason"),
+            app_commands.Choice(name="Pre Season", value="preseason"),
+            app_commands.Choice(name="Beta Test Season", value="betatestseason"),
+            app_commands.Choice(name="Alpha Test Season", value="alphatestseason"),
         ]
     )
 
