@@ -259,24 +259,24 @@ ALLOWED_DIFFS_BY_RANK = {
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
     "Placement":     (24, 28),
-    "Iron":          (17, 20),
-    "Bronze":        (18, 21),
-    "Bronze ⬆":      (19, 22),
-    "Silver":        (20, 23),
-    "Silver ⬆":      (21, 24),
-    "Gold":          (22, 25),
-    "Gold ⬆":        (23, 26),
-    "Platinum":      (24, 27),
-    "Platinum ⬆":    (25, 28),
-    "Diamond":       (26, 29),
-    "Diamond ⬆":     (27, 30), 
-    "Crystal":       (28, 31),
-    "Crystal ⬆":     (29, 32),
-    "Master":        (30, 33),
-    "Master ⬆":      (31, 34),
-    "Champion":      (32, 35),
-    "Grand Champion": (33, 36),
-    "Legend":        (34, 37),
+    "Iron":          (17, 21),
+    "Bronze":        (18, 22),
+    "Bronze ⬆":      (19, 23),
+    "Silver":        (20, 24),
+    "Silver ⬆":      (21, 25),
+    "Gold":          (22, 26),
+    "Gold ⬆":        (23, 27),
+    "Platinum":      (24, 28),
+    "Platinum ⬆":    (25, 29),
+    "Diamond":       (26, 30),
+    "Diamond ⬆":     (27, 31), 
+    "Crystal":       (28, 32),
+    "Crystal ⬆":     (29, 33),
+    "Master":        (30, 34),
+    "Master ⬆":      (31, 35),
+    "Champion":      (32, 36),
+    "Grand Champion": (33, 37),
+    "Legend":        (34, 38),
 }
 
 MIN_LEVEL_GAP = 3
@@ -1242,11 +1242,18 @@ class Matchmaking(commands.Cog):
                     message_id  BIGINT  NOT NULL,
                     gap_low     INTEGER,
                     gap_high    INTEGER,
-                    room_mmr    INTEGER,               -- NEW
+                    room_mmr    INTEGER,
+                    songs_block TEXT,                      -- 👈 NUEVA COLUMNA
                     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
                 """
             )
+
+            # Por si la tabla ya existía sin songs_block, la añadimos
+            await conn.execute(
+                "ALTER TABLE results ADD COLUMN IF NOT EXISTS songs_block TEXT;"
+            )
+
 
             # Historial de partidas por jugador y temporada
             await conn.execute("""
@@ -3075,9 +3082,10 @@ class Matchmaking(commands.Cog):
                     message_id,
                     gap_low,
                     gap_high,
-                    room_mmr
+                    room_mmr,
+                    songs_block
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
                 """,
                 result_id,
                 season_id,
@@ -3087,7 +3095,9 @@ class Matchmaking(commands.Cog):
                 gap_low,
                 gap_high,
                 room_mmr,
+                songs_block.strip() if songs_block else None,
             )
+
 
             room["closed"]   = True
             room["finished"] = True

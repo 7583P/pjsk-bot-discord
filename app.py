@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel  # 🔹 Nuevo: para el modelo de canciones
+from pydantic import BaseModel  # para el modelo de canciones
 
 load_dotenv()
 
@@ -207,7 +207,7 @@ async def startup():
           END IF;
         END$$;
 
-        -- 🔹 NUEVO: tabla para canciones de cada match (result_id)
+        -- tabla para canciones de cada match (result_id)
         CREATE TABLE IF NOT EXISTS public.match_songs(
           id          SERIAL PRIMARY KEY,
           result_id   BIGINT NOT NULL,
@@ -501,7 +501,7 @@ async def set_pfp(request: Request):
     if name_lower:
         PFP_BY_NAME[name_lower] = url
 
-    # Persistir en BD (sin casts; parámetro con tipo correcto)
+    # Persistir en BD
     if db_pool:
         if not user_id and discord_id:
             resolved = await _resolve_user_id_from_discord(discord_id)
@@ -597,7 +597,7 @@ async def get_players(
                         uid_strs.append(str(uid))
 
                     if uid_strs:
-                        # 🔹 Total games + peakMmr por usuario
+                        # Total games + peakMmr por usuario
                         stats_rows = await conn.fetch("""
                             SELECT
                                 user_id,
@@ -618,7 +618,7 @@ async def get_players(
                             for sr in stats_rows
                         }
 
-                        # 🔹 W-L / MMR delta en las últimas 10 partidas por usuario
+                        # W-L / MMR delta en las últimas 10 partidas por usuario
                         last10_rows = await conn.fetch("""
                             WITH ranked AS (
                                 SELECT
@@ -743,7 +743,7 @@ async def get_players(
     return out
 
 
-# 🔹 Modelo Pydantic para las canciones de un match
+# Modelo Pydantic para las canciones de un match
 class MatchSongIn(BaseModel):
     songName: str       # nombre de la canción
     level: str          # nivel / rango (ej: "26-28")
@@ -786,7 +786,7 @@ async def get_matches(
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    # 🔹 canciones por result_id
+    # canciones por result_id
     songs_by_result: Dict[int, List[Dict]] = {}
 
     async with db_pool.acquire() as conn:
@@ -802,7 +802,6 @@ async def get_matches(
 
         if raw_q_season is not None:
             # El cliente SÍ envió season_id (puede ser 0 o >0)
-            # Usamos el valor ya parseado por FastAPI (season_id)
             try:
                 requested = int(season_id or 0)
             except (TypeError, ValueError):
@@ -966,7 +965,7 @@ async def get_matches(
                 "avg_mmr": None,
                 "avgMmr": None,
                 "players": [],
-                # 🔹 NUEVO: canciones del match
+                # canciones del match
                 "songs": songs_by_result.get(rid, []),
             }
             matches_by_result[rid] = m
@@ -1005,7 +1004,7 @@ async def get_matches(
             "sBad": s_b,
             "s_miss": s_m,
             "sMiss": s_m,
-            # 🔹 nuevo campo: puntos totales del jugador en este match
+            # puntos totales del jugador en este match
             "points": points,
             "pts": points,
         }
@@ -1332,7 +1331,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     async with httpx.AsyncClient() as client:
         start = 1           # primer ID
         step = 100          # tamaño de cada rango (1-100, 101-200, ...)
-        max_limit = 3000    # techo de seguridad (lo puedes subir en el futuro)
+        max_limit = 3000    # techo de seguridad
         empty_streak = 0    # cuántas páginas seguidas encontramos “vacías”
 
         while start <= max_limit and empty_streak < 3:
@@ -1370,10 +1369,10 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
                     if "! Card" in row or "! #" in row:
                         continue  # encabezados
 
-                    # 🔹 NUEVO: aceptar líneas con espacios antes del "|"
+                    # aceptar líneas con espacios antes del "|"
                     lines: List[str] = []
                     for ln in row.splitlines():
-                        stripped = ln.lstrip()   # quita espacios/tabs al inicio
+                        stripped = ln.lstrip()
                         if stripped.startswith("|"):
                             lines.append(stripped)
 
