@@ -16,6 +16,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel  # 🔹 Nuevo: para el modelo de canciones
 
 load_dotenv()
 
@@ -205,6 +206,19 @@ async def startup():
               ADD CONSTRAINT chk_https_pfp CHECK (left(url, 8) = 'https://');
           END IF;
         END$$;
+
+        -- 🔹 NUEVO: tabla para canciones de cada match (result_id)
+        CREATE TABLE IF NOT EXISTS public.match_songs(
+          id          SERIAL PRIMARY KEY,
+          result_id   BIGINT NOT NULL,
+          song_name   TEXT   NOT NULL,
+          level       TEXT   NOT NULL,
+          difficulty  TEXT   NOT NULL,
+          notes_count INTEGER NOT NULL,
+          created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_match_songs_result_id
+          ON public.match_songs(result_id);
         """)
 
 
@@ -522,6 +536,7 @@ async def get_players(
     Calcula:
       - matchesPlayed desde match_history (si existe) o seasonplayers.games*
       - last10Games / last10Wins / last10Losses / last10MmrDelta desde match_history
+      - peakMmr desde match_history (igual que el bot)
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
@@ -529,6 +544,7 @@ async def get_players(
     rows = []
     games_by_user: Dict[str, int] = {}
     last10_by_user: Dict[str, Dict[str, int]] = {}
+    peak_by_user: Dict[str, int] = {}
 
     try:
         async with db_pool.acquire() as conn:
@@ -570,7 +586,7 @@ async def get_players(
             """
             rows = await conn.fetch(q, picked, limit, offset)
 
-            # Contar partidas y W-L / MMR last 10 desde match_history
+            # Contar partidas, peakMmr y W-L / MMR last 10 desde match_history
             if HAS_MATCHES_TABLE and rows:
                 try:
                     uid_strs: List[str] = []
@@ -581,20 +597,28 @@ async def get_players(
                         uid_strs.append(str(uid))
 
                     if uid_strs:
-                        # Total games per user en la season (histórico completo)
+                        # 🔹 Total games + peakMmr por usuario
                         stats_rows = await conn.fetch("""
-                            SELECT user_id, COUNT(*) AS games_played
+                            SELECT
+                                user_id,
+                                COUNT(*) AS games_played,
+                                GREATEST(MAX(mmr_before), MAX(mmr_after)) AS peak_mmr
                             FROM public.match_history
                             WHERE season_id = $1
                               AND user_id::text = ANY($2::text[])
                             GROUP BY user_id
                         """, picked, uid_strs)
+
                         games_by_user = {
                             str(sr["user_id"]): sr["games_played"]
                             for sr in stats_rows
                         }
+                        peak_by_user = {
+                            str(sr["user_id"]): sr["peak_mmr"]
+                            for sr in stats_rows
+                        }
 
-                        # W-L / MMR delta en las últimas 10 partidas por usuario
+                        # 🔹 W-L / MMR delta en las últimas 10 partidas por usuario
                         last10_rows = await conn.fetch("""
                             WITH ranked AS (
                                 SELECT
@@ -633,6 +657,7 @@ async def get_players(
                     traceback.print_exc()
                     games_by_user = {}
                     last10_by_user = {}
+                    peak_by_user = {}
 
     except HTTPException:
         raise
@@ -675,6 +700,12 @@ async def get_players(
         elif SP_HAS_GAMES_PLAYED:
             games_played = r.get("games_played")
 
+        # Peak MMR (si no hay matches, usamos el MMR actual)
+        if user_key is not None and user_key in peak_by_user and peak_by_user[user_key] is not None:
+            peak_mmr = peak_by_user[user_key]
+        else:
+            peak_mmr = r.get("mmr")
+
         # W-L last 10 / mmrDelta last 10
         last10_games = None
         last10_wins = None
@@ -692,6 +723,8 @@ async def get_players(
             "discordId": discord_id,
             "name": name,
             "mmr": r.get("mmr"),
+            "peakMmr": peak_mmr,
+            "peak_mmr": peak_mmr,  # por si en algún lado usas snake_case
             "country": r.get("country"),
             "rank": r.get("rank"),
             "pfp": pfp_url,
@@ -708,6 +741,15 @@ async def get_players(
             "last10MmrDelta": last10_mmr_delta,
         })
     return out
+
+
+# 🔹 Modelo Pydantic para las canciones de un match
+class MatchSongIn(BaseModel):
+    songName: str       # nombre de la canción
+    level: str          # nivel / rango (ej: "26-28")
+    difficulty: str     # dificultad (ej: "Expert", "Master")
+    notesCount: int     # cantidad de notas
+
 
 # ======================= API: Matches =======================
 @app.get("/api/matches")
@@ -739,9 +781,13 @@ async def get_matches(
       - >0        -> season específica (valida que exista).
     Si user_id está presente, solo devuelve matches donde participa ese jugador,
     pero cada match incluye a TODOS los jugadores en el campo players[].
+    Además, incluye songs[] con la lista de canciones registradas para ese match.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
+
+    # 🔹 canciones por result_id
+    songs_by_result: Dict[int, List[Dict]] = {}
 
     async with db_pool.acquire() as conn:
         # Re-detectar match_history si todavía no lo conocíamos
@@ -849,6 +895,43 @@ async def get_matches(
             result_ids_text,
         )
 
+        # ---------- 2b) Cargar canciones asociadas a esos result_ids ----------
+        try:
+            song_rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    result_id,
+                    song_name,
+                    level,
+                    difficulty,
+                    notes_count
+                FROM public.match_songs
+                WHERE result_id::text = ANY($1::text[])
+                ORDER BY id
+                """,
+                result_ids_text,
+            )
+
+            for sr in song_rows:
+                rid_raw = sr["result_id"]
+                try:
+                    rid = int(rid_raw)
+                except Exception:
+                    rid = rid_raw
+
+                songs_by_result.setdefault(rid, []).append(
+                    {
+                        "songName": sr["song_name"],
+                        "level": sr["level"],
+                        "difficulty": sr["difficulty"],
+                        "notesCount": sr["notes_count"],
+                    }
+                )
+        except Exception:
+            traceback.print_exc()
+            songs_by_result = {}
+
     # ---------- 3) Agrupar en matches[result_id].players[] ----------
     matches_by_result: Dict[int, Dict] = {}
 
@@ -883,6 +966,8 @@ async def get_matches(
                 "avg_mmr": None,
                 "avgMmr": None,
                 "players": [],
+                # 🔹 NUEVO: canciones del match
+                "songs": songs_by_result.get(rid, []),
             }
             matches_by_result[rid] = m
 
@@ -956,6 +1041,69 @@ async def get_matches(
         m["playedAt"] = m["played_at"]
 
     return matches_list
+
+
+@app.post("/api/matches/{result_id}/songs")
+async def save_match_songs(result_id: int, songs: List[MatchSongIn]):
+    """
+    Guarda la lista de canciones jugadas en un match (result_id).
+    Sobrescribe las que hubiera antes.
+    """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            # Borrar canciones anteriores por si se recalcula el result
+            await conn.execute(
+                "DELETE FROM public.match_songs WHERE result_id = $1",
+                result_id
+            )
+
+            records = [
+                (result_id, s.songName, s.level, s.difficulty, s.notesCount)
+                for s in songs
+            ]
+            if records:
+                await conn.executemany(
+                    """
+                    INSERT INTO public.match_songs(result_id, song_name, level, difficulty, notes_count)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    records
+                )
+
+    return {"ok": True, "resultId": result_id, "songsSaved": len(songs)}
+
+
+@app.get("/api/matches/{result_id}/songs")
+async def get_match_songs(result_id: int):
+    """
+    Devuelve las canciones asociadas a un match (result_id).
+    """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT song_name, level, difficulty, notes_count
+            FROM public.match_songs
+            WHERE result_id = $1
+            ORDER BY id
+            """,
+            result_id,
+        )
+
+    return [
+        {
+            "songName": r["song_name"],
+            "level": r["level"],
+            "difficulty": r["difficulty"],
+            "notesCount": r["notes_count"],
+        }
+        for r in rows
+    ]
 
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"

@@ -1662,7 +1662,6 @@ class Matchmaking(commands.Cog):
             # f) El rango mostrado es SIEMPRE el base final (ya expandido)
             low, high = base_lo, base_hi
 
-
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
 
@@ -1670,6 +1669,7 @@ class Matchmaking(commands.Cog):
         room_info["total_notes"] = total_notes
         room_info["gap_low"]     = low
         room_info["gap_high"]    = high
+        room_info["songs"]       = picks  # 👈 NEW: guardamos las canciones seleccionadas
 
         song_lines = "\n".join(
             f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
@@ -1694,7 +1694,6 @@ class Matchmaking(commands.Cog):
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
             self.bot.dispatch('room_updated', rid)  # ← para actualizar #rooms al instante
-
 
 
 
@@ -3032,6 +3031,7 @@ class Matchmaking(commands.Cog):
 
             gap_low  = room.get("gap_low")
             gap_high = room.get("gap_high")
+            songs    = room.get("songs") or []  # 👈 NEW
 
             board_block = self._format_results_board(summary)
 
@@ -3041,7 +3041,18 @@ class Matchmaking(commands.Cog):
                 if room_mmr is not None:
                     gap_text += f" · Avg MMR {room_mmr}"
 
-            header_line = f"ID: {result_id}{gap_text}"
+            # 👇 NEW: bloque de canciones seleccionadas (uno por línea hacia abajo)
+            songs_block = ""
+            if songs:
+                song_lines = [
+                    f"Lv {lvl} {diff} — {title} ({notes} notes)"
+                    for (title, lvl, diff, notes) in songs
+                ]
+                songs_block = "\n**Songs (Lv / Diff / Notes):**\n" + "\n".join(song_lines)
+
+            # La cabecera ahora incluye ID + Lv + Avg MMR + lista de canciones debajo
+            header_line = f"ID: {result_id}{gap_text}{songs_block}"
+
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
                 description=header_line + "\n" + board_block,
