@@ -1977,8 +1977,7 @@ class Matchmaking(commands.Cog):
 
         if not row:
             return await interaction.response.send_message(
-                f"⚠️ No result found with ID `{result_id}`.",
-                ephemeral=True
+                f"⚠️ No result found with ID `{result_id}`."
             )
 
         channel = await self._resolve_channel(row["channel_id"], fallback=interaction.channel)
@@ -1986,13 +1985,11 @@ class Matchmaking(commands.Cog):
             msg = await channel.fetch_message(row["message_id"])
         except discord.NotFound:
             return await interaction.response.send_message(
-                "⚠️ The original result message could not be found (maybe deleted).",
-                ephemeral=True
+                "⚠️ The original result message could not be found (maybe deleted)."
             )
         except discord.Forbidden:
             return await interaction.response.send_message(
-                "⚠️ I don't have permissions to view the channel of that result.",
-                ephemeral=True
+                "⚠️ I don't have permissions to view the channel of that result."
             )
 
         content = (
@@ -2003,13 +2000,11 @@ class Matchmaking(commands.Cog):
         if msg.embeds:
             await interaction.response.send_message(
                 content,
-                embed=msg.embeds[0],
-                ephemeral=True
+                embed=msg.embeds[0]
             )
         else:
             await interaction.response.send_message(
-                content,
-                ephemeral=True
+                content
             )
 
 
