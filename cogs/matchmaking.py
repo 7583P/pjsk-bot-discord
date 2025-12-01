@@ -1271,12 +1271,22 @@ class Matchmaking(commands.Cog):
                 """
             )
 
+            # 🔧 Asegurar tipos correctos aunque la tabla ya existiera antes
+            await conn.execute(
+                """
+                ALTER TABLE match_songs
+                    ALTER COLUMN level       TYPE INTEGER USING level::integer,
+                    ALTER COLUMN notes_count TYPE INTEGER USING notes_count::integer;
+                """
+            )
+
             await conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_match_songs_result
                 ON match_songs (result_id);
                 """
             )
+
 
             # Historial de partidas por jugador y temporada
             await conn.execute("""
