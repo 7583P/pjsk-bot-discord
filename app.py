@@ -1619,7 +1619,7 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                if variants && ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
+                if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
     data = {"name": page_title, "variants": []}
