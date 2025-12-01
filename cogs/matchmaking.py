@@ -378,31 +378,39 @@ RANK_ROLE_IDS = {
 PLACEMENT_ROLE_ID = 1371321594068336811
 
 class Top100View(View):
-    def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction, season_id: int):
+    def __init__(self, db_pool: asyncpg.Pool, interaction: discord.Interaction, season_id: int, season_name: str):
         super().__init__(timeout=None)
-        self.db       = db_pool
-        self.inter    = interaction
-        self.season_id = season_id
-        self.page     = 0
-        self.per_page = 20
-
+        self.db         = db_pool
+        self.inter      = interaction
+        self.season_id  = season_id
+        self.season_name = season_name
+        self.page       = 0
+        self.per_page   = 20
 
     async def build_embed(self) -> Embed:
-        # total hasta 100 y páginas
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0        
+        # total jugadores en ESA season
+        total_all = await self.db.fetchval(
+            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1",
+            self.season_id
+        )
+        total    = min(total_all or 0, 100)
+        max_page = (total - 1) // self.per_page if total else 0
 
-        # datos de la página actual
         offset = self.page * self.per_page
         rows = await self.db.fetch(
-            "SELECT p.user_id, sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $3 ORDER BY sp.mmr DESC OFFSET $1 LIMIT $2",
+            """
+            SELECT p.user_id, sp.mmr, sp.role
+            FROM players p
+            INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
+            WHERE sp.season_id = $3
+            ORDER BY sp.mmr DESC
+            OFFSET $1 LIMIT $2
+            """,
             offset, self.per_page, self.season_id
         )
 
-        # construye el embed
         embed = Embed(
-            title="PJSK LOUNGE TOP 100",
+            title=f"PJSK LOUNGE TOP 100 — {self.season_name}",
             color=0x00fffb
         )
         header    = "TOP| Name                     |   MMR   | Rank\n"
@@ -419,43 +427,47 @@ class Top100View(View):
             "```\n"
             + header
             + separator
-            + "\n".join(lines)
+            + ("\n".join(lines) if lines else "(no players)\n")
             + f"\n```Página {self.page+1}/{max_page+1}"
         )
         return embed
 
     @button(emoji="◀️", style=ButtonStyle.secondary)
     async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # baja página si puede
         if self.page > 0:
             self.page -= 1
 
-        # recalc habilitación de botones
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
+        total_all = await self.db.fetchval(
+            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1",
+            self.season_id
+        )
+        total    = min(total_all or 0, 100)
+        max_page = (total - 1) // self.per_page if total else 0
+
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
-        # un único response + edit
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
     async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # sube página si puede
-        total_all = await self.db.fetchval("SELECT COUNT(*) FROM players")
-        total     = min(total_all or 0, 100)
-        max_page  = (total - 1) // self.per_page if total else 0
+        total_all = await self.db.fetchval(
+            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1",
+            self.season_id
+        )
+        total    = min(total_all or 0, 100)
+        max_page = (total - 1) // self.per_page if total else 0
+
         if self.page < max_page:
             self.page += 1
 
-        # recalc habilitación
         self.prev_page.disabled = (self.page == 0)
         self.next_page.disabled = (self.page == max_page)
 
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
+
 
 
 class Matchmaking(commands.Cog):
@@ -944,18 +956,22 @@ class Matchmaking(commands.Cog):
         lines: list[str] = []
         lines.append(f"MMR cutoffs — Season {season_name}")
         lines.append("```")
-        lines.append("Tier | Players |  MMR")
-        lines.append("-----+---------+------")
+        # Antes: "Tier | Players |  MMR"
+        #       "-----+---------+------"
+        lines.append("Tier |   MMR")
+        lines.append("-----+------")
 
         # Ordenar T10, T20, T30, ...
         for n in sorted(data.keys()):
             mmr = data[n]
             tier_label = f"T{n}"
             mmr_str = str(mmr) if mmr is not None else "N/A"
-            lines.append(f"{tier_label:<4}| {n:>7} | {mmr_str:>6}")
+            # Antes: f"{tier_label:<4}| {n:>7} | {mmr_str:>6}"
+            lines.append(f"{tier_label:<4}| {mmr_str:>6}")
 
         lines.append("```")
         return "\n".join(lines)
+
 
 
 
@@ -1737,64 +1753,6 @@ class Matchmaking(commands.Cog):
 
 
 
-    @app_commands.command(
-        name="start",
-        description="Inicia la votación de 5 canciones"
-    )
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    async def start(self, interaction: discord.Interaction):
-        ch = interaction.channel
-
-        # Solo funciona dentro de un hilo cuyo padre sea un #join permitido
-        if not (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS):
-            return await interaction.response.send_message(
-                "This command only works in rooms",
-                ephemeral=True
-            )
-
-        thread = ch
-
-        # Buscar la sala asociada a este hilo
-        room_entry = next(
-            (r for r in self.rooms.values() if r["thread"].id == thread.id),
-            None
-        )
-        if not room_entry:
-            return await interaction.response.send_message(
-                "⚠️ No encuentro la sala asociada a este hilo.",
-                ephemeral=True
-            )
-
-        # Ya se inició en esta sala
-        if room_entry.get("started"):
-            return await interaction.response.send_message(
-                "songs has been selected",
-                ephemeral=True
-            )
-
-        # Jugadores actuales (sin bots)
-        players = [m for m in room_entry["players"] if not m.bot]
-
-        # Validar 3–5 jugadores
-        if not (3 <= len(players) <= 5):
-            return await interaction.response.send_message(
-                "Room must have between 3-5 players",
-                ephemeral=True
-            )
-
-        # Aseguramos que room_entry["players"] coincide con la lista filtrada
-        room_entry["players"] = players
-
-        # Reutiliza TODA la lógica de selección de canciones aquí
-        await self.launch_song_poll(room_entry)
-
-        # Confirmación efímera al invocador
-        await interaction.response.send_message(
-            f"✅ Votación iniciada en {thread.mention}",
-            ephemeral=True
-        )
-
-
     async def get_current_season(self) -> asyncpg.Record | None:
         """
         Returns the active season row or None.
@@ -2074,16 +2032,20 @@ class Matchmaking(commands.Cog):
 
         data = await self._fetch_user_stats(user.id, season_id)
         if not data:
+            player_name = await self.resolve_member_name(interaction.guild, user.id)
             return await interaction.response.send_message(
-                f"{user.mention} You dont have register in **Season {season_name}**.", ephemeral=True
+                f"{player_name} doesn't have register in **Season {season_name}**.",
+                ephemeral=True
             )
 
         mmr_delta_last10 = data["last10_mmr_delta"]
         mmr_delta_str = f"{mmr_delta_last10:+d}"
 
+        player_name = await self.resolve_member_name(interaction.guild, user.id)
+
         msg = (
             f"**Stats — Season {season_name}**\n"
-            f"• **Player:** {user.mention}\n"
+            f"• **Player:** {player_name}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
             f"• **MMR:** {data['mmr']}\n"
             f"• **Rank:** {data['role']}\n"
@@ -2093,6 +2055,7 @@ class Matchmaking(commands.Cog):
             f"• **Peak MMR:** {data['peak_mmr']}\n"
         )
         await interaction.response.send_message(msg)
+
 
 
     @app_commands.command(
@@ -2204,27 +2167,46 @@ class Matchmaking(commands.Cog):
                 f"{name} has {mmr_val} MMR and rank {role}."
             )
 
+    @app_commands.command(
+        name="top100",
+        description="Top 100 jugadores por MMR con paginación"
+    )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="mmr_user", description="Muestra el MMR de otro jugador")
-    async def mmr_user(self, interaction: discord.Interaction, user: discord.Member):
-        mmr_val, role = await self.fetch_player(user.id)
-        name = user.display_name
-        if role == "Placement":
-            await interaction.response.send_message(
-                f"{name} Is in placement"
+    @app_commands.describe(
+        season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season"
+    )
+    @app_commands.choices(
+        season=[
+            app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="Pre Season",   value="pre season"),
+            app_commands.Choice(name="Beta Test Season",   value="beta test season"),
+            app_commands.Choice(name="Alpha Test Season",   value="alpha test season"),
+        ]
+    )
+    async def top100(
+        self,
+        interaction: discord.Interaction,
+        season: app_commands.Choice[str] | None = None
+    ):
+        # Resolver season (igual que en /stats, /cutoffs, etc.)
+        season_val = season.value if season else None
+        season_id, season_name = await self._resolve_season_id(season_val)
+        if not season_id:
+            return await interaction.response.send_message(
+                "⚠️ Season not found.",
+                ephemeral=True
             )
-        else:
-            await interaction.response.send_message(
-                f"{name} has {mmr_val} MMR and rank {role}."
-            )
-    
-    @app_commands.command(name="top100", description="Top 100 jugadores por MMR con paginación")
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    async def top100(self, interaction: discord.Interaction):
-        season = await self.get_current_season()
-        season_id = season["id"]
-        view = Top100View(self.db_pool, interaction, season_id)       
-        total    = await self.db_pool.fetchval("SELECT COUNT(*) FROM players p inner join seasonplayers sp on p.user_id = sp.user_id where sp.season_id = $1", season_id)
+
+        view = Top100View(self.db_pool, interaction, season_id, season_name)
+
+        total = await self.db_pool.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM seasonplayers
+            WHERE season_id = $1
+            """,
+            season_id
+        )
         max_page = (total - 1) // view.per_page if total else 0
         view.prev_page.disabled = True
         view.next_page.disabled = (0 == max_page)
@@ -2232,6 +2214,7 @@ class Matchmaking(commands.Cog):
         embed = await view.build_embed()
         await interaction.response.send_message(embed=embed, view=view)
 
+    
 
     @commands.command(name="cleanup_ghosts")
     @commands.has_permissions(administrator=True)
@@ -2749,9 +2732,13 @@ class Matchmaking(commands.Cog):
         if room.get("vote_in_progress", False):
             return await ctx.send("There is already a submit vote in progress in this room.")
 
-        # Debe haberse ejecutado /start
+        # Deben haberse seleccionado las canciones (inicio automático al llegar a 5 jugadores)
         if room.get("started") is False:
-            return await ctx.send("start command need to be excecuted first")
+            return await ctx.send(
+                "Songs have not been selected yet. "
+                "The room starts automatically when it reaches 5 players."
+            )
+
 
         players = room["players"]
         n = len(players)
