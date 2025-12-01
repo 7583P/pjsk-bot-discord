@@ -57,6 +57,8 @@ def set_session_cookie(resp, sid: str):
 db_pool: Optional[asyncpg.pool.Pool] = None
 
 HAS_DISCORD_ID_COL: bool = False
+PLAYERS_HAS_IN_GUILD: bool = False   # <--- NUEVO
+
 SEASONS_HAS_ACTIVE: bool    = False
 SEASONS_HAS_NAME: bool      = False
 SEASONS_HAS_STARTS_AT: bool = False
@@ -103,7 +105,8 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
 
 
 async def _detect_schema(conn: asyncpg.Connection) -> None:
-    global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
+    global HAS_DISCORD_ID_COL, PLAYERS_HAS_IN_GUILD
+    global SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
     global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
     global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED
     global HAS_MATCHES_TABLE, HAS_MATCHPLAYERS_TABLE, RESULTS_TEXT_COL
@@ -111,6 +114,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
     try:
         # players / seasons
         HAS_DISCORD_ID_COL    = await _has_col(conn, "players", "discord_id")
+        PLAYERS_HAS_IN_GUILD  = await _has_col(conn, "players", "in_guild")
         SEASONS_HAS_ACTIVE    = await _has_col(conn, "seasons", "active")
         SEASONS_HAS_NAME      = await _has_col(conn, "seasons", "name")
         SEASONS_HAS_STARTS_AT = await _has_col(conn, "seasons", "starts_at")
@@ -152,6 +156,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         print(
             "🔎 Schema:"
             f" players.discord_id={HAS_DISCORD_ID_COL}"
+            f" players.in_guild={PLAYERS_HAS_IN_GUILD}"
             f" | seasons.active={SEASONS_HAS_ACTIVE}"
             f" name={SEASONS_HAS_NAME}"
             f" starts_at={SEASONS_HAS_STARTS_AT}"
@@ -586,6 +591,8 @@ async def get_players(
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
+            if PLAYERS_HAS_IN_GUILD:
+                select_cols.append("p.in_guild AS in_guild")
             if SP_HAS_WINS:
                 select_cols.append("sp.wins AS wins")
             if SP_HAS_LOSSES:
@@ -750,6 +757,7 @@ async def get_players(
             "country": r.get("country"),
             "rank": r.get("rank"),
             "pfp": pfp_url,
+            "in_guild": r.get("in_guild") if PLAYERS_HAS_IN_GUILD else None,
             # stats extra (para W-L y matches en el front)
             "wins": wins,
             "losses": losses,
@@ -1056,7 +1064,7 @@ async def get_matches(
             }
             matches_by_result[rid] = m
 
-        # PTS = P*4 + G*3 + G2*2 + B*1 + M*0
+        # PTS = P*4 + G*3 + G2*2 + B*1 + M*0  (coincide con el embed)
         s_p = int(r["s_perfect"] or 0)
         s_g = int(r["s_great"] or 0)
         s_g2 = int(r["s_good"] or 0)
@@ -1536,7 +1544,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
         seen.add(cid)
         out.append(it)
 
-    out.sort(key=lambda x: int(str(x["id"])))
+    out.sort(key=lambda x: int(str(x["id"])) )
     return out
 
 # =================== API: /auth02/cards (con persistencia) ===================
@@ -1611,7 +1619,7 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
                 thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
+                if variants && ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
     data = {"name": page_title, "variants": []}
