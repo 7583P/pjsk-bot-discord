@@ -700,7 +700,7 @@ class Matchmaking(commands.Cog):
         """
         Devuelve (season_id, season_name) según la elección del usuario.
         - None o "current/actual" => temporada activa (get_current_season)
-        - "Pre Season"                  => busca por nombre 'PreSeason' (case-insensitive)
+        - "Pre Season"                  => busca por nombre 'Pre Season' (case-insensitive)
         - "Alpha Test Season"                  => busca por nombre 'Alpha Test Season' (case-insensitive)
         - "Beta Test Season"             => busca por nombre 'Beta Test Season' (case-insensitive)
         - Si no coincide, intenta buscar por nombre exacto (case-insensitive) o por ID numérico.
@@ -715,9 +715,9 @@ class Matchmaking(commands.Cog):
 
         # Mapas de alias por conveniencia
         aliases = {
-            "preseason": ["preseason"],
-            "alphatestseason": ["alphatestseason"],
-            "betatestseason": ["betatestseason"],
+            "pre season": ["pre season"],
+            "alpha test season": ["alpha test season"],
+            "beta test season": ["beta test season"],
         }
         candidate_names = aliases.get(key, [val])
 
@@ -1929,13 +1929,13 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(season="Season: Current, PreSeason, Alpha Test Season or Beta Test Season")
+    @app_commands.describe(season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season")
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="PreSeason",   value="preseason"),
-            app_commands.Choice(name="Beta Test Season",   value="betatestseason"),
-            app_commands.Choice(name="Alpha Test Season",   value="alphastesteason"),
+            app_commands.Choice(name="Pre Season",   value="pre season"),
+            app_commands.Choice(name="Beta Test Season",   value="beta test season"),
+            app_commands.Choice(name="Alpha Test Season",   value="alpha test season"),
         ]
     )
     async def stats(self, interaction: discord.Interaction, season: app_commands.Choice[str] | None = None):
@@ -2030,9 +2030,9 @@ class Matchmaking(commands.Cog):
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Pre Season",   value="preseason"),
-            app_commands.Choice(name="Beta Test Season",   value="betatestseason"),
-            app_commands.Choice(name="Alpha Test Season",   value="alphatestseason"),
+            app_commands.Choice(name="Pre Season",   value="pre season"),
+            app_commands.Choice(name="Beta Test Season",   value="beta test season"),
+            app_commands.Choice(name="Alpha Test Season",   value="alpha test season"),
         ]
     )
     async def stats_user(self, interaction: discord.Interaction, user: discord.Member, season: app_commands.Choice[str] | None = None):
@@ -2073,9 +2073,9 @@ class Matchmaking(commands.Cog):
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Pre Season", value="preseason"),
-            app_commands.Choice(name="Beta Test Season", value="betatestseason"),
-            app_commands.Choice(name="Alpha Test Season", value="alphatestseason"),
+            app_commands.Choice(name="Pre Season", value="pre season"),
+            app_commands.Choice(name="Beta Test Season", value="beta test season"),
+            app_commands.Choice(name="Alpha Test Season", value="alpha tests eason"),
         ]
     )
 
