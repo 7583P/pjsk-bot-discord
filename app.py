@@ -6,7 +6,7 @@ import asyncio
 import random
 import unicodedata
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse, unquote, quote
 
 import asyncpg
@@ -71,6 +71,9 @@ SP_HAS_GAMES_PLAYED: bool  = False
 HAS_MATCHES_TABLE: bool        = False
 HAS_MATCHPLAYERS_TABLE: bool   = False  # legacy, no se usa ya
 
+# results: columna de texto donde está el bloque con songs/diffs
+RESULTS_TEXT_COL: Optional[str] = None
+
 # Tipo SQL efectivo del user_id ("text" o "bigint")
 USER_ID_SQLTYPE: str = "text"   # default seguro
 
@@ -103,7 +106,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
     global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
     global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED
-    global HAS_MATCHES_TABLE, HAS_MATCHPLAYERS_TABLE
+    global HAS_MATCHES_TABLE, HAS_MATCHPLAYERS_TABLE, RESULTS_TEXT_COL
 
     try:
         # players / seasons
@@ -128,6 +131,24 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         players_type = await _col_type(conn, "players", "user_id")
         USER_ID_SQLTYPE = pfps_type or players_type or "text"
 
+        # Detectar automáticamente una columna de texto en public.results
+        # que probablemente contenga el bloque de resultado (incluyendo las songs)
+        row = await conn.fetchrow("""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema='public'
+              AND table_name='results'
+              AND data_type IN ('text','character varying')
+              AND (
+                    column_name ILIKE '%text%' OR
+                    column_name ILIKE '%result%' OR
+                    column_name ILIKE '%songs%'
+                  )
+            ORDER BY column_name
+            LIMIT 1
+        """)
+        RESULTS_TEXT_COL = row["column_name"] if row else None
+
         print(
             "🔎 Schema:"
             f" players.discord_id={HAS_DISCORD_ID_COL}"
@@ -141,6 +162,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
             f" | matches_table={HAS_MATCHES_TABLE}"
             f" matchplayers_table={HAS_MATCHPLAYERS_TABLE}"
             f" | user_id_type={USER_ID_SQLTYPE}"
+            f" | results_text_col={RESULTS_TEXT_COL}"
         )
     except Exception:
         traceback.print_exc()
@@ -751,6 +773,61 @@ class MatchSongIn(BaseModel):
     notesCount: int     # cantidad de notas
 
 
+# --------- Helper: parsear canciones desde el texto del result ---------
+def extract_songs_from_result_text(result_text: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Intenta extraer canciones desde un bloque de texto de result (como el embed).
+    Busca líneas que empiecen con 'Lv ' y tengan el formato:
+
+      Lv 24 Expert - Song Name (1002 notes)
+
+    Devuelve una lista de dicts con: songName, level, difficulty, notesCount.
+    """
+    if not result_text:
+        return []
+
+    lines = result_text.splitlines()
+    song_lines: List[str] = []
+
+    for ln in lines:
+        s = ln.strip().lstrip("|").strip()
+        if s.startswith("Lv "):
+            song_lines.append(s)
+
+    if not song_lines:
+        return []
+
+    song_re = re.compile(
+        r"^Lv\s*(\d+)\s+([A-Za-z]+)\s+[-–]\s+(.+?)(?:\s*\((\d+)\s*notes?\))?\s*$"
+    )
+
+    songs: List[Dict[str, Any]] = []
+    for line in song_lines:
+        m = song_re.match(line)
+        if not m:
+            continue
+        level = m.group(1)
+        difficulty = m.group(2)
+        title = m.group(3).strip()
+        notes = m.group(4)
+
+        try:
+            notes_int = int(notes) if notes is not None else 0
+        except ValueError:
+            notes_int = 0
+
+        songs.append(
+            {
+                "songName": title,
+                "level": level,
+                "difficulty": difficulty,
+                "notesCount": notes_int,
+            }
+        )
+
+    return songs
+
+
 # ======================= API: Matches =======================
 @app.get("/api/matches")
 async def get_matches(
@@ -786,7 +863,7 @@ async def get_matches(
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    # canciones por result_id
+    # canciones por result_id (desde match_songs)
     songs_by_result: Dict[int, List[Dict]] = {}
 
     async with db_pool.acquire() as conn:
@@ -859,8 +936,14 @@ async def get_matches(
             return []
 
         # ---------- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----------
+        # columna dinámica del texto del result (si existe)
+        if RESULTS_TEXT_COL:
+            select_result_text = f'r."{RESULTS_TEXT_COL}" AS result_text'
+        else:
+            select_result_text = "NULL::text AS result_text"
+
         rows = await conn.fetch(
-            """
+            f"""
             SELECT
                 mh.id,
                 mh.season_id,
@@ -883,7 +966,8 @@ async def get_matches(
                 p.country AS player_country,
                 r.gap_low   AS gap_low,
                 r.gap_high  AS gap_high,
-                r.room_mmr  AS room_mmr
+                r.room_mmr  AS room_mmr,
+                {select_result_text}
             FROM public.match_history mh
             LEFT JOIN public.players p ON p.user_id = mh.user_id
             LEFT JOIN public.seasons s ON s.id = mh.season_id
@@ -894,7 +978,7 @@ async def get_matches(
             result_ids_text,
         )
 
-        # ---------- 2b) Cargar canciones asociadas a esos result_ids ----------
+        # ---------- 2b) Cargar canciones asociadas a esos result_ids (match_songs) ----------
         try:
             song_rows = await conn.fetch(
                 """
@@ -965,8 +1049,10 @@ async def get_matches(
                 "avg_mmr": None,
                 "avgMmr": None,
                 "players": [],
-                # canciones del match
+                # canciones del match (primero las de match_songs si existen)
                 "songs": songs_by_result.get(rid, []),
+                # texto crudo del result para parsear canciones en fallback
+                "result_text": r.get("result_text"),
             }
             matches_by_result[rid] = m
 
@@ -1011,7 +1097,7 @@ async def get_matches(
 
         matches_by_result[rid].setdefault("players", []).append(player_entry)
 
-    # ---------- 4) Calcular avg_mmr por match (ROOM MMR) ----------
+    # ---------- 4) Calcular avg_mmr por match (ROOM MMR) y parsear songs si faltan ----------
     for m in matches_by_result.values():
         mmrs = [p["mmr_before"] for p in m["players"] if p["mmr_before"] is not None]
         if mmrs:
@@ -1024,6 +1110,18 @@ async def get_matches(
         if m.get("room_mmr") is None:
             m["room_mmr"] = avg
             m["roomMmr"] = avg
+
+        # Si no hay songs en match_songs, intentamos parsear desde el texto del result
+        if not m.get("songs") and m.get("result_text"):
+            try:
+                parsed_songs = extract_songs_from_result_text(m["result_text"])
+            except Exception:
+                parsed_songs = []
+            if parsed_songs:
+                m["songs"] = parsed_songs
+
+        # ya no necesitamos enviar el texto crudo al front
+        m.pop("result_text", None)
 
     # ---------- 5) Ordenar por played_at ASC (más viejas primero) ----------
     matches_list = list(matches_by_result.values())
