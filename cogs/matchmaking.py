@@ -2936,10 +2936,53 @@ class Matchmaking(commands.Cog):
                 )
 
             # Fase 2: Elo por pares
-            players_list.sort(key=lambda x: x["total"], reverse=True)
+            # 1) Orden FINAL de la room:
+            #    - Primero por puntos (PGGBM total)
+            #    - Si hay empate de puntos, Placement va primero
+            def sort_key(p):
+                return (p["total"], 1 if p["was_placement"] else 0)
+
+            players_list.sort(key=sort_key, reverse=True)
+
             ratings = [int(p["mmr_actual"]) for p in players_list]
             order   = list(range(len(players_list)))
             deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
+
+            # 2) Ajuste de TIES:
+            #    Si varios jugadores tienen el MISMO total de puntos,
+            #    comparten el mismo ΔMMR = promedio de sus deltas originales.
+            #
+            #    Ejemplo:
+            #      - pos 1,2,3 hacen tie → se promedian los 3 deltas
+            #      - cada uno se queda con ese mismo Δ promedio
+            #
+            #    OJO:
+            #      - El desempate visual (posición) lo gana Placement,
+            #        pero el MMR (+/-) es el MISMO dentro del grupo de empate.
+            if len(players_list) > 1:
+                adjusted = deltas[:]  # copia
+
+                i = 0
+                while i < len(players_list):
+                    j = i + 1
+                    # agrupar a todos los que tengan el mismo total de puntos
+                    while (
+                        j < len(players_list)
+                        and players_list[j]["total"] == players_list[i]["total"]
+                    ):
+                        j += 1
+
+                    group_size = j - i
+                    if group_size > 1:
+                        # promedio de los deltas originales del grupo
+                        avg_delta = int(round(sum(deltas[i:j]) / group_size))
+                        for k in range(i, j):
+                            adjusted[k] = avg_delta
+
+                    i = j
+
+                deltas = adjusted
+
 
             # Asegurar seasonplayers (por si acaso aún no existe)
             await self.db_pool.execute(
