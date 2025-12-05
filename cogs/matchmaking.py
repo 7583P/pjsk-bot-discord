@@ -2948,17 +2948,11 @@ class Matchmaking(commands.Cog):
             order   = list(range(len(players_list)))
             deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
 
-            # 2) Ajuste de TIES:
-            #    Si varios jugadores tienen el MISMO total de puntos,
-            #    comparten el mismo ΔMMR = promedio de sus deltas originales.
-            #
-            #    Ejemplo:
-            #      - pos 1,2,3 hacen tie → se promedian los 3 deltas
-            #      - cada uno se queda con ese mismo Δ promedio
-            #
-            #    OJO:
-            #      - El desempate visual (posición) lo gana Placement,
-            #        pero el MMR (+/-) es el MISMO dentro del grupo de empate.
+            # 2) Ajuste de TIES (nuevo comportamiento):
+            #    - Si TODOS los jugadores del empate son Placement → comparten el mismo ΔMMR.
+            #    - Si TODOS los jugadores del empate NO son Placement → comparten el mismo ΔMMR.
+            #    - Si el empate es mixto (Placement + no-Placement) → NO se promedia:
+            #         se usan los deltas originales de Elo (Placement ya queda arriba por sort_key).
             if len(players_list) > 1:
                 adjusted = deltas[:]  # copia
 
@@ -2974,10 +2968,19 @@ class Matchmaking(commands.Cog):
 
                     group_size = j - i
                     if group_size > 1:
-                        # promedio de los deltas originales del grupo
-                        avg_delta = int(round(sum(deltas[i:j]) / group_size))
-                        for k in range(i, j):
-                            adjusted[k] = avg_delta
+                        # ¿Este grupo de empate es solo Placement, solo no-Placement o mixto?
+                        has_placement = any(
+                            players_list[k]["was_placement"] for k in range(i, j)
+                        )
+                        has_nonplacement = any(
+                            not players_list[k]["was_placement"] for k in range(i, j)
+                        )
+
+                        # Solo promediamos si el grupo es homogéneo
+                        if not (has_placement and has_nonplacement):
+                            avg_delta = int(round(sum(deltas[i:j]) / group_size))
+                            for k in range(i, j):
+                                adjusted[k] = avg_delta
 
                     i = j
 
