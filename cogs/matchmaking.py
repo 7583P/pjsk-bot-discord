@@ -236,7 +236,7 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 # Mapeo de rangos a dificultades permitidas
 ALLOWED_DIFFS_BY_RANK = {
     "Placement":     ("expert",),
-    "Iron":          ("normal, "hard", "expert", "master"),
+    "Iron":          ("normal", "hard", "expert", "master"),
     "Iron ⬆":        ("hard", "expert", "master"),
     "Bronze":        ("hard", "expert", "master"),
     "Bronze ⬆":      ("hard", "expert", "master"),
