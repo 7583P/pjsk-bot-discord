@@ -236,7 +236,8 @@ DIFFICULTY_PRIORITY = ("hard", "expert", "master", "append")
 # Mapeo de rangos a dificultades permitidas
 ALLOWED_DIFFS_BY_RANK = {
     "Placement":     ("expert",),
-    "Iron":          ("hard", "expert", "master"),
+    "Iron":          ("normal, "hard", "expert", "master"),
+    "Iron ⬆":        ("hard", "expert", "master"),
     "Bronze":        ("hard", "expert", "master"),
     "Bronze ⬆":      ("hard", "expert", "master"),
     "Silver":        ("hard", "expert", "master"),
@@ -259,7 +260,8 @@ ALLOWED_DIFFS_BY_RANK = {
 # Nuevos rangos con gap exacto
 BRACKET_RANGES = {
     "Placement":     (24, 28),
-    "Iron":          (17, 21),
+    "Iron":          (16, 20),
+    "Iron ⬆":        (17, 21),
     "Bronze":        (18, 22),
     "Bronze ⬆":      (19, 23),
     "Silver":        (20, 24),
@@ -313,8 +315,10 @@ def dynamic_range(counts: dict[str, int]) -> tuple[int, int]:
 
 def get_rank_from_mmr(mmr: int) -> str:
 
-    if mmr <= 99:
+    if mmr <= 49:
         return "Iron"
+    elif mmr <= 99:
+        return "Iron ⬆"  
     elif mmr <= 149:
         return "Bronze"
     elif mmr <= 199:
@@ -352,7 +356,8 @@ def get_rank_from_mmr(mmr: int) -> str:
 
 RANK_ROLE_IDS = {
     "Placement":    1371321594068336811,
-    "Iron":        1394444407536881845,        
+    "Iron":        1394444407536881845,   
+    "Iron" ⬆:       1446954780915273778
     "Bronze":        1371324225838645339,
     "Bronze ⬆":        1433827677713858732,
     "Silver":        1389343997100560514,
@@ -2519,7 +2524,27 @@ class Matchmaking(commands.Cog):
             return 110, "Bronze"
         if 961 <= other <= 999:
             return 100, "Bronze"
-        return 50, "Iron" # 1000 - infinite
+         if 1001 <= other <= 1100: 
+            return 90, "Iron ⬆" 
+        if 1101 <= other <= 1200: 
+            return 80, "Iron ⬆" 
+        if 1201 <= other <= 1300: 
+            return 70, "Iron ⬆" 
+        if 1301 <= other <= 1400: 
+            return 60, "Iron⬆" 
+        if 1401 <= other <= 1500: 
+            return 50, "Iron ⬆" 
+        if 1501 <= other <= 1600: 
+            return 40, "Iron" 
+        if 1601 <= other <= 1700: 
+            return 30, "Iron" 
+        if 1701 <= other <= 1800: 
+            return 20, "Iron" 
+        if 1801 <= other <= 1900: 
+            return 10, "Iron" 
+        if 1901 <= other <= 2000: 
+            return 0, "Iron"   
+
 
 
     async def _resolve_channel(self, channel_id: int, *, fallback: discord.abc.Messageable) -> discord.abc.Messageable:
