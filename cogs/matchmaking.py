@@ -2524,7 +2524,7 @@ class Matchmaking(commands.Cog):
             return 110, "Bronze"
         if 961 <= other <= 999:
             return 100, "Bronze"
-         if 1001 <= other <= 1100: 
+        if 1001 <= other <= 1100: 
             return 90, "Iron ⬆" 
         if 1101 <= other <= 1200: 
             return 80, "Iron ⬆" 
