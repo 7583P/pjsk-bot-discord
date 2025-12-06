@@ -2525,25 +2525,29 @@ class Matchmaking(commands.Cog):
         if 961 <= other <= 999:
             return 100, "Bronze"
         if 1001 <= other <= 1100: 
-            return 90, "Iron ⬆" 
+            return 99, "Iron ⬆"
         if 1101 <= other <= 1200: 
-            return 80, "Iron ⬆" 
+            return 95, "Iron ⬆"
         if 1201 <= other <= 1300: 
-            return 70, "Iron ⬆" 
+            return 90, "Iron ⬆"
         if 1301 <= other <= 1400: 
-            return 60, "Iron ⬆" 
+            return 80, "Iron ⬆"
         if 1401 <= other <= 1500: 
-            return 50, "Iron ⬆" 
+            return 70, "Iron ⬆"
         if 1501 <= other <= 1600: 
-            return 40, "Iron" 
+            return 60, "Iron"
         if 1601 <= other <= 1700: 
-            return 30, "Iron" 
+            return 50, "Iron"
         if 1701 <= other <= 1800: 
-            return 20, "Iron" 
+            return 40, "Iron"
         if 1801 <= other <= 1900: 
-            return 10, "Iron" 
+            return 30, "Iron"
         if 1901 <= other <= 2000: 
-            return 0, "Iron"   
+            return 20, "Iron"
+
+        # ⬇️ Cualquier cosa por encima de 2000
+        if other >= 2001:
+            return 10, "Iron"
 
 
 
