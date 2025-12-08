@@ -489,7 +489,7 @@ class Matchmaking(commands.Cog):
         return None
 
     @staticmethod
-    def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 30, scale: int = 400, cap: int | None = 39) -> list[int]:
+    def pairwise_deltas_simple(ratings: list[int], order: list[int], K: int = 50, scale: int = 400, cap: int | None = 39) -> list[int]:
         """
         ratings: MMR actual de cada jugador en el mismo orden que players_list
         order: índices en orden final (0..n-1). Ej: [2,0,1] ⇒ 1º el jugador 2, 2º el 0, 3º el 1
@@ -2975,7 +2975,7 @@ class Matchmaking(commands.Cog):
 
             ratings = [int(p["mmr_actual"]) for p in players_list]
             order   = list(range(len(players_list)))
-            deltas  = self.pairwise_deltas_simple(ratings, order, K=30, scale=400, cap=39)
+            deltas  = self.pairwise_deltas_simple(ratings, order, K=50, scale=400, cap=39)
 
             # 2) Ajuste de TIES (nuevo comportamiento):
             #    - Si TODOS los jugadores del empate son Placement → comparten el mismo ΔMMR.
