@@ -2095,7 +2095,7 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="recalc_season4",
-        description="Recalcula todo el MMR de la Season 4 con K=50 y lógica de TIE"
+        description="Recalcula todo el MMR de la Season 4 con K=50 y lógica de TIE (Placement priority)"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def recalc_season4_slash(self, interaction: discord.Interaction):
@@ -2105,12 +2105,16 @@ class Matchmaking(commands.Cog):
         - Recalcula TODO el historial de MMR de la season con id=4 usando:
           * K = 50
           * pairwise_deltas_simple
-          * lógica de TIE (empatados por puntos reciben el mejor delta del grupo)
+          * Lógica de TIE:
+              - Si en el empate hay Placement y no-Placement mezclados:
+                    • Placement recibe el mejor ΔMMR del grupo
+                    • Todos los no-Placement del grupo comparten el mejor ΔMMR entre los no-Placement
+              - Si en el empate solo hay no-Placement (o solo Placement):
+                    • Todos reciben el mismo ΔMMR (mejor del grupo)
         - Actualiza:
           * match_history (mmr_before, mmr_after, mmr_delta, is_win)
           * seasonplayers (mmr, role)
         """
-        # 1) Restringir a tu usuario
         OWNER_ID = 878310498720940102
         if interaction.user.id != OWNER_ID:
             return await interaction.response.send_message(
@@ -2120,7 +2124,7 @@ class Matchmaking(commands.Cog):
 
         season_id = 4
 
-        # 2) Defer para que no expire la interacción mientras recalculamos
+        # Defer para que no expire la interacción mientras recalculamos
         await interaction.response.defer(ephemeral=True)
 
         await interaction.followup.send(
@@ -2130,7 +2134,7 @@ class Matchmaking(commands.Cog):
         )
 
         async with self.db_pool.acquire() as conn:
-            # 3) Obtener todos los results de esta season en orden cronológico
+            # 1) Obtener todos los results de esta season en orden cronológico
             result_rows = await conn.fetch(
                 """
                 SELECT result_id
@@ -2148,10 +2152,10 @@ class Matchmaking(commands.Cog):
                 )
 
             # Estados en memoria: MMR y rol actual dentro de la season
-            mmr_state: dict[int, int] = {}   # user_id -> mmr actual en la season
-            rank_state: dict[int, str] = {}  # user_id -> role actual en la season
+            mmr_state: dict[int, int] = {}   # user_id -> mmr actual
+            rank_state: dict[int, str] = {}  # user_id -> role actual (no se usa mucho, pero lo dejamos por coherencia)
 
-            # 4) Procesar cada result (tabla de resultados) en orden
+            # 2) Procesar cada result (tabla de resultados) en orden
             for rr in result_rows:
                 rid = rr["result_id"]
 
@@ -2163,7 +2167,8 @@ class Matchmaking(commands.Cog):
                         user_id,
                         pos,
                         s_perfect, s_great, s_good, s_bad, s_miss,
-                        mmr_before
+                        mmr_before,
+                        COALESCE(was_placement, false) AS was_placement
                     FROM match_history
                     WHERE season_id = $1
                       AND result_id = $2
@@ -2196,9 +2201,7 @@ class Matchmaking(commands.Cog):
                         + stats[4] * 0
                     )
 
-                    # MMR antes del match según el estado actual:
-                    # - Si es la 1ª vez que aparece en la season,
-                    #   usamos el mmr_before original como MMR inicial.
+                    # MMR antes del match según el estado actual
                     if uid not in mmr_state:
                         mmr_prev = int(row["mmr_before"] or 0)
                         mmr_state[uid] = mmr_prev
@@ -2208,15 +2211,16 @@ class Matchmaking(commands.Cog):
 
                     players.append(
                         {
-                            "row_id": row["id"],
-                            "user_id": uid,
-                            "stats": stats,
-                            "total": total_points,
-                            "mmr_before": mmr_prev,
+                            "row_id":        row["id"],
+                            "user_id":       uid,
+                            "stats":         stats,
+                            "total":         total_points,
+                            "mmr_before":    mmr_prev,
+                            "was_placement": bool(row["was_placement"]),
                         }
                     )
 
-                # 5) Calcular deltas con pairwise_deltas_simple (K=50, cap=39)
+                # 3) Calcular deltas con pairwise_deltas_simple (K=50, cap=39)
                 ratings = [p["mmr_before"] for p in players]
                 order   = list(range(len(players)))  # ya están en orden de pos
                 deltas  = self.pairwise_deltas_simple(
@@ -2227,8 +2231,14 @@ class Matchmaking(commands.Cog):
                     cap=39,
                 )
 
-                # 6) Lógica de TIE:
-                #    agrupa por 'total' (puntos) y todos reciben el mejor delta del grupo.
+                # 4) Lógica de TIE con prioridad a Placement
+                #
+                #   - Se agrupa por 'total' (puntos).
+                #   - Si el grupo tiene SOLO no-Placement (o solo Placement):
+                #         todos reciben el mejor ΔMMR del grupo.
+                #   - Si el grupo tiene mezcla Placement / no-Placement:
+                #         • todos los Placement del grupo reciben el mejor ΔMMR del grupo
+                #         • todos los no-Placement del grupo reciben el mejor Δ entre los no-Placement
                 if len(players) > 1:
                     adjusted = deltas[:]
                     i = 0
@@ -2238,16 +2248,38 @@ class Matchmaking(commands.Cog):
                         while j < len(players) and players[j]["total"] == players[i]["total"]:
                             j += 1
 
-                        if j - i > 1:
-                            best_delta = max(deltas[i:j])
-                            for k in range(i, j):
-                                adjusted[k] = best_delta
+                        group_size = j - i
+                        if group_size > 1:
+                            # Índices de placement / no-placement dentro del grupo
+                            placement_idx = [
+                                k for k in range(i, j)
+                                if players[k]["was_placement"]
+                            ]
+                            nonplacement_idx = [
+                                k for k in range(i, j)
+                                if not players[k]["was_placement"]
+                            ]
+
+                            if placement_idx and nonplacement_idx:
+                                # Caso mixto: Placement vs no-Placement
+                                best_delta_placement = max(deltas[k] for k in placement_idx)
+                                best_delta_nonplacement = max(deltas[k] for k in nonplacement_idx)
+
+                                for k in placement_idx:
+                                    adjusted[k] = best_delta_placement
+                                for k in nonplacement_idx:
+                                    adjusted[k] = best_delta_nonplacement
+                            else:
+                                # Grupo homogéneo (todos Placement o todos no-Placement)
+                                best_delta_all = max(deltas[i:j])
+                                for k in range(i, j):
+                                    adjusted[k] = best_delta_all
 
                         i = j
 
                     deltas = adjusted
 
-                # 7) Aplicar resultados: actualizar estados + tablas
+                # 5) Aplicar resultados: actualizar estados + tablas
                 for idx, p in enumerate(players):
                     uid       = p["user_id"]
                     mmr_prev  = int(p["mmr_before"])
