@@ -2093,28 +2093,44 @@ class Matchmaking(commands.Cog):
         await interaction.response.send_message(board)
 
 
-    @commands.command(name="recalc_season4")
-    @commands.has_permissions(administrator=True)
-    async def recalc_season4(self, ctx: commands.Context):
+    @app_commands.command(
+        name="recalc_season4",
+        description="Recalcula todo el MMR de la Season 4 con K=50 y lógica de TIE"
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def recalc_season4_slash(self, interaction: discord.Interaction):
         """
-        Recalcula TODO el historial de MMR de la season con id=4 usando:
-        - K = 50
-        - pairwise_deltas_simple
-        - lógica de TIE (todos los empatados por puntos reciben el mejor delta del grupo)
+        Slash command:
+        - Solo puede usarlo el usuario 878310498720940102
+        - Recalcula TODO el historial de MMR de la season con id=4 usando:
+          * K = 50
+          * pairwise_deltas_simple
+          * lógica de TIE (empatados por puntos reciben el mejor delta del grupo)
+        - Actualiza:
+          * match_history (mmr_before, mmr_after, mmr_delta, is_win)
+          * seasonplayers (mmr, role)
+        """
+        # 1) Restringir a tu usuario
+        OWNER_ID = 878310498720940102
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message(
+                "❌ You are not allowed to use this command.",
+                ephemeral=True
+            )
 
-        Actualiza:
-        - match_history (mmr_before, mmr_after, mmr_delta, is_win)
-        - seasonplayers (mmr, role)
-        """
         season_id = 4
 
-        await ctx.send(
-            "⚠️ Iniciando recálculo de MMR para la season con id=4.\n"
-            "Asegúrate de no tener salas activas ni nuevos submits mientras corre este comando."
+        # 2) Defer para que no expire la interacción mientras recalculamos
+        await interaction.response.defer(ephemeral=True)
+
+        await interaction.followup.send(
+            "⚠️ Starting MMR recalculation for season id=4.\n"
+            "Make sure there are no active rooms or new submits while this command is running.",
+            ephemeral=True
         )
 
         async with self.db_pool.acquire() as conn:
-            # 1) Obtenemos los results de esta season en orden cronológico
+            # 3) Obtener todos los results de esta season en orden cronológico
             result_rows = await conn.fetch(
                 """
                 SELECT result_id
@@ -2126,17 +2142,20 @@ class Matchmaking(commands.Cog):
             )
 
             if not result_rows:
-                return await ctx.send("No encontré results para la season id=4.")
+                return await interaction.followup.send(
+                    "⚠️ No results found for season id=4.",
+                    ephemeral=True
+                )
 
             # Estados en memoria: MMR y rol actual dentro de la season
             mmr_state: dict[int, int] = {}   # user_id -> mmr actual en la season
             rank_state: dict[int, str] = {}  # user_id -> role actual en la season
 
-            # Recorremos cada result (tabla de resultados) en orden
+            # 4) Procesar cada result (tabla de resultados) en orden
             for rr in result_rows:
                 rid = rr["result_id"]
 
-                # 2) Filas de match_history correspondientes a este result
+                # Filas de match_history correspondientes a este result
                 rows = await conn.fetch(
                     """
                     SELECT
@@ -2179,12 +2198,10 @@ class Matchmaking(commands.Cog):
 
                     # MMR antes del match según el estado actual:
                     # - Si es la 1ª vez que aparece en la season,
-                    #   usamos el mmr_before original como MMR inicial de la season.
+                    #   usamos el mmr_before original como MMR inicial.
                     if uid not in mmr_state:
                         mmr_prev = int(row["mmr_before"] or 0)
                         mmr_state[uid] = mmr_prev
-                        # El rol inicial lo deducimos del MMR actual o lo dejamos según seasonplayers
-                        # (a efectos de este recálculo solo importa el MMR; el rol se recalcula luego).
                         rank_state[uid] = get_rank_from_mmr(mmr_prev)
                     else:
                         mmr_prev = mmr_state[uid]
@@ -2199,10 +2216,10 @@ class Matchmaking(commands.Cog):
                         }
                     )
 
-                # 3) Calcular deltas con pairwise_deltas_simple (K=50, cap=39)
+                # 5) Calcular deltas con pairwise_deltas_simple (K=50, cap=39)
                 ratings = [p["mmr_before"] for p in players]
-                order = list(range(len(players)))  # ya están en orden de pos
-                deltas = self.pairwise_deltas_simple(
+                order   = list(range(len(players)))  # ya están en orden de pos
+                deltas  = self.pairwise_deltas_simple(
                     ratings,
                     order,
                     K=50,
@@ -2210,7 +2227,7 @@ class Matchmaking(commands.Cog):
                     cap=39,
                 )
 
-                # 4) Aplicar la lógica de TIE:
+                # 6) Lógica de TIE:
                 #    agrupa por 'total' (puntos) y todos reciben el mejor delta del grupo.
                 if len(players) > 1:
                     adjusted = deltas[:]
@@ -2230,16 +2247,16 @@ class Matchmaking(commands.Cog):
 
                     deltas = adjusted
 
-                # 5) Aplicar resultados: actualizar estados + tablas
+                # 7) Aplicar resultados: actualizar estados + tablas
                 for idx, p in enumerate(players):
-                    uid = p["user_id"]
-                    mmr_prev = int(p["mmr_before"])
+                    uid       = p["user_id"]
+                    mmr_prev  = int(p["mmr_before"])
                     mmr_delta = int(deltas[idx])
                     mmr_after = mmr_prev + mmr_delta
-                    new_role = get_rank_from_mmr(mmr_after)
+                    new_role  = get_rank_from_mmr(mmr_after)
 
                     # Actualizar estado en memoria
-                    mmr_state[uid] = mmr_after
+                    mmr_state[uid]  = mmr_after
                     rank_state[uid] = new_role
 
                     # seasonplayers: upsert con nuevo mmr y rol
@@ -2275,7 +2292,11 @@ class Matchmaking(commands.Cog):
                         p["row_id"],
                     )
 
-            await ctx.send("✅ Recalculo completado para la season con id=4.")
+        await interaction.followup.send(
+            "✅ MMR recalculation finished for season id=4.",
+            ephemeral=True
+        )
+
 
     
 
