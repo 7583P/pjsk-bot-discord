@@ -2093,6 +2093,191 @@ class Matchmaking(commands.Cog):
         await interaction.response.send_message(board)
 
 
+    @commands.command(name="recalc_season4")
+    @commands.has_permissions(administrator=True)
+    async def recalc_season4(self, ctx: commands.Context):
+        """
+        Recalcula TODO el historial de MMR de la season con id=4 usando:
+        - K = 50
+        - pairwise_deltas_simple
+        - lógica de TIE (todos los empatados por puntos reciben el mejor delta del grupo)
+
+        Actualiza:
+        - match_history (mmr_before, mmr_after, mmr_delta, is_win)
+        - seasonplayers (mmr, role)
+        """
+        season_id = 4
+
+        await ctx.send(
+            "⚠️ Iniciando recálculo de MMR para la season con id=4.\n"
+            "Asegúrate de no tener salas activas ni nuevos submits mientras corre este comando."
+        )
+
+        async with self.db_pool.acquire() as conn:
+            # 1) Obtenemos los results de esta season en orden cronológico
+            result_rows = await conn.fetch(
+                """
+                SELECT result_id
+                FROM results
+                WHERE season_id = $1
+                ORDER BY created_at ASC, result_id ASC
+                """,
+                season_id,
+            )
+
+            if not result_rows:
+                return await ctx.send("No encontré results para la season id=4.")
+
+            # Estados en memoria: MMR y rol actual dentro de la season
+            mmr_state: dict[int, int] = {}   # user_id -> mmr actual en la season
+            rank_state: dict[int, str] = {}  # user_id -> role actual en la season
+
+            # Recorremos cada result (tabla de resultados) en orden
+            for rr in result_rows:
+                rid = rr["result_id"]
+
+                # 2) Filas de match_history correspondientes a este result
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        id,
+                        user_id,
+                        pos,
+                        s_perfect, s_great, s_good, s_bad, s_miss,
+                        mmr_before
+                    FROM match_history
+                    WHERE season_id = $1
+                      AND result_id = $2
+                    ORDER BY pos ASC, id ASC
+                    """,
+                    season_id,
+                    rid,
+                )
+
+                if not rows:
+                    continue
+
+                # Construimos la lista de jugadores en el orden de posiciones
+                players = []
+                for row in rows:
+                    uid = row["user_id"]
+                    stats = [
+                        int(row["s_perfect"] or 0),
+                        int(row["s_great"] or 0),
+                        int(row["s_good"] or 0),
+                        int(row["s_bad"] or 0),
+                        int(row["s_miss"] or 0),
+                    ]
+                    # PGG BM → puntos
+                    total_points = (
+                        stats[0] * 4
+                        + stats[1] * 3
+                        + stats[2] * 2
+                        + stats[3] * 1
+                        + stats[4] * 0
+                    )
+
+                    # MMR antes del match según el estado actual:
+                    # - Si es la 1ª vez que aparece en la season,
+                    #   usamos el mmr_before original como MMR inicial de la season.
+                    if uid not in mmr_state:
+                        mmr_prev = int(row["mmr_before"] or 0)
+                        mmr_state[uid] = mmr_prev
+                        # El rol inicial lo deducimos del MMR actual o lo dejamos según seasonplayers
+                        # (a efectos de este recálculo solo importa el MMR; el rol se recalcula luego).
+                        rank_state[uid] = get_rank_from_mmr(mmr_prev)
+                    else:
+                        mmr_prev = mmr_state[uid]
+
+                    players.append(
+                        {
+                            "row_id": row["id"],
+                            "user_id": uid,
+                            "stats": stats,
+                            "total": total_points,
+                            "mmr_before": mmr_prev,
+                        }
+                    )
+
+                # 3) Calcular deltas con pairwise_deltas_simple (K=50, cap=39)
+                ratings = [p["mmr_before"] for p in players]
+                order = list(range(len(players)))  # ya están en orden de pos
+                deltas = self.pairwise_deltas_simple(
+                    ratings,
+                    order,
+                    K=50,
+                    scale=400,
+                    cap=39,
+                )
+
+                # 4) Aplicar la lógica de TIE:
+                #    agrupa por 'total' (puntos) y todos reciben el mejor delta del grupo.
+                if len(players) > 1:
+                    adjusted = deltas[:]
+                    i = 0
+                    while i < len(players):
+                        j = i + 1
+                        # mismo total de puntos dentro del grupo de empate
+                        while j < len(players) and players[j]["total"] == players[i]["total"]:
+                            j += 1
+
+                        if j - i > 1:
+                            best_delta = max(deltas[i:j])
+                            for k in range(i, j):
+                                adjusted[k] = best_delta
+
+                        i = j
+
+                    deltas = adjusted
+
+                # 5) Aplicar resultados: actualizar estados + tablas
+                for idx, p in enumerate(players):
+                    uid = p["user_id"]
+                    mmr_prev = int(p["mmr_before"])
+                    mmr_delta = int(deltas[idx])
+                    mmr_after = mmr_prev + mmr_delta
+                    new_role = get_rank_from_mmr(mmr_after)
+
+                    # Actualizar estado en memoria
+                    mmr_state[uid] = mmr_after
+                    rank_state[uid] = new_role
+
+                    # seasonplayers: upsert con nuevo mmr y rol
+                    await conn.execute(
+                        """
+                        INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (season_id, user_id)
+                        DO UPDATE SET
+                            mmr  = EXCLUDED.mmr,
+                            role = EXCLUDED.role
+                        """,
+                        season_id,
+                        uid,
+                        mmr_after,
+                        new_role,
+                    )
+
+                    # match_history: pisar mmr_before/after/delta/is_win
+                    await conn.execute(
+                        """
+                        UPDATE match_history
+                        SET mmr_before = $1,
+                            mmr_after  = $2,
+                            mmr_delta  = $3,
+                            is_win     = $4
+                        WHERE id = $5
+                        """,
+                        mmr_prev,
+                        mmr_after,
+                        mmr_delta,
+                        mmr_delta >= 0,
+                        p["row_id"],
+                    )
+
+            await ctx.send("✅ Recalculo completado para la season con id=4.")
+
+    
 
     @app_commands.command(name="d", description="Salir de la sala")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
