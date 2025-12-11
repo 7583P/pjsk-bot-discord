@@ -636,6 +636,64 @@ class Matchmaking(commands.Cog):
             out.append((r["title"], int(r["level"]), r["diff"].capitalize(), int(r["notes_count"])))
         return out
 
+    async def _build_level_balanced_pool(
+        self,
+        low: int,
+        high: int,
+        *,
+        server: str,
+        diffs: tuple[str, ...],
+        per_level: int = 5,
+        exclude_titles: set[str] | None = None,
+    ) -> list[tuple[str, int, str, int]]:
+        """
+        Construye un pool equilibrado por nivel:
+
+        - Recorre cada nivel en [low, high].
+        - Intenta sacar hasta `per_level` canciones por nivel usando `diffs`
+          (por ejemplo: ('expert', 'master')).
+        - Respeta `exclude_titles` y nunca duplica títulos.
+        - Si en un nivel solo hay 1 canción, solo entra esa al pool.
+        """
+        pool: list[tuple[str, int, str, int]] = []
+        used_titles: set[str] = set(exclude_titles or set())
+
+        async with self._songs_lock:
+            async with self.db_pool.acquire() as conn:
+                for lvl in range(low, high + 1):
+                    rows = await conn.fetch(
+                        """
+                        SELECT title, level, diff, notes_count
+                        FROM songs
+                        WHERE level = $1
+                          AND server = $2
+                          AND diff = ANY($3::text[])
+                          AND title <> ALL($4::text[])
+                        ORDER BY random()
+                        LIMIT $5
+                        """,
+                        lvl,
+                        server,
+                        list(diffs),
+                        list(used_titles) or ["__none__"],  # evitar array vacío
+                        per_level,
+                    )
+
+                    for r in rows:
+                        title = r["title"]
+                        pool.append(
+                            (
+                                title,
+                                int(r["level"]),
+                                r["diff"].capitalize(),
+                                int(r["notes_count"]),
+                            )
+                        )
+                        used_titles.add(title)
+
+        return pool
+
+    
 
     async def _pick_placement_songs_levels_24_to_28(
         self,
@@ -1712,27 +1770,31 @@ class Matchmaking(commands.Cog):
             pool_non_append: list[tuple[str, int, str, int]] = []
             pool_append: list[tuple[str, int, str, int]] = []
 
-            # Non-append (hard/expert/master) SIEMPRE en su rango base
+            # Non-append (hard/expert/master) SIEMPRE en su rango base,
+            # pero equilibrado por nivel (intentamos 5 por nivel).
             taken_titles: set[str] = set()
             if non_append_diffs:
-                pool_non_append = await self._get_random_songs(
-                    base_lo, base_hi,
-                    non_append_diffs,
-                    limit=NON_APPEND_POOL_LIMIT,
+                pool_non_append = await self._build_level_balanced_pool(
+                    base_lo,
+                    base_hi,
                     server=server_code,
+                    diffs=non_append_diffs,
+                    per_level=5,   # 5 canciones por nivel → 25 en total si el catálogo lo permite
                 )
-                taken_titles = {t for (t, *_) in pool_non_append}
+                taken_titles = {t for (t, *_rest) in pool_non_append}
 
-            # Append SOLO en su rango de append
+            # Append SOLO en su rango de append, sin romper la probabilidad de append
             if append_range is not None:
                 alo, ahi = append_range
                 pool_append = await self._get_random_songs(
-                    alo, ahi,
+                    alo,
+                    ahi,
                     ("append",),
                     limit=APPEND_POOL_LIMIT,
                     server=server_code,
                     exclude_titles=taken_titles,
                 )
+
 
             # d) Selección final
             prob = get_append_probability_for_rank(base_rank)
