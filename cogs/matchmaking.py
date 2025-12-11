@@ -518,6 +518,63 @@ class Matchmaking(commands.Cog):
         if cap is not None:
             out = [max(-cap, min(cap, d)) for d in out]
         return out
+
+    @staticmethod
+    def _apply_tie_logic_placement_priority(players: list[dict], deltas: list[int]) -> list[int]:
+        """
+        players: lista de dicts con al menos:
+            - 'total'          -> puntos PGGBM de la partida
+            - 'was_placement'  -> bool indicando si estaba en Placement en ESTE match
+        deltas: lista de ΔMMR calculados por pairwise_deltas_simple, alineada por índice.
+
+        Regla:
+        - Se agrupa por 'total' (puntos), asumiendo que players ya viene ordenado por posición.
+        - Si el grupo tiene solo Placement o solo no-Placement:
+              todos reciben el mejor Δ del grupo.
+        - Si el grupo tiene mezcla Placement + no-Placement:
+              • todos los Placement del grupo reciben el mejor Δ de TODO el grupo.
+              • todos los no-Placement del grupo reciben el mejor Δ entre los no-Placement.
+        """
+        if len(players) <= 1:
+            return deltas
+
+        adjusted = deltas[:]
+
+        i = 0
+        while i < len(players):
+            j = i + 1
+            # grupo de empate por 'total'
+            while j < len(players) and players[j]["total"] == players[i]["total"]:
+                j += 1
+
+            group_size = j - i
+            if group_size > 1:
+                group_indices = list(range(i, j))
+                placement_idx = [k for k in group_indices if players[k].get("was_placement", False)]
+                nonplacement_idx = [k for k in group_indices if not players[k].get("was_placement", False)]
+
+                if placement_idx and nonplacement_idx:
+                    # Grupo mixto: Placement + no-Placement
+                    group_best = max(deltas[k] for k in group_indices)
+                    best_non   = max(deltas[k] for k in nonplacement_idx)
+
+                    # Placement recibe SIEMPRE el mejor Δ del grupo
+                    for k in placement_idx:
+                        adjusted[k] = group_best
+
+                    # No-Placement reciben el mejor Δ entre ellos
+                    for k in nonplacement_idx:
+                        adjusted[k] = best_non
+                else:
+                    # Grupo homogéneo (solo Placement o solo no-Placement)
+                    best_all = max(deltas[k] for k in group_indices)
+                    for k in group_indices:
+                        adjusted[k] = best_all
+
+            i = j
+
+        return adjusted
+
     
     async def _get_room_rank_by_avg_mmr(self, players: list[discord.Member]) -> str:
         """
@@ -2231,53 +2288,8 @@ class Matchmaking(commands.Cog):
                     cap=39,
                 )
 
-                # 4) Lógica de TIE con prioridad a Placement
-                #
-                #   - Se agrupa por 'total' (puntos).
-                #   - Si el grupo tiene SOLO no-Placement (o solo Placement):
-                #         todos reciben el mejor ΔMMR del grupo.
-                #   - Si el grupo tiene mezcla Placement / no-Placement:
-                #         • todos los Placement del grupo reciben el mejor ΔMMR del grupo
-                #         • todos los no-Placement del grupo reciben el mejor Δ entre los no-Placement
-                if len(players) > 1:
-                    adjusted = deltas[:]
-                    i = 0
-                    while i < len(players):
-                        j = i + 1
-                        # mismo total de puntos dentro del grupo de empate
-                        while j < len(players) and players[j]["total"] == players[i]["total"]:
-                            j += 1
-
-                        group_size = j - i
-                        if group_size > 1:
-                            # Índices de placement / no-placement dentro del grupo
-                            placement_idx = [
-                                k for k in range(i, j)
-                                if players[k]["was_placement"]
-                            ]
-                            nonplacement_idx = [
-                                k for k in range(i, j)
-                                if not players[k]["was_placement"]
-                            ]
-
-                            if placement_idx and nonplacement_idx:
-                                # Caso mixto: Placement vs no-Placement
-                                best_delta_placement = max(deltas[k] for k in placement_idx)
-                                best_delta_nonplacement = max(deltas[k] for k in nonplacement_idx)
-
-                                for k in placement_idx:
-                                    adjusted[k] = best_delta_placement
-                                for k in nonplacement_idx:
-                                    adjusted[k] = best_delta_nonplacement
-                            else:
-                                # Grupo homogéneo (todos Placement o todos no-Placement)
-                                best_delta_all = max(deltas[i:j])
-                                for k in range(i, j):
-                                    adjusted[k] = best_delta_all
-
-                        i = j
-
-                    deltas = adjusted
+                # 4) Lógica de TIE con prioridad a Placement (compartida con !submit)
+                deltas = self._apply_tie_logic_placement_priority(players, deltas)
 
                 # 5) Aplicar resultados: actualizar estados + tablas
                 for idx, p in enumerate(players):
@@ -3213,36 +3225,16 @@ class Matchmaking(commands.Cog):
 
             ratings = [int(p["mmr_actual"]) for p in players_list]
             order   = list(range(len(players_list)))
-            deltas  = self.pairwise_deltas_simple(ratings, order, K=50, scale=400, cap=39)
+            deltas  = self.pairwise_deltas_simple(
+                ratings,
+                order,
+                K=50,
+                scale=400,
+                cap=39,
+            )
 
-            # 2) Ajuste de TIES (nuevo comportamiento):
-            #    - Si varios jugadores empatan en puntos (total),
-            #      TODOS los del grupo reciben el MEJOR ΔMMR de ese grupo.
-            #    - No se divide ni se promedia el MMR entre ellos.
-            if len(players_list) > 1:
-                adjusted = deltas[:]  # copia
-
-                i = 0
-                while i < len(players_list):
-                    j = i + 1
-                    # agrupar a todos los que tengan el mismo total de puntos
-                    while (
-                        j < len(players_list)
-                        and players_list[j]["total"] == players_list[i]["total"]
-                    ):
-                        j += 1
-
-                    group_size = j - i
-                    if group_size > 1:
-                        # Mejor delta dentro del grupo de empate
-                        best_delta = max(deltas[i:j])
-                        # Todos reciben el mismo ΔMMR del mejor puesto del grupo
-                        for k in range(i, j):
-                            adjusted[k] = best_delta
-
-                    i = j
-
-                deltas = adjusted
+            # 2) Ajuste de TIES con prioridad a Placement (igual al recalc)
+            deltas = self._apply_tie_logic_placement_priority(players_list, deltas)
 
 
             # Asegurar seasonplayers (por si acaso aún no existe)
