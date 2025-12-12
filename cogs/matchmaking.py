@@ -2212,215 +2212,215 @@ class Matchmaking(commands.Cog):
         await interaction.response.send_message(board)
 
 
-@app_commands.command(
-    name="recalc_season4",
-    description="Recalcula todo el MMR de la Season 4 desde 0 usando la lógica de submit"
-)
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-async def recalc_season4_slash(self, interaction: discord.Interaction):
-    OWNER_ID = 878310498720940102
-    if interaction.user.id != OWNER_ID:
-        return await interaction.response.send_message(
-            "❌ You are not allowed to use this command.",
-            ephemeral=True
-        )
-
-    season_id = 4
-
-    await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(
-        "⚠️ Starting FULL from-scratch MMR recalculation for season id=4.\n"
-        "Make sure there are no active rooms or new submits while this is running.",
-        ephemeral=True
+    @app_commands.command(
+        name="recalc_season4",
+        description="Recalcula todo el MMR de la Season 4 desde 0 usando la lógica de submit"
     )
-
-    async with self.db_pool.acquire() as conn:
-        # 0) Resultados en orden cronológico
-        result_rows = await conn.fetch(
-            """
-            SELECT result_id
-            FROM results
-            WHERE season_id = $1
-            ORDER BY created_at ASC, result_id ASC
-            """,
-            season_id,
-        )
-        if not result_rows:
-            return await interaction.followup.send(
-                "⚠️ No results found for season id=4.",
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def recalc_season4_slash(self, interaction: discord.Interaction):
+        OWNER_ID = 878310498720940102
+        if interaction.user.id != OWNER_ID:
+            return await interaction.response.send_message(
+                "❌ You are not allowed to use this command.",
                 ephemeral=True
             )
-
-        # 1) Lista de jugadores involucrados en la season (para resetear seasonplayers)
-        user_rows = await conn.fetch(
-            "SELECT DISTINCT user_id FROM match_history WHERE season_id = $1",
-            season_id
+    
+        season_id = 4
+    
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(
+            "⚠️ Starting FULL from-scratch MMR recalculation for season id=4.\n"
+            "Make sure there are no active rooms or new submits while this is running.",
+            ephemeral=True
         )
-        user_ids = [int(r["user_id"]) for r in user_rows]
-
-        # 2) Resetear seasonplayers season 4 (para que el leaderboard final sea 100% recalculado)
-        if user_ids:
-            await conn.execute(
+    
+        async with self.db_pool.acquire() as conn:
+            # 0) Resultados en orden cronológico
+            result_rows = await conn.fetch(
                 """
-                DELETE FROM seasonplayers
+                SELECT result_id
+                FROM results
                 WHERE season_id = $1
-                  AND user_id = ANY($2::bigint[])
+                ORDER BY created_at ASC, result_id ASC
                 """,
                 season_id,
-                user_ids
             )
-
-        # 3) Estado FROM SCRATCH:
-        #    todos empiezan en Placement y sin MMR “real” previo
-        mmr_state: dict[int, int] = {uid: 0 for uid in user_ids}
-        role_state: dict[int, str] = {uid: "Placement" for uid in user_ids}
-
-        # 4) Procesar cada result como submit lo haría
-        for rr in result_rows:
-            rid = int(rr["result_id"])
-
-            rows = await conn.fetch(
-                """
-                SELECT
-                    id,
-                    user_id,
-                    s_perfect, s_great, s_good, s_bad, s_miss
-                FROM match_history
-                WHERE season_id = $1
-                  AND result_id = $2
-                ORDER BY id ASC
-                """,
-                season_id,
-                rid,
+            if not result_rows:
+                return await interaction.followup.send(
+                    "⚠️ No results found for season id=4.",
+                    ephemeral=True
+                )
+    
+            # 1) Lista de jugadores involucrados en la season (para resetear seasonplayers)
+            user_rows = await conn.fetch(
+                "SELECT DISTINCT user_id FROM match_history WHERE season_id = $1",
+                season_id
             )
-            if not rows:
-                continue
-
-            players: list[dict] = []
-            for row in rows:
-                row_id = int(row["id"])
-                uid = int(row["user_id"])
-                stats = [
-                    int(row["s_perfect"] or 0),
-                    int(row["s_great"] or 0),
-                    int(row["s_good"] or 0),
-                    int(row["s_bad"] or 0),
-                    int(row["s_miss"] or 0),
-                ]
-                total_points = stats[0]*4 + stats[1]*3 + stats[2]*2 + stats[3]*1 + stats[4]*0
-
-                # Igual que submit: Placement se decide por "rol actual" antes del match
-                was_placement = (role_state.get(uid, "Placement") == "Placement")
-
-                # Igual que submit: si es Placement, el "mmr_before" efectivo es el seed del stats
-                if was_placement:
-                    seed_mmr, _seed_rank = self.placement_seed_from_stats(stats)
-                    mmr_prev = int(seed_mmr)
-                else:
-                    mmr_prev = int(mmr_state.get(uid, 0))
-
-                players.append({
-                    "row_id": row_id,
-                    "user_id": uid,
-                    "stats": stats,
-                    "total": int(total_points),
-                    "mmr_before": int(mmr_prev),
-                    "was_placement": bool(was_placement),
-                })
-
-            # Orden final igual que submit:
-            # - puntos desc
-            # - si empate, Placement primero
-            # - row_id como desempate determinista
-            players.sort(key=lambda p: (-p["total"], -(1 if p["was_placement"] else 0), p["row_id"]))
-
-            if len(players) < 2:
-                # si por algún motivo hay results de 1 jugador, igual dejamos estado coherente
-                p = players[0]
-                uid = p["user_id"]
-                mmr_prev = int(p["mmr_before"])
-                mmr_after = mmr_prev
-                new_role = get_rank_from_mmr(mmr_after) if not p["was_placement"] else get_rank_from_mmr(mmr_after)
-                mmr_state[uid] = mmr_after
-                role_state[uid] = new_role
-
+            user_ids = [int(r["user_id"]) for r in user_rows]
+    
+            # 2) Resetear seasonplayers season 4 (para que el leaderboard final sea 100% recalculado)
+            if user_ids:
                 await conn.execute(
                     """
-                    INSERT INTO seasonplayers (season_id, user_id, mmr, role)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (season_id, user_id)
-                    DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+                    DELETE FROM seasonplayers
+                    WHERE season_id = $1
+                      AND user_id = ANY($2::bigint[])
                     """,
-                    season_id, uid, mmr_after, new_role
+                    season_id,
+                    user_ids
                 )
-                await conn.execute(
+    
+            # 3) Estado FROM SCRATCH:
+            #    todos empiezan en Placement y sin MMR “real” previo
+            mmr_state: dict[int, int] = {uid: 0 for uid in user_ids}
+            role_state: dict[int, str] = {uid: "Placement" for uid in user_ids}
+    
+            # 4) Procesar cada result como submit lo haría
+            for rr in result_rows:
+                rid = int(rr["result_id"])
+    
+                rows = await conn.fetch(
                     """
-                    UPDATE match_history
-                    SET pos = $1, mmr_before = $2, mmr_after = $3, mmr_delta = $4, was_placement = $5, is_win = $6
-                    WHERE id = $7
+                    SELECT
+                        id,
+                        user_id,
+                        s_perfect, s_great, s_good, s_bad, s_miss
+                    FROM match_history
+                    WHERE season_id = $1
+                      AND result_id = $2
+                    ORDER BY id ASC
                     """,
-                    1, mmr_prev, mmr_after, 0, p["was_placement"], True, p["row_id"]
+                    season_id,
+                    rid,
                 )
-                continue
-
-            ratings = [int(p["mmr_before"]) for p in players]
-            order = list(range(len(players)))
-
-            deltas = self.pairwise_deltas_simple(
-                ratings,
-                order,
-                K=50,
-                scale=400,
-                cap=39,
-            )
-
-            deltas = self._apply_tie_logic_placement_priority(players, deltas)
-
-            # Aplicar y persistir (match_history + seasonplayers) y actualizar estado para el siguiente result
-            for pos, p in enumerate(players, start=1):
-                uid = p["user_id"]
-                mmr_prev = int(p["mmr_before"])
-                mmr_delta = int(deltas[pos - 1])
-                mmr_after = mmr_prev + mmr_delta
-                new_role = get_rank_from_mmr(mmr_after)
-
-                mmr_state[uid] = mmr_after
-                role_state[uid] = new_role
-
-                await conn.execute(
-                    """
-                    INSERT INTO seasonplayers (season_id, user_id, mmr, role)
-                    VALUES ($1, $2, $3, $4)
-                    ON CONFLICT (season_id, user_id)
-                    DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
-                    """,
-                    season_id, uid, mmr_after, new_role
+                if not rows:
+                    continue
+    
+                players: list[dict] = []
+                for row in rows:
+                    row_id = int(row["id"])
+                    uid = int(row["user_id"])
+                    stats = [
+                        int(row["s_perfect"] or 0),
+                        int(row["s_great"] or 0),
+                        int(row["s_good"] or 0),
+                        int(row["s_bad"] or 0),
+                        int(row["s_miss"] or 0),
+                    ]
+                    total_points = stats[0]*4 + stats[1]*3 + stats[2]*2 + stats[3]*1 + stats[4]*0
+    
+                    # Igual que submit: Placement se decide por "rol actual" antes del match
+                    was_placement = (role_state.get(uid, "Placement") == "Placement")
+    
+                    # Igual que submit: si es Placement, el "mmr_before" efectivo es el seed del stats
+                    if was_placement:
+                        seed_mmr, _seed_rank = self.placement_seed_from_stats(stats)
+                        mmr_prev = int(seed_mmr)
+                    else:
+                        mmr_prev = int(mmr_state.get(uid, 0))
+    
+                    players.append({
+                        "row_id": row_id,
+                        "user_id": uid,
+                        "stats": stats,
+                        "total": int(total_points),
+                        "mmr_before": int(mmr_prev),
+                        "was_placement": bool(was_placement),
+                    })
+    
+                # Orden final igual que submit:
+                # - puntos desc
+                # - si empate, Placement primero
+                # - row_id como desempate determinista
+                players.sort(key=lambda p: (-p["total"], -(1 if p["was_placement"] else 0), p["row_id"]))
+    
+                if len(players) < 2:
+                    # si por algún motivo hay results de 1 jugador, igual dejamos estado coherente
+                    p = players[0]
+                    uid = p["user_id"]
+                    mmr_prev = int(p["mmr_before"])
+                    mmr_after = mmr_prev
+                    new_role = get_rank_from_mmr(mmr_after) if not p["was_placement"] else get_rank_from_mmr(mmr_after)
+                    mmr_state[uid] = mmr_after
+                    role_state[uid] = new_role
+    
+                    await conn.execute(
+                        """
+                        INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (season_id, user_id)
+                        DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+                        """,
+                        season_id, uid, mmr_after, new_role
+                    )
+                    await conn.execute(
+                        """
+                        UPDATE match_history
+                        SET pos = $1, mmr_before = $2, mmr_after = $3, mmr_delta = $4, was_placement = $5, is_win = $6
+                        WHERE id = $7
+                        """,
+                        1, mmr_prev, mmr_after, 0, p["was_placement"], True, p["row_id"]
+                    )
+                    continue
+    
+                ratings = [int(p["mmr_before"]) for p in players]
+                order = list(range(len(players)))
+    
+                deltas = self.pairwise_deltas_simple(
+                    ratings,
+                    order,
+                    K=50,
+                    scale=400,
+                    cap=39,
                 )
-
-                await conn.execute(
-                    """
-                    UPDATE match_history
-                    SET pos = $1,
-                        mmr_before = $2,
-                        mmr_after  = $3,
-                        mmr_delta  = $4,
-                        was_placement = $5,
-                        is_win     = $6
-                    WHERE id = $7
-                    """,
-                    pos,
-                    mmr_prev,
-                    mmr_after,
-                    mmr_delta,
-                    bool(p["was_placement"]),
-                    mmr_delta >= 0,
-                    p["row_id"],
-                )
-
-    await interaction.followup.send(
-        "✅ Season 4 recalculation finished FROM SCRATCH (submit-equivalent).",
-        ephemeral=True
-    )
+    
+                deltas = self._apply_tie_logic_placement_priority(players, deltas)
+    
+                # Aplicar y persistir (match_history + seasonplayers) y actualizar estado para el siguiente result
+                for pos, p in enumerate(players, start=1):
+                    uid = p["user_id"]
+                    mmr_prev = int(p["mmr_before"])
+                    mmr_delta = int(deltas[pos - 1])
+                    mmr_after = mmr_prev + mmr_delta
+                    new_role = get_rank_from_mmr(mmr_after)
+    
+                    mmr_state[uid] = mmr_after
+                    role_state[uid] = new_role
+    
+                    await conn.execute(
+                        """
+                        INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (season_id, user_id)
+                        DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+                        """,
+                        season_id, uid, mmr_after, new_role
+                    )
+    
+                    await conn.execute(
+                        """
+                        UPDATE match_history
+                        SET pos = $1,
+                            mmr_before = $2,
+                            mmr_after  = $3,
+                            mmr_delta  = $4,
+                            was_placement = $5,
+                            is_win     = $6
+                        WHERE id = $7
+                        """,
+                        pos,
+                        mmr_prev,
+                        mmr_after,
+                        mmr_delta,
+                        bool(p["was_placement"]),
+                        mmr_delta >= 0,
+                        p["row_id"],
+                    )
+    
+        await interaction.followup.send(
+            "✅ Season 4 recalculation finished FROM SCRATCH (submit-equivalent).",
+            ephemeral=True
+        )
 
     
 
