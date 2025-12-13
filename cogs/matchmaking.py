@@ -2258,138 +2258,138 @@ class Matchmaking(commands.Cog):
                 pass
 
 
-@app_commands.command(name="c", description="Join a room")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-async def join_room(self, interaction: discord.Interaction):
-    ch = interaction.channel
-    if ch.id not in ALLOWED_JOIN_CHANNELS:
-        return await interaction.response.send_message(
-            "This command only works on #join",
-            ephemeral=True
-        )
-
-    assert isinstance(ch, discord.TextChannel)
-    member: discord.Member = interaction.user
-
-    async with self._join_lock:
-        # ⛔️ Guard: ya estás en una sala activa
-        already = self._find_player_room_id(member)
-        if already is not None:
+    @app_commands.command(name="c", description="Join a room")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def join_room(self, interaction: discord.Interaction):
+        ch = interaction.channel
+        if ch.id not in ALLOWED_JOIN_CHANNELS:
             return await interaction.response.send_message(
-                f"❌ You are already in a room. Use **/d** to leave before joining another.",
+                "This command only works on #join",
                 ephemeral=True
             )
 
-        # Determinar server en función del canal #join
-        server_code = "jp" if ch.id == 1378215330979254402 else "en"
+        assert isinstance(ch, discord.TextChannel)
+        member: discord.Member = interaction.user
 
-        mmr_val, _ = await self.fetch_player(member.id)
-        is_placement = self._is_placement_member(member)
+        async with self._join_lock:
+            # ⛔️ Guard: ya estás en una sala activa
+            already = self._find_player_room_id(member)
+            if already is not None:
+                return await interaction.response.send_message(
+                    f"❌ You are already in a room. Use **/d** to leave before joining another.",
+                    ephemeral=True
+                )
 
-        # Asegurar que exista al menos una sala (Current) para este #join
-        cur_rid, cur_info = self._current_room(ch.id)
-        if cur_rid is None:
-            cur_rid, cur_info = await self._create_room(ch, server_code=server_code)
-            self.bot.dispatch("room_updated", cur_rid)
+            # Determinar server en función del canal #join
+            server_code = "jp" if ch.id == 1378215330979254402 else "en"
 
-        # =========================================================
-        # PLACEMENT (cambio final): entra a la sala abierta/no iniciada
-        # con MENOR AVG MMR y con espacio. NO bumping del Current.
-        # =========================================================
-        if is_placement:
-            candidates = []
-            for rid, info in self._queue_rooms(ch.id):  # solo not-started
-                if info.get("finished", False) or info.get("started", False):
-                    continue
-                if len(info.get("players", [])) >= ROOM_CAPACITY:
-                    continue
-                avg = await self._avg_mmr(info.get("players", []))
-                candidates.append((avg, int(info.get("created_ts", 0)), rid, info))
+            mmr_val, _ = await self.fetch_player(member.id)
+            is_placement = self._is_placement_member(member)
 
-            if candidates:
-                candidates.sort(key=lambda t: (t[0], t[1], t[2]))  # menor avg primero
-                _, _, best_rid, best_info = candidates[0]
-            else:
-                best_rid, best_info = await self._create_room(ch, server_code=server_code)
+            # Asegurar que exista al menos una sala (Current) para este #join
+            cur_rid, cur_info = self._current_room(ch.id)
+            if cur_rid is None:
+                cur_rid, cur_info = await self._create_room(ch, server_code=server_code)
+                self.bot.dispatch("room_updated", cur_rid)
 
-            await self._add_member_to_room(member, best_rid, best_info)
+            # =========================================================
+            # PLACEMENT (cambio final): entra a la sala abierta/no iniciada
+            # con MENOR AVG MMR y con espacio. NO bumping del Current.
+            # =========================================================
+            if is_placement:
+                candidates = []
+                for rid, info in self._queue_rooms(ch.id):  # solo not-started
+                    if info.get("finished", False) or info.get("started", False):
+                        continue
+                    if len(info.get("players", [])) >= ROOM_CAPACITY:
+                        continue
+                    avg = await self._avg_mmr(info.get("players", []))
+                    candidates.append((avg, int(info.get("created_ts", 0)), rid, info))
 
-            # Reindexar/renombrar solo dentro de este parent (#join)
-            await self._reindex_parent_rooms(interaction.guild, ch.id)
-            disp = self._disp(best_info, best_rid)
+                if candidates:
+                    candidates.sort(key=lambda t: (t[0], t[1], t[2]))  # menor avg primero
+                    _, _, best_rid, best_info = candidates[0]
+                else:
+                    best_rid, best_info = await self._create_room(ch, server_code=server_code)
 
-            await interaction.response.send_message(f"Joined room {disp}.", ephemeral=True)
-            await ch.send(f"**{member.display_name}** Joined room {disp} (MMR {mmr_val})")
+                await self._add_member_to_room(member, best_rid, best_info)
 
-            # Si queda full, arrancar countdown
-            await self._ensure_countdown(best_rid, best_info)
-            return
+                # Reindexar/renombrar solo dentro de este parent (#join)
+                await self._reindex_parent_rooms(interaction.guild, ch.id)
+                disp = self._disp(best_info, best_rid)
 
-        # =========================================================
-        # NO PLACEMENT: Current / Cutoff / Bumping / Cascada
-        # =========================================================
-        cur_rid, cur_info = self._current_room(ch.id)
-        if cur_rid is None:
-            cur_rid, cur_info = await self._create_room(ch, server_code=server_code)
+                await interaction.response.send_message(f"Joined room {disp}.", ephemeral=True)
+                await ch.send(f"**{member.display_name}** Joined room {disp} (MMR {mmr_val})")
 
-        # Si Current tiene <5, entra normal
-        if len(cur_info.get("players", [])) < ROOM_CAPACITY:
-            await self._add_member_to_room(member, cur_rid, cur_info)
+                # Si queda full, arrancar countdown
+                await self._ensure_countdown(best_rid, best_info)
+                return
 
-            await self._reindex_parent_rooms(interaction.guild, ch.id)
-            disp = self._disp(cur_info, cur_rid)
+            # =========================================================
+            # NO PLACEMENT: Current / Cutoff / Bumping / Cascada
+            # =========================================================
+            cur_rid, cur_info = self._current_room(ch.id)
+            if cur_rid is None:
+                cur_rid, cur_info = await self._create_room(ch, server_code=server_code)
 
-            await interaction.response.send_message(f"Joined room {disp}.", ephemeral=True)
-            await ch.send(f"**{member.display_name}** Joined room {disp} (MMR {mmr_val})")
+            # Si Current tiene <5, entra normal
+            if len(cur_info.get("players", [])) < ROOM_CAPACITY:
+                await self._add_member_to_room(member, cur_rid, cur_info)
 
-            await self._ensure_countdown(cur_rid, cur_info)
-            return
+                await self._reindex_parent_rooms(interaction.guild, ch.id)
+                disp = self._disp(cur_info, cur_rid)
 
-        # Current está 5/5 → cutoff del #5 (min MMR)
-        cutoff, lowest = await self._room_cutoff_and_lowest(cur_info)
+                await interaction.response.send_message(f"Joined room {disp}.", ephemeral=True)
+                await ch.send(f"**{member.display_name}** Joined room {disp} (MMR {mmr_val})")
 
-        # MMR_nuevo > cutoff => bumping
-        if int(mmr_val) > int(cutoff):
-            # entra el nuevo al current, sale el lowest
-            await self._remove_member_from_room(lowest, cur_rid, cur_info)
-            await self._add_member_to_room(member, cur_rid, cur_info)
+                await self._ensure_countdown(cur_rid, cur_info)
+                return
 
-            # Cascada: el expulsado cae a Waiting (Room2+)
+            # Current está 5/5 → cutoff del #5 (min MMR)
+            cutoff, lowest = await self._room_cutoff_and_lowest(cur_info)
+
+            # MMR_nuevo > cutoff => bumping
+            if int(mmr_val) > int(cutoff):
+                # entra el nuevo al current, sale el lowest
+                await self._remove_member_from_room(lowest, cur_rid, cur_info)
+                await self._add_member_to_room(member, cur_rid, cur_info)
+
+                # Cascada: el expulsado cae a Waiting (Room2+)
+                final_rid, final_info = await self._cascade_insert(
+                    ch, parent_id=ch.id, incoming=lowest, server_code=server_code
+                )
+
+                await self._reindex_parent_rooms(interaction.guild, ch.id)
+                disp_cur = self._disp(cur_info, cur_rid)
+                disp_wait = self._disp(final_info, final_rid)
+
+                await interaction.response.send_message(
+                    f"Joined room {disp_cur} (bumped someone to waiting).",
+                    ephemeral=True
+                )
+                await ch.send(
+                    f"**{member.display_name}** Joined room {disp_cur} (MMR {mmr_val}) — "
+                    f"bumped **{lowest.display_name}** to room {disp_wait}"
+                )
+
+                # Countdown: si Current está full, asegurar STARTING
+                await self._ensure_countdown(cur_rid, cur_info)
+                return
+
+            # MMR_nuevo == cutoff => NO bump (el que ya estaba se queda), nuevo a Waiting
+            # MMR_nuevo <  cutoff => nuevo a Waiting
             final_rid, final_info = await self._cascade_insert(
-                ch, parent_id=ch.id, incoming=lowest, server_code=server_code
+                ch, parent_id=ch.id, incoming=member, server_code=server_code
             )
 
             await self._reindex_parent_rooms(interaction.guild, ch.id)
-            disp_cur = self._disp(cur_info, cur_rid)
-            disp_wait = self._disp(final_info, final_rid)
+            disp_final = self._disp(final_info, final_rid)
 
-            await interaction.response.send_message(
-                f"Joined room {disp_cur} (bumped someone to waiting).",
-                ephemeral=True
-            )
-            await ch.send(
-                f"**{member.display_name}** Joined room {disp_cur} (MMR {mmr_val}) — "
-                f"bumped **{lowest.display_name}** to room {disp_wait}"
-            )
+            await interaction.response.send_message(f"Joined room {disp_final}.", ephemeral=True)
+            await ch.send(f"**{member.display_name}** Joined room {disp_final} (MMR {mmr_val})")
 
-            # Countdown: si Current está full, asegurar STARTING
+            # Por si Current está full y aún no arrancó countdown
             await self._ensure_countdown(cur_rid, cur_info)
-            return
-
-        # MMR_nuevo == cutoff => NO bump (el que ya estaba se queda), nuevo a Waiting
-        # MMR_nuevo <  cutoff => nuevo a Waiting
-        final_rid, final_info = await self._cascade_insert(
-            ch, parent_id=ch.id, incoming=member, server_code=server_code
-        )
-
-        await self._reindex_parent_rooms(interaction.guild, ch.id)
-        disp_final = self._disp(final_info, final_rid)
-
-        await interaction.response.send_message(f"Joined room {disp_final}.", ephemeral=True)
-        await ch.send(f"**{member.display_name}** Joined room {disp_final} (MMR {mmr_val})")
-
-        # Por si Current está full y aún no arrancó countdown
-        await self._ensure_countdown(cur_rid, cur_info)
 
 
 
@@ -2774,83 +2774,83 @@ async def join_room(self, interaction: discord.Interaction):
 
     
 
-@app_commands.command(name="d", description="Salir de la sala")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-async def leave_room(self, interaction: discord.Interaction):
-    ch = interaction.channel
+    @app_commands.command(name="d", description="Salir de la sala")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def leave_room(self, interaction: discord.Interaction):
+        ch = interaction.channel
 
-    # — Guard: solo en #join o sus hilos —
-    if not is_allowed_leave(ch):
-        return await interaction.response.send_message(
-            "This command only works on #join or in room thread",
-            ephemeral=True
-        )
-
-    member = interaction.user
-
-    for rid, info in list(self.rooms.items()):
-        if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
-            continue
-
-        if member in info["players"]:
-            # ⛔ No permitir salir si la sala ya inició (freeze)
-            if info.get("started"):
-                return await interaction.response.send_message(
-                    "You can't leave after the songs have been selected",
-                    ephemeral=True
-                )
-
-            # Guardar parent_id ANTES por si la sala se borra
-            parent_id = info["thread"].parent_id
-
-            # Quitar del thread y de la lista
-            info["players"].remove(member)
-            await info["thread"].send(f"**{member.display_name}** left")
-            try:
-                await info["thread"].remove_user(member)
-            except Exception:
-                pass
-
-            # ✅ CANCELAR COUNTDOWN si estaba STARTING y ya no está 5/5
-            if info.get("starting", False) and len(info["players"]) < ROOM_CAPACITY:
-                task = info.get("countdown_task")
-                if task and not task.done():
-                    task.cancel()
-                info["countdown_task"] = None
-                info["starting"] = False
-                info["start_deadline_ts"] = None
-                try:
-                    await info["thread"].send("Countdown canceled (room is no longer full).")
-                except Exception:
-                    pass
-
-            # Si la sala quedó vacía, archivar y borrar
-            if not info["players"]:
-                try:
-                    await info["thread"].edit(archived=True, locked=True)
-                    await info["thread"].delete()
-                except Exception:
-                    pass
-                self.rooms.pop(rid, None)
-                self.bot.dispatch('room_finished', rid)
-            else:
-                await self.update_room_board(interaction.guild, rid)
-
-            # ✅ Reindexar SOLO el parent #join (EN o JP)
-            try:
-                await self._reindex_parent_rooms(interaction.guild, parent_id)
-            except Exception:
-                pass
-
-            # Confirmación al usuario
-            await interaction.response.send_message(
-                f"Leaved room {rid}.", ephemeral=True
+        # — Guard: solo en #join o sus hilos —
+        if not is_allowed_leave(ch):
+            return await interaction.response.send_message(
+                "This command only works on #join or in room thread",
+                ephemeral=True
             )
-            return
 
-    await interaction.response.send_message(
-        "You are not in a room", ephemeral=True
-    )
+        member = interaction.user
+
+        for rid, info in list(self.rooms.items()):
+            if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
+                continue
+
+            if member in info["players"]:
+                # ⛔ No permitir salir si la sala ya inició (freeze)
+                if info.get("started"):
+                    return await interaction.response.send_message(
+                        "You can't leave after the songs have been selected",
+                        ephemeral=True
+                    )
+
+                # Guardar parent_id ANTES por si la sala se borra
+                parent_id = info["thread"].parent_id
+
+                # Quitar del thread y de la lista
+                info["players"].remove(member)
+                await info["thread"].send(f"**{member.display_name}** left")
+                try:
+                    await info["thread"].remove_user(member)
+                except Exception:
+                    pass
+
+                # ✅ CANCELAR COUNTDOWN si estaba STARTING y ya no está 5/5
+                if info.get("starting", False) and len(info["players"]) < ROOM_CAPACITY:
+                    task = info.get("countdown_task")
+                    if task and not task.done():
+                        task.cancel()
+                    info["countdown_task"] = None
+                    info["starting"] = False
+                    info["start_deadline_ts"] = None
+                    try:
+                        await info["thread"].send("Countdown canceled (room is no longer full).")
+                    except Exception:
+                        pass
+
+                # Si la sala quedó vacía, archivar y borrar
+                if not info["players"]:
+                    try:
+                        await info["thread"].edit(archived=True, locked=True)
+                        await info["thread"].delete()
+                    except Exception:
+                        pass
+                    self.rooms.pop(rid, None)
+                    self.bot.dispatch('room_finished', rid)
+                else:
+                    await self.update_room_board(interaction.guild, rid)
+
+                # ✅ Reindexar SOLO el parent #join (EN o JP)
+                try:
+                    await self._reindex_parent_rooms(interaction.guild, parent_id)
+                except Exception:
+                    pass
+
+                # Confirmación al usuario
+                await interaction.response.send_message(
+                    f"Leaved room {rid}.", ephemeral=True
+                )
+                return
+
+        await interaction.response.send_message(
+            "You are not in a room", ephemeral=True
+        )
 
 
 
@@ -3903,3 +3903,4 @@ async def leave_room(self, interaction: discord.Interaction):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #edd
+
