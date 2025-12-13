@@ -1451,9 +1451,14 @@ class Matchmaking(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self._songs_lock = asyncio.Lock()
+
+        # ✅ AGREGA ESTO:
+        self._join_lock = asyncio.Lock()
+
         self.rooms: dict[int, dict] = {}
         self.inactivity: dict[int, dict[int, dict]] = {}
         self.monitor_inactivity.start()
+
 
 
 
@@ -3903,4 +3908,3 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #edd
-
