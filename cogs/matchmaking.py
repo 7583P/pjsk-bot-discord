@@ -412,7 +412,7 @@ RANK_ROLE_IDS = {
     "Champion":      1371323543501144115,
     "Champion ⬆":      1449495589153935421,
     "Grand Champion": 1394444744892874832,
-    "Grand Champion ⬆": 1449495651535552729
+    "Grand Champion ⬆": 1449495651535552729,
     "Legend":        1371323380510363749,
 }
 
