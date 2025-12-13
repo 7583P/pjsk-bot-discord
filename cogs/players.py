@@ -16,7 +16,7 @@ DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port
 # Diccionario con todos los roles de rango (Discord Role IDs)
 RANK_ROLE_IDS = {
     "Placement":    1371321594068336811,
-    "Iron":        1394444407536881845,       
+    "Iron":        1394444407536881845,   
     "Iron ⬆":       1446954780915273778,
     "Bronze":        1371324225838645339,
     "Bronze ⬆":        1433827677713858732,
@@ -33,7 +33,9 @@ RANK_ROLE_IDS = {
     "Master":       1394635883466199110,
     "Master ⬆":   1440478019012530267,
     "Champion":      1371323543501144115,
+    "Champion ⬆":      1449495589153935421,
     "Grand Champion": 1394444744892874832,
+    "Grand Champion ⬆": 1449495651535552729
     "Legend":        1371323380510363749,
 }
 
