@@ -68,8 +68,8 @@ def flagify_iso2_suffix(text: str) -> str:
 # ————— Append: solo limita el rango de selección para canciones 'append' —————
 APPEND_RANKS_ORDER = [
     "Legend",
-    "Grand Champion ⬆",
-    "Grand Champion",
+    "Divine Star",
+    "Star",
     "Champion ⬆",
     "Champion",
     "Master ⬆",
@@ -82,16 +82,16 @@ APPEND_RANKS_ORDER = [
 
 
 APPEND_RANGES = {
-    "Diamond":        (24, 28),
-    "Diamond ⬆":      (25, 29),
-    "Crystal":        (26, 30),
-    "Crystal ⬆":      (27, 31),
-    "Master":         (28, 32),
-    "Master ⬆":       (29, 33),
-    "Champion":       (30, 34),
-    "Champion ⬆":     (31, 35),
-    "Grand Champion": (32, 36),
-    "Grand Champion ⬆": (33, 37),
+    "Diamond":        (24, 26),
+    "Diamond ⬆":      (25, 27),
+    "Crystal":        (26, 28),
+    "Crystal ⬆":      (27, 29),
+    "Master":         (28, 30),
+    "Master ⬆":       (29, 31),
+    "Champion":       (30, 33),
+    "Champion ⬆":     (31, 34),
+    "Star":           (32, 35),
+    "Divine Star":    (33, 36),
     "Legend":         (34, 38),
 }
 
@@ -112,8 +112,8 @@ APPEND_PROBABILITIES_PERCENT = {
     "Master ⬆":       25,
     "Champion":       30,
     "Champion ⬆":     35,
-    "Grand Champion": 40,
-    "Grand Champion ⬆": 45,
+    "Star":           40,
+    "Divine Star":    45,
     "Legend":         50,
 }
 
@@ -194,7 +194,7 @@ APPEND_COUNTS_DISTRIB = {
     },
 
         # puedes ir definiendo otros rangos aquí si quieres
-        "Champion": {
+        "Champion ⬆": {
         1: 1,  # 40% de los rooms con append → 1 append
         2: 0.5,  # 20% → 2 appends
         3: 0.1,  # 4% de los rooms con append → 1 append
@@ -203,7 +203,7 @@ APPEND_COUNTS_DISTRIB = {
 
     },
     # puedes ir definiendo otros rangos aquí si quieres
-        "Grand Champion": {
+        "Star": {
         1: 1,  # 45% de los rooms con append → 1 append
         2: 0.5,  # 22.5% → 2 appends
         3: 0.1,  # 4.5% de los rooms con append → 1 append
@@ -213,7 +213,7 @@ APPEND_COUNTS_DISTRIB = {
     },
 
         # puedes ir definiendo otros rangos aquí si quieres
-        "Grand Champion": {
+        "Divine Star": {
         1: 1,  # 45% de los rooms con append → 1 append
         2: 0.5,  # 22.5% → 2 appends
         3: 0.1,  # 4.5% de los rooms con append → 1 append
@@ -270,7 +270,7 @@ ALLOWED_DIFFS_BY_RANK = {
     "Silver ⬆":      ("hard", "expert"),
     "Gold":          ("hard", "expert"),
     "Gold ⬆":        ("hard", "expert"),
-    "Platinum":      ("hard", "expert"),
+    "Platinum":      ("hard", "expert", "master"),
     "Platinum ⬆":    ("hard", "expert", "master"),
     "Diamond":       ("hard","expert", "master", "append"),
     "Diamond ⬆":     ("hard","expert", "master", "append"),
@@ -280,8 +280,8 @@ ALLOWED_DIFFS_BY_RANK = {
     "Master ⬆":      ("expert", "master", "append"),
     "Champion ⬆":      ("expert", "master", "append"),
     "Champion":      ("expert", "master", "append"),
-    "Grand Champion": ("expert", "master", "append"),
-    "Grand Champion ⬆": ("master", "append"),
+    "Star": ("expert", "master", "append"),
+    "Divine Star": ("master", "append"),
     "Legend":        ("master", "append"),
 }
 
@@ -306,8 +306,8 @@ BRACKET_RANGES = {
     "Master ⬆":      (29, 33),
     "Champion":      (30, 34),
     "Champion ⬆":    (31, 35),
-    "Grand Champion":   (32, 36),
-    "Grand Champion ⬆": (33, 37),
+    "Star":          (32, 36),
+    "Divine Star":   (33, 37),
     "Legend":        (34, 38),
 
 }
@@ -385,9 +385,9 @@ def get_rank_from_mmr(mmr: int) -> str:
     elif mmr <= 899:
         return "Champion ⬆"
     elif mmr <= 949:
-        return "Grand Champion"
+        return "Star"
     elif mmr <= 999:
-        return "Grand Champion ⬆"
+        return "Divine Star"
     else:
         return "Legend"
 
@@ -411,8 +411,8 @@ RANK_ROLE_IDS = {
     "Master ⬆":   1440478019012530267,
     "Champion":      1371323543501144115,
     "Champion ⬆":      1449495589153935421,
-    "Grand Champion": 1394444744892874832,
-    "Grand Champion ⬆": 1449495651535552729,
+    "Star": 1394444744892874832,
+    "Divine Star": 1449495651535552729,
     "Legend":        1371323380510363749,
 }
 
