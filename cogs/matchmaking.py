@@ -111,7 +111,7 @@ APPEND_PROBABILITIES_PERCENT = {
     "Master":         20,
     "Master ⬆":       25,
     "Champion":       30,
-    "Grabd Champion":     35,
+    "Grand Champion":     35,
     "Star":           40,
     "Divine Star":    45,
     "Legend":         50,
