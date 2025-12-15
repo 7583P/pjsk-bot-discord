@@ -88,10 +88,10 @@ APPEND_RANGES = {
     "Crystal ⬆":      (27, 29),
     "Master":         (28, 30),
     "Master ⬆":       (29, 31),
-    "Champion":       (30, 33),
-    "Grand Champion":     (31, 34),
+    "Champion":       (30, 32),
+    "Grand Champion": (31, 33),
     "Star":           (32, 35),
-    "Divine Star":    (33, 36),
+    "Divine Star":    (33, 37),
     "Legend":         (34, 38),
 }
 
@@ -111,7 +111,7 @@ APPEND_PROBABILITIES_PERCENT = {
     "Master":         20,
     "Master ⬆":       25,
     "Champion":       30,
-    "Champion ⬆":     35,
+    "Grabd Champion":     35,
     "Star":           40,
     "Divine Star":    45,
     "Legend":         50,
