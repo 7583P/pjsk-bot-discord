@@ -194,7 +194,7 @@ APPEND_COUNTS_DISTRIB = {
     },
 
         # puedes ir definiendo otros rangos aquí si quieres
-        "Champion ⬆": {
+        "Grand Champion": {
         1: 1,  # 40% de los rooms con append → 1 append
         2: 0.5,  # 20% → 2 appends
         3: 0.1,  # 4% de los rooms con append → 1 append
@@ -278,8 +278,8 @@ ALLOWED_DIFFS_BY_RANK = {
     "Crystal ⬆":     ("expert", "master", "append"),
     "Master":        ("expert", "master", "append"),
     "Master ⬆":      ("expert", "master", "append"),
-    "Champion ⬆":      ("expert", "master", "append"),
     "Champion":      ("expert", "master", "append"),
+    "Grand Champion":      ("expert", "master", "append"),
     "Star": ("expert", "master", "append"),
     "Divine Star": ("master", "append"),
     "Legend":        ("master", "append"),
@@ -305,7 +305,7 @@ BRACKET_RANGES = {
     "Master":        (28, 32),
     "Master ⬆":      (29, 33),
     "Champion":      (30, 34),
-    "Champion ⬆":    (31, 35),
+    "Grand Champion":    (31, 35),
     "Star":          (32, 36),
     "Divine Star":   (33, 37),
     "Legend":        (34, 38),
@@ -383,7 +383,7 @@ def get_rank_from_mmr(mmr: int) -> str:
     elif mmr <= 849:
         return "Champion"
     elif mmr <= 899:
-        return "Champion ⬆"
+        return "Grand Champion"
     elif mmr <= 949:
         return "Star"
     elif mmr <= 999:
@@ -410,7 +410,7 @@ RANK_ROLE_IDS = {
     "Master":       1394635883466199110,
     "Master ⬆":   1440478019012530267,
     "Champion":      1371323543501144115,
-    "Champion ⬆":      1449495589153935421,
+    "Grand Champion":      1449495589153935421,
     "Star": 1394444744892874832,
     "Divine Star": 1449495651535552729,
     "Legend":        1371323380510363749,
