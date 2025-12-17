@@ -191,7 +191,8 @@ async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
 
 @app.on_event("startup")
 async def startup():
-    global db_pool
+    global db_pool, _cards_task, _cards_stop
+
     if not DATABASE_URL:
         print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
         return
@@ -248,9 +249,27 @@ async def startup():
           ON public.match_songs(result_id);
         """)
 
+    # ---- background refresher de cartas Sekaipedia (AUTO) ----
+    _cards_stop.clear()
+    if _cards_task is None or _cards_task.done():
+        _cards_task = asyncio.create_task(_refresh_cards_forever())
+
 
 @app.on_event("shutdown")
 async def shutdown():
+    global _cards_task, _cards_stop
+
+    _cards_stop.set()
+    if _cards_task:
+        _cards_task.cancel()
+        try:
+            await _cards_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            traceback.print_exc()
+        _cards_task = None
+
     if db_pool:
         await db_pool.close()
         print("🛑 DB pool closed")
@@ -1245,6 +1264,55 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.fromtimestamp(0, tz=timezone.utc)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
+
+# --------- AUTO REFRESH (background poller) ----------
+_cards_stop = asyncio.Event()
+_cards_task: Optional[asyncio.Task] = None
+
+async def _refresh_cards_once() -> None:
+    """
+    Refresca cartas si la BD no está fresca.
+    Actualiza BD + cache en memoria.
+    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
+    """
+    if not db_pool:
+        return
+
+    async with _cards_lock:
+        try:
+            # 1) Chequear frescura rápido con una conexión corta
+            async with db_pool.acquire() as conn:
+                if await _cards_db_is_fresh(conn):
+                    return
+
+            # 2) Scrape (sin mantener una conexión ocupada)
+            items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                return
+
+            # 3) Persistir y refrescar cache
+            async with db_pool.acquire() as conn:
+                await _cards_db_upsert_many(conn, items)
+
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = datetime.now(timezone.utc)
+            print(f"✅ Cards refreshed (auto): {len(items)}")
+        except Exception:
+            traceback.print_exc()
+
+async def _refresh_cards_forever() -> None:
+    """
+    Poller: corre cada CARDS_TTL y refresca si hace falta.
+    """
+    await asyncio.sleep(3)  # pequeño delay post-startup
+    while not _cards_stop.is_set():
+        await _refresh_cards_once()
+        try:
+            await asyncio.wait_for(_cards_stop.wait(), timeout=CARDS_TTL.total_seconds())
+        except asyncio.TimeoutError:
+            pass
+
+# ----------------------------------------------------
 
 async def _sleep_jitter(a=0.15, b=0.5):
     await asyncio.sleep(random.uniform(a, b))
