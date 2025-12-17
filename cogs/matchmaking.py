@@ -2681,89 +2681,89 @@ class Matchmaking(commands.Cog):
 
     
 
-@app_commands.command(name="d", description="Salir de la sala")
-@app_commands.guilds(discord.Object(id=GUILD_ID))
-async def leave_room(self, interaction: discord.Interaction):
-    ch = interaction.channel
-
-    # — Guard: solo en #join o sus hilos —
-    if not is_allowed_leave(ch):
-        return await interaction.response.send_message(
-            "This command only works on #join or in room thread",
-            ephemeral=True
-        )
-
-    member = interaction.user
-
-    async with self._join_lock:
-        for rid, info in list(self.rooms.items()):
-            if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
-                continue
-
-            if member in info["players"]:
-                # ⛔ No permitir salir si la sala ya inició (freeze)
-                if info.get("started"):
-                    return await interaction.response.send_message(
-                        "You can't leave after the songs have been selected",
-                        ephemeral=True
-                    )
-
-                parent_id = info["thread"].parent_id
-
-                # Quitar del thread y de la lista
-                info["players"].remove(member)
-                try:
-                    await info["thread"].send(f"**{member.display_name}** left")
-                except Exception:
-                    pass
-
-                try:
-                    await info["thread"].remove_user(member)
-                except Exception:
-                    pass
-
-                # ✅ CANCELAR COUNTDOWN si estaba STARTING y ya no está 5/5
-                if info.get("starting", False) and len(info["players"]) < ROOM_CAPACITY:
-                    await self._cancel_countdown_if_any(
-                        info,
-                        reason="Countdown canceled (room is no longer full)."
-                    )
-
-                # Si la sala quedó vacía, archivar y borrar
-                if not info["players"]:
+    @app_commands.command(name="d", description="Salir de la sala")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def leave_room(self, interaction: discord.Interaction):
+        ch = interaction.channel
+    
+        # — Guard: solo en #join o sus hilos —
+        if not is_allowed_leave(ch):
+            return await interaction.response.send_message(
+                "This command only works on #join or in room thread",
+                ephemeral=True
+            )
+    
+        member = interaction.user
+    
+        async with self._join_lock:
+            for rid, info in list(self.rooms.items()):
+                if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
+                    continue
+    
+                if member in info["players"]:
+                    # ⛔ No permitir salir si la sala ya inició (freeze)
+                    if info.get("started"):
+                        return await interaction.response.send_message(
+                            "You can't leave after the songs have been selected",
+                            ephemeral=True
+                        )
+    
+                    parent_id = info["thread"].parent_id
+    
+                    # Quitar del thread y de la lista
+                    info["players"].remove(member)
                     try:
-                        await info["thread"].edit(archived=True, locked=True)
-                        await info["thread"].delete()
+                        await info["thread"].send(f"**{member.display_name}** left")
                     except Exception:
                         pass
-                    self.rooms.pop(rid, None)
-                    self.bot.dispatch('room_finished', rid)
-                else:
-                    await self.update_room_board(interaction.guild, rid)
-
-                # ✅ NUEVO: upward fill (rebalance) si alguien dejó un hueco arriba
-                try:
-                    await self._rebalance_upwards(interaction.guild, parent_id)
-                except Exception:
-                    log.exception("rebalance_upwards failed")
-
-                # ✅ Reindex final para que room-1 sea el de mayor avg MMR
-                try:
-                    await self._reindex_parent_rooms(interaction.guild, parent_id)
-                except Exception:
-                    pass
-
-                disp = self._disp(info, rid)
-                await interaction.response.send_message(
-                    f"Leaved room {disp}.",
-                    ephemeral=True
-                )
-                return
-
-        await interaction.response.send_message(
-            "You are not in a room",
-            ephemeral=True
-        )
+    
+                    try:
+                        await info["thread"].remove_user(member)
+                    except Exception:
+                        pass
+    
+                    # ✅ CANCELAR COUNTDOWN si estaba STARTING y ya no está 5/5
+                    if info.get("starting", False) and len(info["players"]) < ROOM_CAPACITY:
+                        await self._cancel_countdown_if_any(
+                            info,
+                            reason="Countdown canceled (room is no longer full)."
+                        )
+    
+                    # Si la sala quedó vacía, archivar y borrar
+                    if not info["players"]:
+                        try:
+                            await info["thread"].edit(archived=True, locked=True)
+                            await info["thread"].delete()
+                        except Exception:
+                            pass
+                        self.rooms.pop(rid, None)
+                        self.bot.dispatch('room_finished', rid)
+                    else:
+                        await self.update_room_board(interaction.guild, rid)
+    
+                    # ✅ NUEVO: upward fill (rebalance) si alguien dejó un hueco arriba
+                    try:
+                        await self._rebalance_upwards(interaction.guild, parent_id)
+                    except Exception:
+                        log.exception("rebalance_upwards failed")
+    
+                    # ✅ Reindex final para que room-1 sea el de mayor avg MMR
+                    try:
+                        await self._reindex_parent_rooms(interaction.guild, parent_id)
+                    except Exception:
+                        pass
+    
+                    disp = self._disp(info, rid)
+                    await interaction.response.send_message(
+                        f"Leaved room {disp}.",
+                        ephemeral=True
+                    )
+                    return
+    
+            await interaction.response.send_message(
+                "You are not in a room",
+                ephemeral=True
+            )
 
 
 
