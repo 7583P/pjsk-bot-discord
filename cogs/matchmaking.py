@@ -636,20 +636,117 @@ class Matchmaking(commands.Cog):
 
     def _queue_rooms(self, parent_id: int) -> list[tuple[int, dict]]:
         """
-        Cola (ciclo de selección): SOLO salas no iniciadas (started=False),
-        ordenadas por created_ts asc (FIFO). Incluye STARTING.
+        Cola de salas NO iniciadas (started=False), ordenadas por display_num
+        (room-1, room-2, ...) como fuente de verdad.
+
+        display_num lo recalculamos con _reindex_parent_rooms (orden por avg MMR).
         """
         items = []
         for rid, info in self._rooms_for_parent(parent_id):
             if info.get("started", False):
                 continue
             items.append((rid, info))
-        items.sort(key=lambda t: int(t[1].get("created_ts", 0)))
+
+        # display_num primero; si falta, cae a created_ts
+        items.sort(
+            key=lambda t: (
+                int(t[1].get("display_num") or 999999),
+                int(t[1].get("created_ts", 0)),
+                t[0],
+            )
+        )
         return items
 
     def _current_room(self, parent_id: int) -> tuple[int, dict] | tuple[None, None]:
         q = self._queue_rooms(parent_id)
         return q[0] if q else (None, None)
+
+    async def _pick_highest_mmr_member(self, players: list[discord.Member]) -> discord.Member | None:
+        """
+        Devuelve el miembro con MMR más alto (determinista por orden de join en empate).
+        """
+        if not players:
+            return None
+        mmr_map = await self._room_mmrs(players)
+        # empate -> el que entró antes (índice menor) gana
+        return max(players, key=lambda m: (mmr_map.get(m.id, 0), -players.index(m)))
+
+
+    async def _rebalance_upwards(self, guild: discord.Guild, parent_id: int):
+        """
+        Si una sala superior (room-1, room-2, ...) queda con hueco (<5) y NO ha iniciado,
+        sube al jugador con más MMR de la sala inmediata inferior para rellenar.
+        Puede cascada.
+
+        Regla: solo considera salas NO started y NO finished.
+        """
+        # Construimos lista actual de salas no-started ordenadas por avg MMR (como reindex)
+        rooms = []
+        for rid, info in self._rooms_for_parent(parent_id):
+            if info.get("finished", False):
+                continue
+            if info.get("started", False):
+                continue
+            players = info.get("players", [])
+            avg = await self._avg_mmr(players) if players else -1
+            rooms.append((rid, info, int(avg), int(info.get("created_ts", 0))))
+
+        # Más alto avg primero; desempates por created_ts y rid
+        rooms.sort(key=lambda t: (-t[2], t[3], t[0]))
+
+        if len(rooms) <= 1:
+            return
+
+        # Cascada: i toma de i+1 si tiene hueco
+        for i in range(len(rooms) - 1):
+            rid_up, info_up, *_ = rooms[i]
+
+            if info_up.get("finished", False) or info_up.get("started", False):
+                continue
+
+            while len(info_up.get("players", [])) < ROOM_CAPACITY:
+                rid_down, info_down, *_ = rooms[i + 1]
+
+                if info_down.get("finished", False) or info_down.get("started", False):
+                    break
+
+                down_players = info_down.get("players", [])
+                if not down_players:
+                    break
+
+                donor = await self._pick_highest_mmr_member(down_players)
+                if donor is None:
+                    break
+
+                # mover donor: abajo -> arriba
+                await self._remove_member_from_room(donor, rid_down, info_down)
+
+                # cancelar countdown si abajo estaba STARTING y ya no está full
+                if info_down.get("starting", False) and len(info_down.get("players", [])) < ROOM_CAPACITY:
+                    await self._cancel_countdown_if_any(
+                        info_down,
+                        reason="Countdown canceled (room is no longer full)."
+                    )
+
+                await self._add_member_to_room(donor, rid_up, info_up)
+
+                # si arriba queda full, asegurar countdown
+                await self._ensure_countdown(rid_up, info_up)
+
+                # si abajo se quedó vacío, lo borramos y cortamos (no hay más para donar)
+                if not info_down.get("players", []):
+                    try:
+                        await info_down["thread"].edit(archived=True, locked=True)
+                        await info_down["thread"].delete(reason="Empty room after rebalance")
+                    except Exception:
+                        pass
+                    self.rooms.pop(rid_down, None)
+                    break
+
+        # Al final: reindex/renombrar para reflejar el nuevo orden
+        await self._reindex_parent_rooms(guild, parent_id)
+
+
 
     async def _room_mmrs(self, players: list[discord.Member]) -> dict[int, int]:
         """MMR por user_id (1 query por jugador; si quieres, luego lo optimizamos por batch)."""
@@ -710,24 +807,30 @@ class Matchmaking(commands.Cog):
 
         return new_id, info
 
+
+
     async def _reindex_parent_rooms(self, guild: discord.Guild, parent_id: int):
         """
         Recalcula display_num por parent #join:
         - Primero NO started (incluye STARTING), luego started
-        - Dentro de cada grupo por created_ts asc
+        - Dentro de NO started: Average MMR DESC (más alto = room-1)
+        - Desempates: created_ts asc, rid asc
         Además renombra thread a room-{display_num}.
         """
         items = self._rooms_for_parent(parent_id)
 
-        def key(t):
-            rid, info = t
+        scored: list[tuple[bool, int, int, int, dict]] = []
+        # tupla: (started, -avg, created_ts, rid, info)
+        for rid, info in items:
             started = bool(info.get("started", False))
             created = int(info.get("created_ts", 0))
-            return (1 if started else 0, created, rid)
+            players = info.get("players", [])
+            avg = await self._avg_mmr(players) if players else -1
+            scored.append((started, -int(avg), created, rid, info))
 
-        items.sort(key=key)
+        scored.sort(key=lambda t: (1 if t[0] else 0, t[1], t[2], t[3]))
 
-        for idx, (rid, info) in enumerate(items, start=1):
+        for idx, (_started, _negavg, _created, rid, info) in enumerate(scored, start=1):
             info["display_num"] = idx
             th: discord.Thread = info["thread"]
             try:
@@ -1502,14 +1605,23 @@ class Matchmaking(commands.Cog):
                         pass
                     players.remove(member)
                     data.pop(member.id, None)
-                    await thread.send(
-                        f"{member.mention} has been kicked due to inactivity"
-                    )
+
+                    await thread.send(f"{member.mention} has been kicked due to inactivity")
+
+                    parent_id = thread.parent_id
+
                     if players:
                         await self.update_room_board(thread.guild, rid)
 
-                    # — Si la sala ha quedado vacía (solo queda el bot), archivarla y borrarla —
-                    if not players:
+                        # NUEVO: si quedó hueco en una sala "arriba", subir al más alto MMR de la de abajo
+                        try:
+                            async with self._join_lock:
+                                await self._rebalance_upwards(thread.guild, parent_id)
+                        except Exception:
+                            log.exception("rebalance_upwards failed (inactivity)")
+
+                    else:
+                        # — Si la sala ha quedado vacía, archivarla y borrarla —
                         try:
                             await thread.edit(archived=True, locked=True)
                             await thread.delete()
@@ -1518,6 +1630,7 @@ class Matchmaking(commands.Cog):
                         self.rooms.pop(rid, None)
                         self.inactivity.pop(thread.id, None)
                         continue
+
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -2568,20 +2681,21 @@ class Matchmaking(commands.Cog):
 
     
 
-    @app_commands.command(name="d", description="Salir de la sala")
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    async def leave_room(self, interaction: discord.Interaction):
-        ch = interaction.channel
+@app_commands.command(name="d", description="Salir de la sala")
+@app_commands.guilds(discord.Object(id=GUILD_ID))
+async def leave_room(self, interaction: discord.Interaction):
+    ch = interaction.channel
 
-        # — Guard: solo en #join o sus hilos —
-        if not is_allowed_leave(ch):
-            return await interaction.response.send_message(
-                "This command only works on #join or in room thread",
-                ephemeral=True
-            )
+    # — Guard: solo en #join o sus hilos —
+    if not is_allowed_leave(ch):
+        return await interaction.response.send_message(
+            "This command only works on #join or in room thread",
+            ephemeral=True
+        )
 
-        member = interaction.user
+    member = interaction.user
 
+    async with self._join_lock:
         for rid, info in list(self.rooms.items()):
             if info["thread"].parent_id not in ALLOWED_JOIN_CHANNELS:
                 continue
@@ -2594,12 +2708,15 @@ class Matchmaking(commands.Cog):
                         ephemeral=True
                     )
 
-                # Guardar parent_id ANTES por si la sala se borra
                 parent_id = info["thread"].parent_id
 
                 # Quitar del thread y de la lista
                 info["players"].remove(member)
-                await info["thread"].send(f"**{member.display_name}** left")
+                try:
+                    await info["thread"].send(f"**{member.display_name}** left")
+                except Exception:
+                    pass
+
                 try:
                     await info["thread"].remove_user(member)
                 except Exception:
@@ -2607,16 +2724,10 @@ class Matchmaking(commands.Cog):
 
                 # ✅ CANCELAR COUNTDOWN si estaba STARTING y ya no está 5/5
                 if info.get("starting", False) and len(info["players"]) < ROOM_CAPACITY:
-                    task = info.get("countdown_task")
-                    if task and not task.done():
-                        task.cancel()
-                    info["countdown_task"] = None
-                    info["starting"] = False
-                    info["start_deadline_ts"] = None
-                    try:
-                        await info["thread"].send("Countdown canceled (room is no longer full).")
-                    except Exception:
-                        pass
+                    await self._cancel_countdown_if_any(
+                        info,
+                        reason="Countdown canceled (room is no longer full)."
+                    )
 
                 # Si la sala quedó vacía, archivar y borrar
                 if not info["players"]:
@@ -2630,20 +2741,28 @@ class Matchmaking(commands.Cog):
                 else:
                     await self.update_room_board(interaction.guild, rid)
 
-                # ✅ Reindexar SOLO el parent #join (EN o JP)
+                # ✅ NUEVO: upward fill (rebalance) si alguien dejó un hueco arriba
+                try:
+                    await self._rebalance_upwards(interaction.guild, parent_id)
+                except Exception:
+                    log.exception("rebalance_upwards failed")
+
+                # ✅ Reindex final para que room-1 sea el de mayor avg MMR
                 try:
                     await self._reindex_parent_rooms(interaction.guild, parent_id)
                 except Exception:
                     pass
 
-                # Confirmación al usuario
+                disp = self._disp(info, rid)
                 await interaction.response.send_message(
-                    f"Leaved room {rid}.", ephemeral=True
+                    f"Leaved room {disp}.",
+                    ephemeral=True
                 )
                 return
 
         await interaction.response.send_message(
-            "You are not in a room", ephemeral=True
+            "You are not in a room",
+            ephemeral=True
         )
 
 
@@ -3697,3 +3816,4 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
+
