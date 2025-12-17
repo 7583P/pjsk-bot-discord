@@ -1490,119 +1490,81 @@ def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
     safe_name = quote(filename)
     return f"https://sekaipedia.org/wiki/Special:FilePath/{safe_name}?width={width}"
 
-# ---------- Scraper real: listado de cartas (dinámico, sin límite 1300) ----------
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    """
-    Recorre dinámicamente las páginas:
-      List_of_cards_(1-100), (101-200), (201-300), ...
-    hasta que encuentra varias páginas seguidas sin tabla de cartas.
+# =================== NUEVO: Parser robusto del wikitext de List_of_cards ===================
+def _strip_wiki_markup(s: str) -> str:
+    s = re.sub(r"\{\{.*?\}\}", "", s, flags=re.S)  # templates
+    s = re.sub(r"<.*?>", "", s, flags=re.S)        # html
+    return s.strip()
 
-    Así, si mañana aparece List_of_cards_(1301-1400) o (1401-1500),
-    se leerá automáticamente sin tocar código.
+def _cells_from_row(row: str) -> List[str]:
     """
+    Soporta:
+      | 1292 || [[Page|Name]] || ...
+    y también:
+      | 1292
+      | [[Page|Name]]
+      | ...
+    """
+    cells: List[str] = []
+    for ln in row.splitlines():
+        s = ln.lstrip()
+        if not s.startswith("|"):
+            continue
+        s = s[1:].strip()
+        parts = [p.strip() for p in s.split("||")]
+        for p in parts:
+            if p != "":
+                cells.append(p)
+    return cells
+
+def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
     items: List[Dict] = []
+    tables = re.split(r"\n\|\}", wikitext)
 
-    async with httpx.AsyncClient() as client:
-        start = 1           # primer ID
-        step = 100          # tamaño de cada rango (1-100, 101-200, ...)
-        max_limit = 3000    # techo de seguridad
-        empty_streak = 0    # cuántas páginas seguidas encontramos “vacías”
+    for table in tables:
+        if "! Card" not in table and "! Card name" not in table:
+            continue
 
-        while start <= max_limit and empty_streak < 3:
-            page = f"List_of_cards_({start}-{start+step-1})"
-            print(f"[cards] parsing {page}")
-
-            try:
-                data = await _get_json(client, SEKAIPEDIA_API, {
-                    "action": "parse",
-                    "page": page,
-                    "prop": "wikitext",
-                    "format": "json",
-                    "formatversion": 2,
-                })
-            except Exception:
-                traceback.print_exc()
-                break  # si falla feo, salimos del bucle
-
-            parse = (data or {}).get("parse") or {}
-            wikitext: str = parse.get("wikitext") or ""
-            if not wikitext:
-                empty_streak += 1
-                start += step
+        rows = re.split(r"\n\|-+", table)
+        for row in rows:
+            if "! Card" in row or "! #" in row:
                 continue
 
-            tables = re.split(r"\n\|\}", wikitext)
-            rows_found = 0
+            cells = _cells_from_row(row)
+            if len(cells) < 2:
+                continue
 
-            for table in tables:
-                if "! Card" not in table and "! Card name" not in table:
-                    continue  # no es la tabla principal de cartas
+            # 1) ID
+            id_cell = _strip_wiki_markup(cells[0])
+            m_id = re.search(r"\b(\d{1,6})\b", id_cell)
+            if not m_id:
+                continue
+            card_id = m_id.group(1)
 
-                rows = re.split(r"\n\|-+", table)
-                for row in rows:
-                    if "! Card" in row or "! #" in row:
-                        continue  # encabezados
-
-                    # aceptar líneas con espacios antes del "|"
-                    lines: List[str] = []
-                    for ln in row.splitlines():
-                        stripped = ln.lstrip()
-                        if stripped.startswith("|"):
-                            lines.append(stripped)
-
-                    if not lines:
-                        continue
-
-                    row_text = " ".join(lines)
-                    cells = [c.strip() for c in row_text.lstrip("|").split("||")]
-                    if len(cells) < 2:
-                        continue
-
-                    # 1) ID
-                    m_id = re.search(r"\b(\d{1,4})\b", cells[0])
-                    if not m_id:
-                        continue
-                    card_id = m_id.group(1)
-
-                    # 2) nombre y title
-                    name_cell = cells[1]
-                    m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
-                    if m_name:
-                        page_title   = m_name.group(1)
-                        display_name = m_name.group(2) or m_name.group(1)
-                    else:
-                        tmp = re.sub(r"\{\{.*?\}\}", "", name_cell)
-                        tmp = re.sub(r"<.*?>", "", tmp)
-                        display_name = tmp.strip()
-                        page_title   = display_name.replace(" ", "_")
-
-                    href = f"https://sekaipedia.org/wiki/{page_title}"
-
-                    # 3) imagen
-                    m_file = re.search(r"\[\[File:([^|\]]+)", row)
-                    thumb_url = None
-                    if m_file:
-                        filename = m_file.group(1)
-                        thumb_url = _build_thumb_from_filename(filename, width=256)
-
-                    items.append({
-                        "id": card_id,
-                        "name": display_name,
-                        "href": href,
-                        "thumb": thumb_url,
-                    })
-                    rows_found += 1
-
-            if rows_found == 0:
-                empty_streak += 1
+            # 2) Nombre + href (desde [[...]])
+            name_cell = cells[1]
+            m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
+            if m_name:
+                page_title = m_name.group(1).strip()
+                display_name = (m_name.group(2) or page_title).strip()
             else:
-                empty_streak = 0  # reseteamos si encontramos cartas en este rango
+                display_name = _strip_wiki_markup(name_cell)
+                page_title = display_name.replace(" ", "_")
 
-            # pequeña pausa entre páginas para no spamear
-            await _sleep_jitter(0.3, 0.7)
-            start += step
+            href = f"https://sekaipedia.org/wiki/{page_title.replace(' ', '_')}"
 
-    # Quitar duplicados por id
+            # 3) imagen (thumb)
+            m_file = re.search(r"\[\[\s*File:([^|\]]+)", row, flags=re.I)
+            thumb_url = _build_thumb_from_filename(m_file.group(1), width=256) if m_file else None
+
+            items.append({
+                "id": card_id,
+                "name": display_name,
+                "href": href,
+                "thumb": thumb_url,
+            })
+
+    # Quitar duplicados por id y ordenar
     seen = set()
     out: List[Dict] = []
     for it in items:
@@ -1612,14 +1574,52 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
         seen.add(cid)
         out.append(it)
 
-    out.sort(key=lambda x: int(str(x["id"])) )
+    out.sort(key=lambda x: int(str(x["id"])))
     return out
 
-# =================== API: /auth02/cards (con persistencia) ===================
+# ---------- Scraper real: página única List_of_cards (sin límite 1300) ----------
+async def _scrape_cards_from_sekaipedia() -> List[Dict]:
+    """
+    Lee la página única "List_of_cards" y parsea su wikitext.
+    Esto evita depender de subpáginas por rangos y elimina el corte ~1262.
+    """
+    async with httpx.AsyncClient() as client:
+        data = await _get_json(client, SEKAIPEDIA_API, {
+            "action": "parse",
+            "page": "List_of_cards",
+            "prop": "wikitext",
+            "format": "json",
+            "formatversion": 2,
+        })
+
+    parse = (data or {}).get("parse") or {}
+    wikitext: str = parse.get("wikitext") or ""
+    if not wikitext:
+        return []
+
+    return _parse_cards_from_wikitext(wikitext)
+
+# =================== API: /auth02/cards (con persistencia + force refresh) ===================
 @app.get("/auth02/cards")
-async def auth02_cards():
+async def auth02_cards(request: Request, force: int = Query(0, description="1 = fuerza refresh inmediato (requiere sesión)")):
+    """
+    Devuelve lista de cartas de Sekaipedia (persistente en BD + cache).
+
+    - Por defecto, usa BD/cache si está fresco.
+    - Si force=1, ignora freshness y fuerza scrape + upsert.
+      *Protegido* por sesión (cookie sid) para evitar abuso.
+    """
+    force = bool(force)
+
+    if force:
+        sid = request.cookies.get(COOKIE_NAME)
+        if not sid or sid not in SESSIONS:
+            raise HTTPException(status_code=401, detail="no-session")
+
     now = datetime.now(timezone.utc)
-    if db_pool:
+
+    # Si no forzamos, intentamos BD (fresh)
+    if not force and db_pool:
         async with db_pool.acquire() as conn:
             try:
                 if await _cards_db_is_fresh(conn):
@@ -1627,12 +1627,15 @@ async def auth02_cards():
             except Exception:
                 traceback.print_exc()
 
-    if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
+    # Si no forzamos, intentamos cache (fresh)
+    if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
         return _cards_cache["items"]
 
     async with _cards_lock:
         now = datetime.now(timezone.utc)
-        if db_pool:
+
+        # Re-check dentro del lock
+        if not force and db_pool:
             async with db_pool.acquire() as conn:
                 try:
                     if await _cards_db_is_fresh(conn):
@@ -1640,7 +1643,7 @@ async def auth02_cards():
                 except Exception:
                     traceback.print_exc()
 
-        if _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
+        if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
             return _cards_cache["items"]
 
         try:
@@ -1717,4 +1720,3 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-
