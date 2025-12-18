@@ -21,19 +21,28 @@ from pydantic import BaseModel  # para el modelo de canciones
 load_dotenv()
 
 # ========================= ENV =========================
-DISCORD_CLIENT_ID     = os.getenv("DISCORD_CLIENT_ID", "")
+DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
-DISCORD_REDIRECT_URI  = os.getenv("DISCORD_REDIRECT_URI", "https://unique-education-production.up.railway.app/auth02/callback")
-FRONT_URL   = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
+DISCORD_REDIRECT_URI = os.getenv(
+    "DISCORD_REDIRECT_URI",
+    "https://unique-education-production.up.railway.app/auth02/callback",
+)
+FRONT_URL = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", FRONT_URL)
 COOKIE_NAME = os.getenv("COOKIE_NAME", "sid")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ===================== FastAPI =====================
 app = FastAPI()
+
+_allowed_origins = []
+for o in [FRONT_URL, CORS_ORIGIN]:
+    if o and o not in _allowed_origins:
+        _allowed_origins.append(o)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONT_URL],
+    allow_origins=_allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -41,6 +50,7 @@ app.add_middleware(
 
 # ================ Sesiones simples en memoria ================
 SESSIONS: Dict[str, Dict] = {}  # sid -> {"id": "<discord_id>", "username": "..."}
+
 
 def set_session_cookie(resp, sid: str):
     resp.set_cookie(
@@ -50,52 +60,68 @@ def set_session_cookie(resp, sid: str):
         secure=True,
         samesite="none",
         path="/",
-        max_age=60 * 60 * 24 * 7  # 7 días
+        max_age=60 * 60 * 24 * 7,  # 7 días
     )
+
+
+def _rget(rec: Any, key: str, default=None):
+    try:
+        return rec[key]
+    except Exception:
+        return default
+
 
 # =========================== DB & Schema Flags ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
 
 HAS_DISCORD_ID_COL: bool = False
-PLAYERS_HAS_IN_GUILD: bool = False   # <--- NUEVO
+PLAYERS_HAS_IN_GUILD: bool = False  # <--- NUEVO
 
-SEASONS_HAS_ACTIVE: bool    = False
-SEASONS_HAS_NAME: bool      = False
+SEASONS_HAS_ACTIVE: bool = False
+SEASONS_HAS_NAME: bool = False
 SEASONS_HAS_STARTS_AT: bool = False
-SEASONS_HAS_ENDS_AT: bool   = False
+SEASONS_HAS_ENDS_AT: bool = False
 
 # seasonplayers extra stats
-SP_HAS_WINS: bool          = False
-SP_HAS_LOSSES: bool        = False
-SP_HAS_GAMES_PLAYED: bool  = False
+SP_HAS_WINS: bool = False
+SP_HAS_LOSSES: bool = False
+SP_HAS_GAMES_PLAYED: bool = False
 
 # matches / match_history
-HAS_MATCHES_TABLE: bool        = False
-HAS_MATCHPLAYERS_TABLE: bool   = False  # legacy, no se usa ya
+HAS_MATCHES_TABLE: bool = False
+HAS_MATCHPLAYERS_TABLE: bool = False  # legacy, no se usa ya
 
 # results: columna de texto donde está el bloque con songs/diffs
 RESULTS_TEXT_COL: Optional[str] = None
 
 # Tipo SQL efectivo del user_id ("text" o "bigint")
-USER_ID_SQLTYPE: str = "text"   # default seguro
+USER_ID_SQLTYPE: str = "text"  # default seguro
 
 
 async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
-    row = await conn.fetchrow("""
+    row = await conn.fetchrow(
+        """
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
-    """, table, column)
+    """,
+        table,
+        column,
+    )
     return bool(row)
 
 
 async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Optional[str]:
-    row = await conn.fetchrow("""
+    row = await conn.fetchrow(
+        """
         SELECT data_type
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
         LIMIT 1
-    """, table, column)
+    """,
+        table,
+        column,
+    )
     if not row:
         return None
     dt = str(row["data_type"]).lower()
@@ -113,31 +139,32 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
 
     try:
         # players / seasons
-        HAS_DISCORD_ID_COL    = await _has_col(conn, "players", "discord_id")
-        PLAYERS_HAS_IN_GUILD  = await _has_col(conn, "players", "in_guild")
-        SEASONS_HAS_ACTIVE    = await _has_col(conn, "seasons", "active")
-        SEASONS_HAS_NAME      = await _has_col(conn, "seasons", "name")
+        HAS_DISCORD_ID_COL = await _has_col(conn, "players", "discord_id")
+        PLAYERS_HAS_IN_GUILD = await _has_col(conn, "players", "in_guild")
+        SEASONS_HAS_ACTIVE = await _has_col(conn, "seasons", "active")
+        SEASONS_HAS_NAME = await _has_col(conn, "seasons", "name")
         SEASONS_HAS_STARTS_AT = await _has_col(conn, "seasons", "starts_at")
-        SEASONS_HAS_ENDS_AT   = await _has_col(conn, "seasons", "ends_at")
+        SEASONS_HAS_ENDS_AT = await _has_col(conn, "seasons", "ends_at")
 
         # seasonplayers: columnas de stats
-        SP_HAS_WINS         = await _has_col(conn, "seasonplayers", "wins")
-        SP_HAS_LOSSES       = await _has_col(conn, "seasonplayers", "losses")
-        SP_HAS_GAMES_PLAYED = await _has_col(conn, "seasonplayers", "games_played") \
-                              or await _has_col(conn, "seasonplayers", "games")
+        SP_HAS_WINS = await _has_col(conn, "seasonplayers", "wins")
+        SP_HAS_LOSSES = await _has_col(conn, "seasonplayers", "losses")
+        SP_HAS_GAMES_PLAYED = (await _has_col(conn, "seasonplayers", "games_played")) or (
+            await _has_col(conn, "seasonplayers", "games")
+        )
 
         # matches / match_history
-        HAS_MATCHES_TABLE      = await _has_col(conn, "match_history", "season_id")
+        HAS_MATCHES_TABLE = await _has_col(conn, "match_history", "season_id")
         HAS_MATCHPLAYERS_TABLE = False  # ya no la vamos a usar
 
         # Detectar tipo de user_id: si player_pfps existe usa su tipo; si no, usa el de players
-        pfps_type    = await _col_type(conn, "player_pfps", "user_id")
+        pfps_type = await _col_type(conn, "player_pfps", "user_id")
         players_type = await _col_type(conn, "players", "user_id")
         USER_ID_SQLTYPE = pfps_type or players_type or "text"
 
         # Detectar automáticamente una columna de texto en public.results
-        # que probablemente contenga el bloque de resultado (incluyendo las songs)
-        row = await conn.fetchrow("""
+        row = await conn.fetchrow(
+            """
             SELECT column_name
             FROM information_schema.columns
             WHERE table_schema='public'
@@ -150,7 +177,8 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
                   )
             ORDER BY column_name
             LIMIT 1
-        """)
+        """
+        )
         RESULTS_TEXT_COL = row["column_name"] if row else None
 
         print(
@@ -198,7 +226,11 @@ async def startup():
         return
 
     db_pool = await asyncpg.create_pool(
-        DATABASE_URL, min_size=1, max_size=10, timeout=10.0, command_timeout=30.0,
+        DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        timeout=10.0,
+        command_timeout=30.0,
     )
     print("✅ DB pool initialized")
 
@@ -207,7 +239,8 @@ async def startup():
 
         # Crear tablas persistentes
         uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
-        await conn.execute(f"""
+        await conn.execute(
+            f"""
         CREATE TABLE IF NOT EXISTS public.sekaicards(
           page_id    BIGINT PRIMARY KEY,
           name       TEXT NOT NULL,
@@ -247,7 +280,8 @@ async def startup():
         );
         CREATE INDEX IF NOT EXISTS idx_match_songs_result_id
           ON public.match_songs(result_id);
-        """)
+        """
+        )
 
     # ---- background refresher de cartas Sekaipedia (AUTO) ----
     _cards_stop.clear()
@@ -274,6 +308,7 @@ async def shutdown():
         await db_pool.close()
         print("🛑 DB pool closed")
 
+
 # ======================= Helpers: Seasons =======================
 async def _season_exists(conn: asyncpg.Connection, season_id: int) -> bool:
     row = await conn.fetchrow("SELECT 1 FROM public.seasons WHERE id=$1", season_id)
@@ -292,10 +327,12 @@ async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: 
         raise HTTPException(404, f"season {requested_season_id} not found")
 
     if SEASONS_HAS_ACTIVE:
-        row = await conn.fetchrow("""
+        row = await conn.fetchrow(
+            """
             SELECT id FROM public.seasons
             WHERE active = TRUE ORDER BY id DESC LIMIT 1
-        """)
+        """
+        )
         if row and row["id"]:
             return int(row["id"])
 
@@ -305,6 +342,7 @@ async def _pick_effective_season(conn: asyncpg.Connection, requested_season_id: 
 
     raise HTTPException(404, "no seasons found")
 
+
 # ======================= API: Seasons =======================
 @app.get("/api/seasons")
 async def list_seasons():
@@ -312,10 +350,14 @@ async def list_seasons():
         raise HTTPException(500, "DB pool not initialized")
 
     cols = ["id"]
-    if SEASONS_HAS_NAME:      cols.append("name")
-    if SEASONS_HAS_ACTIVE:    cols.append("active")
-    if SEASONS_HAS_STARTS_AT: cols.append("starts_at")
-    if SEASONS_HAS_ENDS_AT:   cols.append("ends_at")
+    if SEASONS_HAS_NAME:
+        cols.append("name")
+    if SEASONS_HAS_ACTIVE:
+        cols.append("active")
+    if SEASONS_HAS_STARTS_AT:
+        cols.append("starts_at")
+    if SEASONS_HAS_ENDS_AT:
+        cols.append("ends_at")
     select_cols = ", ".join(cols)
 
     q = f"SELECT {select_cols} FROM public.seasons ORDER BY id DESC"
@@ -325,20 +367,34 @@ async def list_seasons():
     out = []
     for r in rows:
         item = {"id": r["id"]}
-        if SEASONS_HAS_NAME:      item["name"] = r.get("name")
-        if SEASONS_HAS_ACTIVE:    item["active"] = r.get("active")
-        if SEASONS_HAS_STARTS_AT: item["startsAt"] = r.get("starts_at").isoformat() if r.get("starts_at") else None
-        if SEASONS_HAS_ENDS_AT:   item["endsAt"] = r.get("ends_at").isoformat() if r.get("ends_at") else None
+        if SEASONS_HAS_NAME:
+            item["name"] = _rget(r, "name")
+        if SEASONS_HAS_ACTIVE:
+            item["active"] = _rget(r, "active")
+        if SEASONS_HAS_STARTS_AT:
+            dt = _rget(r, "starts_at")
+            item["startsAt"] = dt.isoformat() if dt else None
+        if SEASONS_HAS_ENDS_AT:
+            dt = _rget(r, "ends_at")
+            item["endsAt"] = dt.isoformat() if dt else None
         out.append(item)
     return out
 
+
 # ======================= AUTH02 (Discord OAuth) =======================
-PFP_BY_NAME:    Dict[str, str] = {}
-PFP_BY_ID:      Dict[str, str] = {}
+PFP_BY_NAME: Dict[str, str] = {}
+PFP_BY_ID: Dict[str, str] = {}
 PFP_BY_DISCORD: Dict[str, str] = {}
 
 STATE_STORE: Dict[str, datetime] = {}
 STATE_TTL = timedelta(minutes=10)
+
+
+def _cleanup_state_store():
+    now = datetime.now(timezone.utc)
+    expired = [k for k, exp in STATE_STORE.items() if exp < now]
+    for k in expired:
+        STATE_STORE.pop(k, None)
 
 
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
@@ -367,7 +423,9 @@ def _valid_https_url(u: str) -> bool:
         return False
 
 
-def _resolve_pfp_for_player(user_id: Optional[str], discord_id: Optional[str], name: Optional[str]) -> Optional[str]:
+def _resolve_pfp_for_player(
+    user_id: Optional[str], discord_id: Optional[str], name: Optional[str]
+) -> Optional[str]:
     if user_id:
         url = PFP_BY_ID.get(str(user_id))
         if url:
@@ -412,6 +470,7 @@ async def health():
 
 @app.get("/auth02")
 async def auth02_start():
+    _cleanup_state_store()
     state = secrets.token_urlsafe(24)
     STATE_STORE[state] = datetime.now(timezone.utc) + STATE_TTL
     params = {
@@ -430,6 +489,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
     if not code:
         raise HTTPException(400, "Missing code")
 
+    _cleanup_state_store()
     exp = STATE_STORE.pop(state or "", None)
     if not exp or datetime.now(timezone.utc) > exp:
         raise HTTPException(400, "Invalid or expired state")
@@ -488,6 +548,7 @@ async def auth02_logout(request: Request):
     resp.delete_cookie(COOKIE_NAME, path="/")
     return resp
 
+
 # =================== /auth02/pfps ===================
 MAX_PFPS = 5000
 
@@ -526,7 +587,7 @@ async def set_pfp(request: Request):
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM public.player_pfps WHERE user_id = $1",
-                    _uid_for_sql(user_id)
+                    _uid_for_sql(user_id),
                 )
         return {"ok": True, "deleted": True}
 
@@ -555,13 +616,17 @@ async def set_pfp(request: Request):
                 user_id = resolved
         if user_id:
             async with db_pool.acquire() as conn:
-                await conn.execute("""
+                await conn.execute(
+                    """
                     INSERT INTO public.player_pfps(user_id, url, updated_at)
                     VALUES ($1, $2, now())
                     ON CONFLICT (user_id) DO UPDATE
                       SET url = EXCLUDED.url,
                           updated_at = now()
-                """, _uid_for_sql(user_id), url)
+                """,
+                    _uid_for_sql(user_id),
+                    url,
+                )
 
     return {"ok": True, "byId": bool(user_id), "byDiscord": bool(discord_id), "byName": bool(name_lower)}
 
@@ -569,6 +634,7 @@ async def set_pfp(request: Request):
 @app.get("/auth02/pfps")
 async def list_pfps():
     return JSONResponse({"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME})
+
 
 # ======================= API: Players =======================
 @app.get("/api/players")
@@ -606,7 +672,7 @@ async def get_players(
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
                 "pp.url     AS pfp_url",
-                "pp.updated_at AS pfp_updated_at"
+                "pp.updated_at AS pfp_updated_at",
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -617,7 +683,6 @@ async def get_players(
             if SP_HAS_LOSSES:
                 select_cols.append("sp.losses AS losses")
             if SP_HAS_GAMES_PLAYED:
-                # intentamos ambos nombres, el que exista
                 if await _has_col(conn, "seasonplayers", "games_played"):
                     select_cols.append("sp.games_played AS games_played")
                 elif await _has_col(conn, "seasonplayers", "games"):
@@ -639,14 +704,14 @@ async def get_players(
                 try:
                     uid_strs: List[str] = []
                     for rr in rows:
-                        uid = rr.get("user_id")
+                        uid = _rget(rr, "user_id")
                         if uid is None:
                             continue
                         uid_strs.append(str(uid))
 
                     if uid_strs:
-                        # Total games + peakMmr por usuario
-                        stats_rows = await conn.fetch("""
+                        stats_rows = await conn.fetch(
+                            """
                             SELECT
                                 user_id,
                                 COUNT(*) AS games_played,
@@ -655,19 +720,16 @@ async def get_players(
                             WHERE season_id = $1
                               AND user_id::text = ANY($2::text[])
                             GROUP BY user_id
-                        """, picked, uid_strs)
+                        """,
+                            picked,
+                            uid_strs,
+                        )
 
-                        games_by_user = {
-                            str(sr["user_id"]): sr["games_played"]
-                            for sr in stats_rows
-                        }
-                        peak_by_user = {
-                            str(sr["user_id"]): sr["peak_mmr"]
-                            for sr in stats_rows
-                        }
+                        games_by_user = {str(sr["user_id"]): sr["games_played"] for sr in stats_rows}
+                        peak_by_user = {str(sr["user_id"]): sr["peak_mmr"] for sr in stats_rows}
 
-                        # W-L / MMR delta en las últimas 10 partidas por usuario
-                        last10_rows = await conn.fetch("""
+                        last10_rows = await conn.fetch(
+                            """
                             WITH ranked AS (
                                 SELECT
                                     user_id,
@@ -691,7 +753,10 @@ async def get_players(
                                 COALESCE(SUM(mmr_delta) FILTER (WHERE rn <= 10), 0) AS last10_mmr_delta
                             FROM ranked
                             GROUP BY user_id
-                        """, picked, uid_strs)
+                        """,
+                            picked,
+                            uid_strs,
+                        )
                         last10_by_user = {
                             str(r["user_id"]): {
                                 "games": r["last10_games"],
@@ -715,14 +780,14 @@ async def get_players(
 
     out = []
     for r in rows:
-        user_id    = r.get("user_id")
-        user_key   = str(user_id) if user_id is not None else None
-        discord_id = r.get("discord_id") if HAS_DISCORD_ID_COL else None
-        name       = r.get("name")
+        user_id = _rget(r, "user_id")
+        user_key = str(user_id) if user_id is not None else None
+        discord_id = _rget(r, "discord_id") if HAS_DISCORD_ID_COL else None
+        name = _rget(r, "name")
 
         # PFP
-        pfp_url = r.get("pfp_url")
-        pfp_ts  = r.get("pfp_updated_at")
+        pfp_url = _rget(r, "pfp_url")
+        pfp_ts = _rget(r, "pfp_updated_at")
         if pfp_url:
             try:
                 epoch = int(pfp_ts.timestamp()) if pfp_ts else None
@@ -735,26 +800,23 @@ async def get_players(
             pfp_url = _resolve_pfp_for_player(
                 str(user_id) if user_id is not None else None,
                 str(discord_id) if discord_id is not None else None,
-                name
+                name,
             )
 
-        wins   = r.get("wins")   if SP_HAS_WINS   else None
-        losses = r.get("losses") if SP_HAS_LOSSES else None
+        wins = _rget(r, "wins") if SP_HAS_WINS else None
+        losses = _rget(r, "losses") if SP_HAS_LOSSES else None
 
-        # Preferimos el conteo real desde match_history; si no, usamos la columna de seasonplayers (si existe)
         games_played = None
         if user_key is not None and user_key in games_by_user:
             games_played = games_by_user[user_key]
         elif SP_HAS_GAMES_PLAYED:
-            games_played = r.get("games_played")
+            games_played = _rget(r, "games_played")
 
-        # Peak MMR (si no hay matches, usamos el MMR actual)
         if user_key is not None and user_key in peak_by_user and peak_by_user[user_key] is not None:
             peak_mmr = peak_by_user[user_key]
         else:
-            peak_mmr = r.get("mmr")
+            peak_mmr = _rget(r, "mmr")
 
-        # W-L last 10 / mmrDelta last 10
         last10_games = None
         last10_wins = None
         last10_losses = None
@@ -766,38 +828,38 @@ async def get_players(
             last10_losses = s.get("losses")
             last10_mmr_delta = s.get("mmr_delta")
 
-        out.append({
-            "id": user_id,
-            "discordId": discord_id,
-            "name": name,
-            "mmr": r.get("mmr"),
-            "peakMmr": peak_mmr,
-            "peak_mmr": peak_mmr,  # por si en algún lado usas snake_case
-            "country": r.get("country"),
-            "rank": r.get("rank"),
-            "pfp": pfp_url,
-            "in_guild": r.get("in_guild") if PLAYERS_HAS_IN_GUILD else None,
-            # stats extra (para W-L y matches en el front)
-            "wins": wins,
-            "losses": losses,
-            "gamesPlayed": games_played,
-            "matchesPlayed": games_played,
-            "matches": games_played,
-            # last 10 info
-            "last10Games": last10_games,
-            "last10Wins": last10_wins,
-            "last10Losses": last10_losses,
-            "last10MmrDelta": last10_mmr_delta,
-        })
+        out.append(
+            {
+                "id": user_id,
+                "discordId": discord_id,
+                "name": name,
+                "mmr": _rget(r, "mmr"),
+                "peakMmr": peak_mmr,
+                "peak_mmr": peak_mmr,
+                "country": _rget(r, "country"),
+                "rank": _rget(r, "rank"),
+                "pfp": pfp_url,
+                "in_guild": _rget(r, "in_guild") if PLAYERS_HAS_IN_GUILD else None,
+                "wins": wins,
+                "losses": losses,
+                "gamesPlayed": games_played,
+                "matchesPlayed": games_played,
+                "matches": games_played,
+                "last10Games": last10_games,
+                "last10Wins": last10_wins,
+                "last10Losses": last10_losses,
+                "last10MmrDelta": last10_mmr_delta,
+            }
+        )
     return out
 
 
 # Modelo Pydantic para las canciones de un match
 class MatchSongIn(BaseModel):
-    songName: str       # nombre de la canción
-    level: str          # nivel / rango (ej: "26-28")
-    difficulty: str     # dificultad (ej: "Expert", "Master")
-    notesCount: int     # cantidad de notas
+    songName: str
+    level: str
+    difficulty: str
+    notesCount: int
 
 
 # --------- Helper: parsear canciones desde el texto del result ---------
@@ -824,9 +886,7 @@ def extract_songs_from_result_text(result_text: Optional[str]) -> List[Dict[str,
     if not song_lines:
         return []
 
-    song_re = re.compile(
-        r"^Lv\s*(\d+)\s+([A-Za-z]+)\s+[-–]\s+(.+?)(?:\s*\((\d+)\s*notes?\))?\s*$"
-    )
+    song_re = re.compile(r"^Lv\s*(\d+)\s+([A-Za-z]+)\s+[-–]\s+(.+?)(?:\s*\((\d+)\s*notes?\))?\s*$")
 
     songs: List[Dict[str, Any]] = []
     for line in song_lines:
@@ -843,14 +903,7 @@ def extract_songs_from_result_text(result_text: Optional[str]) -> List[Dict[str,
         except ValueError:
             notes_int = 0
 
-        songs.append(
-            {
-                "songName": title,
-                "level": level,
-                "difficulty": difficulty,
-                "notesCount": notes_int,
-            }
-        )
+        songs.append({"songName": title, "level": level, "difficulty": difficulty, "notesCount": notes_int})
 
     return songs
 
@@ -861,64 +914,47 @@ async def get_matches(
     request: Request,
     season_id: Optional[int] = Query(
         None,
-        description=(
-            "Season ID: "
-            "omitir = todas las seasons, "
-            "0 = season activa/última, "
-            ">0 = season específica"
-        ),
+        description=("Season ID: " "omitir = todas las seasons, " "0 = season activa/última, " ">0 = season específica"),
     ),
-    user_id: Optional[str] = Query(
-        None,
-        description="Filtra solo partidas donde participa este user_id (opcional)",
-    ),
+    user_id: Optional[str] = Query(None, description="Filtra solo partidas donde participa este user_id (opcional)"),
     limit: int = Query(500, ge=1, le=5000),
     offset: int = Query(0, ge=0),
 ):
     """
     Devuelve las partidas desde match_history, agrupadas por result_id (una entrada por match),
-    ordenadas de más vieja a más nueva (para que el historial se lea cronológicamente).
+    ordenadas de más vieja a más nueva.
 
-    Comportamiento de season_id:
-      - No enviado -> todas las seasons.
-      - 0         -> season activa/última (_pick_effective_season(0)).
-      - >0        -> season específica (valida que exista).
+    - No enviado -> todas las seasons.
+    - 0         -> season activa/última.
+    - >0        -> season específica (valida que exista).
     Si user_id está presente, solo devuelve matches donde participa ese jugador,
-    pero cada match incluye a TODOS los jugadores en el campo players[].
-    Además, incluye songs[] con la lista de canciones registradas para ese match.
+    pero cada match incluye a TODOS los jugadores en players[].
+    Incluye songs[] con la lista de canciones registradas para ese match.
     """
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    # canciones por result_id (desde match_songs)
     songs_by_result: Dict[int, List[Dict]] = {}
 
     async with db_pool.acquire() as conn:
-        # Re-detectar match_history si todavía no lo conocíamos
         await _ensure_matches_table(conn)
         if not HAS_MATCHES_TABLE:
-            # No existe match_history en este schema → devolvemos lista vacía
             return []
 
-        # ---------- Resolver season (o todas) ----------
         picked_season: Optional[int] = None
         raw_q_season = request.query_params.get("season_id")
 
         if raw_q_season is not None:
-            # El cliente SÍ envió season_id (puede ser 0 o >0)
             try:
                 requested = int(season_id or 0)
             except (TypeError, ValueError):
                 raise HTTPException(400, "season_id must be an integer")
 
             try:
-                # 0 => current/última; >0 => específica
                 picked_season = await _pick_effective_season(conn, requested)
             except HTTPException:
-                # Si la season no existe o no hay seasons, para no romper el front devolvemos []
                 return []
 
-        # ---------- Construir WHERE dinámico ----------
         where_clauses = []
         params: List = []
 
@@ -927,7 +963,6 @@ async def get_matches(
             params.append(picked_season)
 
         if user_id is not None:
-            # Siempre comparamos como texto para soportar user_id bigint/text
             where_clauses.append(f"user_id::text = ${len(params) + 1}")
             params.append(str(user_id))
 
@@ -935,13 +970,11 @@ async def get_matches(
         if where_clauses:
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
-        # Añadimos limit / offset al final
         params.append(limit)
         params.append(offset)
         limit_idx = len(params) - 1
         offset_idx = len(params)
 
-        # ---------- 1) Determinar qué result_ids entran en esta página ----------
         sql_results = f"""
             SELECT result_id,
                    MIN(played_at) AS first_played_at
@@ -956,14 +989,10 @@ async def get_matches(
         if not res_rows:
             return []
 
-        result_ids_text: List[str] = [
-            str(r["result_id"]) for r in res_rows if r["result_id"] is not None
-        ]
+        result_ids_text: List[str] = [str(r["result_id"]) for r in res_rows if r["result_id"] is not None]
         if not result_ids_text:
             return []
 
-        # ---------- 2) Cargar TODAS las filas (jugadores) para esos result_ids ----------
-        # columna dinámica del texto del result (si existe)
         if RESULTS_TEXT_COL:
             select_result_text = f'r."{RESULTS_TEXT_COL}" AS result_text'
         else:
@@ -1005,7 +1034,7 @@ async def get_matches(
             result_ids_text,
         )
 
-        # ---------- 2b) Cargar canciones asociadas a esos result_ids (match_songs) ----------
+        # Cargar canciones asociadas
         try:
             song_rows = await conn.fetch(
                 """
@@ -1042,7 +1071,6 @@ async def get_matches(
             traceback.print_exc()
             songs_by_result = {}
 
-    # ---------- 3) Agrupar en matches[result_id].players[] ----------
     matches_by_result: Dict[int, Dict] = {}
 
     for r in rows:
@@ -1050,7 +1078,7 @@ async def get_matches(
         try:
             rid = int(rid_raw)
         except Exception:
-            rid = rid_raw  # fallback por si alguna vez no es numérico
+            rid = rid_raw
 
         played_dt: Optional[datetime] = r["played_at"]
 
@@ -1060,42 +1088,37 @@ async def get_matches(
                 "id": rid,
                 "season_id": r["season_id"],
                 "seasonId": r["season_id"],
-                "season_name": r.get("season_name"),
+                "season_name": _rget(r, "season_name"),
                 "result_id": rid,
                 "resultId": rid,
                 "played_at": played_dt,
                 "playedAt": played_dt.isoformat() if played_dt else None,
-                # LV range (gap) que usaste al hacer el RESULT en Discord
-                "gap_low": r.get("gap_low"),
-                "gapLow": r.get("gap_low"),
-                "gap_high": r.get("gap_high"),
-                "gapHigh": r.get("gap_high"),
-                # Room MMR guardado por el bot (si no está, luego usamos avg_mmr)
-                "room_mmr": r.get("room_mmr"),
-                "roomMmr": r.get("room_mmr"),
+                "gap_low": _rget(r, "gap_low"),
+                "gapLow": _rget(r, "gap_low"),
+                "gap_high": _rget(r, "gap_high"),
+                "gapHigh": _rget(r, "gap_high"),
+                "room_mmr": _rget(r, "room_mmr"),
+                "roomMmr": _rget(r, "room_mmr"),
                 "avg_mmr": None,
                 "avgMmr": None,
                 "players": [],
-                # canciones del match (primero las de match_songs si existen)
                 "songs": songs_by_result.get(rid, []),
-                # texto crudo del result para parsear canciones en fallback
-                "result_text": r.get("result_text"),
+                "result_text": _rget(r, "result_text"),
             }
             matches_by_result[rid] = m
 
-        # PTS = P*4 + G*3 + G2*2 + B*1 + M*0  (coincide con el embed)
         s_p = int(r["s_perfect"] or 0)
         s_g = int(r["s_great"] or 0)
         s_g2 = int(r["s_good"] or 0)
         s_b = int(r["s_bad"] or 0)
         s_m = int(r["s_miss"] or 0)
-        points = s_p * 4 + s_g * 3 + s_g2 * 2 + s_b * 1  # miss * 0
+        points = s_p * 4 + s_g * 3 + s_g2 * 2 + s_b * 1
 
         player_entry = {
             "user_id": r["user_id"],
             "userId": r["user_id"],
-            "name": r["player_name"],
-            "country": r["player_country"],
+            "name": _rget(r, "player_name"),
+            "country": _rget(r, "player_country"),
             "pos": r["pos"],
             "mmr_before": r["mmr_before"],
             "mmrBefore": r["mmr_before"],
@@ -1117,20 +1140,15 @@ async def get_matches(
             "sBad": s_b,
             "s_miss": s_m,
             "sMiss": s_m,
-            # puntos totales del jugador en este match
             "points": points,
             "pts": points,
         }
 
         matches_by_result[rid].setdefault("players", []).append(player_entry)
 
-    # ---------- 4) Calcular avg_mmr por match (ROOM MMR) y parsear songs si faltan ----------
     for m in matches_by_result.values():
         mmrs = [p["mmr_before"] for p in m["players"] if p["mmr_before"] is not None]
-        if mmrs:
-            avg = int(sum(mmrs) / len(mmrs))
-        else:
-            avg = None
+        avg = int(sum(mmrs) / len(mmrs)) if mmrs else None
         m["avg_mmr"] = avg
         m["avgMmr"] = avg
 
@@ -1138,7 +1156,6 @@ async def get_matches(
             m["room_mmr"] = avg
             m["roomMmr"] = avg
 
-        # Si no hay songs en match_songs, intentamos parsear desde el texto del result
         if not m.get("songs") and m.get("result_text"):
             try:
                 parsed_songs = extract_songs_from_result_text(m["result_text"])
@@ -1147,10 +1164,8 @@ async def get_matches(
             if parsed_songs:
                 m["songs"] = parsed_songs
 
-        # ya no necesitamos enviar el texto crudo al front
         m.pop("result_text", None)
 
-    # ---------- 5) Ordenar por played_at ASC (más viejas primero) ----------
     matches_list = list(matches_by_result.values())
     matches_list.sort(
         key=lambda x: (
@@ -1158,7 +1173,6 @@ async def get_matches(
             x["id"],
         )
     )
-    # convertir played_at datetime -> iso string definitivo
     for m in matches_list:
         dt = m.get("played_at")
         m["played_at"] = dt.isoformat() if isinstance(dt, datetime) else None
@@ -1178,23 +1192,16 @@ async def save_match_songs(result_id: int, songs: List[MatchSongIn]):
 
     async with db_pool.acquire() as conn:
         async with conn.transaction():
-            # Borrar canciones anteriores por si se recalcula el result
-            await conn.execute(
-                "DELETE FROM public.match_songs WHERE result_id = $1",
-                result_id
-            )
+            await conn.execute("DELETE FROM public.match_songs WHERE result_id = $1", result_id)
 
-            records = [
-                (result_id, s.songName, s.level, s.difficulty, s.notesCount)
-                for s in songs
-            ]
+            records = [(result_id, s.songName, s.level, s.difficulty, s.notesCount) for s in songs]
             if records:
                 await conn.executemany(
                     """
                     INSERT INTO public.match_songs(result_id, song_name, level, difficulty, notes_count)
                     VALUES ($1, $2, $3, $4, $5)
                     """,
-                    records
+                    records,
                 )
 
     return {"ok": True, "resultId": result_id, "songsSaved": len(songs)}
@@ -1219,19 +1226,12 @@ async def get_match_songs(result_id: int):
             result_id,
         )
 
-    return [
-        {
-            "songName": r["song_name"],
-            "level": r["level"],
-            "difficulty": r["difficulty"],
-            "notesCount": r["notes_count"],
-        }
-        for r in rows
-    ]
+    return [{"songName": r["song_name"], "level": r["level"], "difficulty": r["difficulty"], "notesCount": r["notes_count"]} for r in rows]
+
 
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
-SEKAIPEDIA_API  = "https://sekaipedia.org/w/api.php"
+SEKAIPEDIA_API = "https://sekaipedia.org/w/api.php"
 
 _UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1241,12 +1241,10 @@ _UA_POOL = [
     "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
 ]
 
+
 def _ascii(s: str) -> str:
-    return (
-        unicodedata.normalize("NFKD", s or "")
-        .encode("ascii", "ignore")
-        .decode("ascii")
-    )
+    return unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+
 
 def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
     raw = {
@@ -1261,6 +1259,7 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
     }
     return {k: _ascii(v) for k, v in raw.items()}
 
+
 _cards_cache: Dict[str, object] = {"items": [], "ts": datetime.fromtimestamp(0, tz=timezone.utc)}
 CARDS_TTL = timedelta(hours=6)
 _cards_lock = asyncio.Lock()
@@ -1268,6 +1267,7 @@ _cards_lock = asyncio.Lock()
 # --------- AUTO REFRESH (background poller) ----------
 _cards_stop = asyncio.Event()
 _cards_task: Optional[asyncio.Task] = None
+
 
 async def _refresh_cards_once() -> None:
     """
@@ -1280,17 +1280,14 @@ async def _refresh_cards_once() -> None:
 
     async with _cards_lock:
         try:
-            # 1) Chequear frescura rápido con una conexión corta
             async with db_pool.acquire() as conn:
                 if await _cards_db_is_fresh(conn):
                     return
 
-            # 2) Scrape (sin mantener una conexión ocupada)
             items = await _scrape_cards_from_sekaipedia()
             if not items:
                 return
 
-            # 3) Persistir y refrescar cache
             async with db_pool.acquire() as conn:
                 await _cards_db_upsert_many(conn, items)
 
@@ -1300,11 +1297,9 @@ async def _refresh_cards_once() -> None:
         except Exception:
             traceback.print_exc()
 
+
 async def _refresh_cards_forever() -> None:
-    """
-    Poller: corre cada CARDS_TTL y refresca si hace falta.
-    """
-    await asyncio.sleep(3)  # pequeño delay post-startup
+    await asyncio.sleep(3)
     while not _cards_stop.is_set():
         await _refresh_cards_once()
         try:
@@ -1312,10 +1307,10 @@ async def _refresh_cards_forever() -> None:
         except asyncio.TimeoutError:
             pass
 
-# ----------------------------------------------------
 
 async def _sleep_jitter(a=0.15, b=0.5):
     await asyncio.sleep(random.uniform(a, b))
+
 
 async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     for attempt in range(5):
@@ -1335,6 +1330,7 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
             await asyncio.sleep(0.8 + attempt * 0.5)
     return {}
 
+
 def _abs_sekaipedia(u: str) -> str:
     if not u:
         return ""
@@ -1344,19 +1340,24 @@ def _abs_sekaipedia(u: str) -> str:
         return "https://sekaipedia.org" + u
     return u
 
+
 # =================== Persistencia: helpers BD (cartas / variantes) ===================
 async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
-    rows = await conn.fetch("""
+    rows = await conn.fetch(
+        """
         SELECT page_id AS id, name, href, thumb
         FROM public.sekaicards
         ORDER BY page_id DESC
-    """)
+    """
+    )
     return [{"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]} for r in rows]
+
 
 async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> None:
     if not items:
         return
-    await conn.executemany("""
+    await conn.executemany(
+        """
         INSERT INTO public.sekaicards(page_id, name, href, thumb, updated_at)
         VALUES ($1, $2, $3, $4, now())
         ON CONFLICT (page_id) DO UPDATE
@@ -1364,59 +1365,94 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
               href = EXCLUDED.href,
               thumb = EXCLUDED.thumb,
               updated_at = now()
-    """, [(int(i["id"]), i["name"], i["href"], i.get("thumb")) for i in items])
+    """,
+        [(int(i["id"]), i["name"], i["href"], i.get("thumb")) for i in items],
+    )
+
 
 async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
     row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
     if not row or not row["ts"]:
         return False
-    # row["ts"] ya viene aware (timestamptz)
     return (datetime.now(timezone.utc) - row["ts"]) < CARDS_TTL
 
+
 async def _variants_db_get(conn: asyncpg.Connection, page_id: int) -> Tuple[List[Dict], Optional[datetime]]:
-    rows = await conn.fetch("""
+    rows = await conn.fetch(
+        """
         SELECT label, url, updated_at
         FROM public.sekaicard_variants
         WHERE page_id=$1
         ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
-    """, page_id)
+    """,
+        page_id,
+    )
     variants = [{"label": r["label"], "url": r["url"]} for r in rows]
     ts = max((r["updated_at"] for r in rows), default=None)
     return variants, ts
+
 
 async def _variants_db_save(conn: asyncpg.Connection, page_id: int, variants: List[Dict]) -> None:
     await conn.execute("DELETE FROM public.sekaicard_variants WHERE page_id=$1", page_id)
     if not variants:
         return
-    await conn.executemany("""
+    await conn.executemany(
+        """
         INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
         VALUES ($1, $2, $3, now())
-    """, [(page_id, v["label"], v["url"]) for v in variants])
+    """,
+        [(page_id, v["label"], v["url"]) for v in variants],
+    )
+
 
 # =================== Scraping helpers ===================
 _BAD_KEYWORDS = [
-    "banner","sprite","chibi","icon","logo","title","sticker","stamp",
-    "background","bg","skill","cutin","home","mini","ui","costume",
-    "profile","story","stamp","april","joke"
+    "banner",
+    "sprite",
+    "chibi",
+    "icon",
+    "logo",
+    "title",
+    "sticker",
+    "stamp",
+    "background",
+    "bg",
+    "skill",
+    "cutin",
+    "home",
+    "mini",
+    "ui",
+    "costume",
+    "profile",
+    "story",
+    "stamp",
+    "april",
+    "joke",
 ]
+
+
 def _filename_from_url(u: str) -> str:
     try:
         return urlparse(u).path.rsplit("/", 1)[-1].lower()
     except Exception:
         return u.lower()
 
+
 def _is_trained(fn: str) -> bool:
     s = fn.lower()
     return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+
 
 def _is_untrained(fn: str) -> bool:
     s = fn.lower()
     return ("untrained" in s) or ("before training" in s) or ("base" in s) or ("normal" in s)
 
+
 def _looks_card_image(fn: str) -> bool:
     if any(bad in fn for bad in _BAD_KEYWORDS):
         return False
     return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
+
 
 def _prefer_square(links: List[str]) -> List[str]:
     seen, out = set(), []
@@ -1426,6 +1462,7 @@ def _prefer_square(links: List[str]) -> List[str]:
             out.append(u)
     return out
 
+
 def _page_title_from_href(href: str) -> str:
     try:
         path = urlparse(href).path
@@ -1434,12 +1471,15 @@ def _page_title_from_href(href: str) -> str:
     except Exception:
         return ""
 
+
 async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
     if not page_title:
         return []
-    data1 = await _get_json(client, SEKAIPEDIA_API, {
-        "action":"query","prop":"images","titles":page_title,"imlimit":"500","format":"json"
-    })
+    data1 = await _get_json(
+        client,
+        SEKAIPEDIA_API,
+        {"action": "query", "prop": "images", "titles": page_title, "imlimit": "500", "format": "json"},
+    )
     pages = (data1.get("query", {}) or {}).get("pages", {}) or {}
     file_titles: List[str] = []
     for _, pinfo in pages.items():
@@ -1451,11 +1491,19 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
         return []
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
-        chunk = file_titles[i:i+50]
-        data2 = await _get_json(client, SEKAIPEDIA_API, {
-            "action":"query","titles":"|".join(chunk),"prop":"imageinfo",
-            "iiprop":"url|size|mime","iiurlwidth":"512","format":"json"
-        })
+        chunk = file_titles[i : i + 50]
+        data2 = await _get_json(
+            client,
+            SEKAIPEDIA_API,
+            {
+                "action": "query",
+                "titles": "|".join(chunk),
+                "prop": "imageinfo",
+                "iiprop": "url|size|mime",
+                "iiurlwidth": "512",
+                "format": "json",
+            },
+        )
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
             for ii in (finfo.get("imageinfo") or []):
                 url = ii.get("thumburl") or ii.get("url")
@@ -1463,6 +1511,7 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
                     urls.append(_abs_sekaipedia(url))
         await _sleep_jitter(0.2, 0.5)
     return _prefer_square(urls)
+
 
 async def _scrape_card_variants(href: str) -> Dict:
     page_title = _page_title_from_href(href)
@@ -1478,23 +1527,20 @@ async def _scrape_card_variants(href: str) -> Dict:
         elif _is_untrained(fn):
             untrained_links.append(u)
     trained_url = trained_links[0] if trained_links else None
-    return {
-        "name": page_title,
-        "variants": ([] + ([{"label": "Trained", "url": trained_url}] if trained_url else []))
-    }
+    return {"name": page_title, "variants": ([] + ([{"label": "Trained", "url": trained_url}] if trained_url else []))}
+
 
 def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
-    """
-    Convierte "Card_xxx.png" en una URL directa usando Special:FilePath.
-    """
     safe_name = quote(filename)
     return f"https://sekaipedia.org/wiki/Special:FilePath/{safe_name}?width={width}"
+
 
 # =================== NUEVO: Parser robusto del wikitext de List_of_cards ===================
 def _strip_wiki_markup(s: str) -> str:
     s = re.sub(r"\{\{.*?\}\}", "", s, flags=re.S)  # templates
-    s = re.sub(r"<.*?>", "", s, flags=re.S)        # html
+    s = re.sub(r"<.*?>", "", s, flags=re.S)  # html
     return s.strip()
+
 
 def _cells_from_row(row: str) -> List[str]:
     """
@@ -1517,33 +1563,57 @@ def _cells_from_row(row: str) -> List[str]:
                 cells.append(p)
     return cells
 
+
+def _extract_wikitable_blocks(wikitext: str) -> List[str]:
+    # Captura todas las wikitables completas: {| ... |}
+    return re.findall(r"\{\|.*?\n\|\}", wikitext, flags=re.S)
+
+
 def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
+    """
+    Parseo tolerante: recorre todas las wikitables, extrae filas con:
+      - id numérico en la primera celda
+      - link [[...]] en la segunda celda (o en alguna celda cercana)
+      - primer File:... para thumb (si existe)
+    """
     items: List[Dict] = []
-    tables = re.split(r"\n\|\}", wikitext)
+
+    tables = _extract_wikitable_blocks(wikitext)
+    if not tables:
+        # fallback: intentar split simple si no matchea
+        tables = re.split(r"\n\|\}", wikitext)
 
     for table in tables:
-        if "! Card" not in table and "! Card name" not in table:
+        # saltamos tablas irrelevantes si definitivamente no tienen IDs numéricos
+        if not re.search(r"\b\d{1,6}\b", table):
             continue
 
         rows = re.split(r"\n\|-+", table)
         for row in rows:
-            if "! Card" in row or "! #" in row:
+            # ignorar headers
+            if row.strip().startswith("!"):
+                continue
+            if "! " in row:
                 continue
 
             cells = _cells_from_row(row)
-            if len(cells) < 2:
+            if not cells:
                 continue
 
-            # 1) ID
+            # 1) ID (buscar en la primera celda, y si falla, en toda la fila)
             id_cell = _strip_wiki_markup(cells[0])
             m_id = re.search(r"\b(\d{1,6})\b", id_cell)
+            if not m_id:
+                m_id = re.search(r"\b(\d{1,6})\b", row)
             if not m_id:
                 continue
             card_id = m_id.group(1)
 
-            # 2) Nombre + href (desde [[...]])
-            name_cell = cells[1]
+            # 2) Nombre + href: preferimos celda 2 si existe; si no, buscamos primer [[...]]
+            name_cell = cells[1] if len(cells) >= 2 else row
             m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
+            if not m_name:
+                m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", row)
             if m_name:
                 page_title = m_name.group(1).strip()
                 display_name = (m_name.group(2) or page_title).strip()
@@ -1557,14 +1627,8 @@ def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
             m_file = re.search(r"\[\[\s*File:([^|\]]+)", row, flags=re.I)
             thumb_url = _build_thumb_from_filename(m_file.group(1), width=256) if m_file else None
 
-            items.append({
-                "id": card_id,
-                "name": display_name,
-                "href": href,
-                "thumb": thumb_url,
-            })
+            items.append({"id": card_id, "name": display_name, "href": href, "thumb": thumb_url})
 
-    # Quitar duplicados por id y ordenar
     seen = set()
     out: List[Dict] = []
     for it in items:
@@ -1574,30 +1638,69 @@ def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
         seen.add(cid)
         out.append(it)
 
-    out.sort(key=lambda x: int(str(x["id"])))
+    try:
+        out.sort(key=lambda x: int(str(x["id"])))
+    except Exception:
+        pass
+
     return out
 
-# ---------- Scraper real: página única List_of_cards (sin límite 1300) ----------
+
+# ---------- Scraper real: página única List_of_cards (sin límites) ----------
 async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     """
-    Lee la página única "List_of_cards" y parsea su wikitext.
-    Esto evita depender de subpáginas por rangos y elimina el corte ~1262.
+    Lee el wikitext de "List_of_cards" y lo parsea.
+    Usa action=query+revisions (más estable para payloads grandes),
+    y fallback a action=parse si no viene content.
     """
     async with httpx.AsyncClient() as client:
-        data = await _get_json(client, SEKAIPEDIA_API, {
-            "action": "parse",
-            "page": "List_of_cards",
-            "prop": "wikitext",
-            "format": "json",
-            "formatversion": 2,
-        })
+        # 1) Preferido: revisions content (menos propenso a truncar)
+        data = await _get_json(
+            client,
+            SEKAIPEDIA_API,
+            {
+                "action": "query",
+                "prop": "revisions",
+                "rvprop": "content",
+                "rvslots": "main",
+                "titles": "List_of_cards",
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
 
-    parse = (data or {}).get("parse") or {}
-    wikitext: str = parse.get("wikitext") or ""
+        wikitext = ""
+        try:
+            pages = (data.get("query") or {}).get("pages") or []
+            if pages and (pages[0].get("revisions") or []):
+                rev0 = pages[0]["revisions"][0]
+                slots = rev0.get("slots") or {}
+                main = slots.get("main") or {}
+                wikitext = main.get("content") or ""
+        except Exception:
+            wikitext = ""
+
+        # 2) Fallback: action=parse
+        if not wikitext:
+            data2 = await _get_json(
+                client,
+                SEKAIPEDIA_API,
+                {
+                    "action": "parse",
+                    "page": "List_of_cards",
+                    "prop": "wikitext",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+            )
+            parse = (data2 or {}).get("parse") or {}
+            wikitext = parse.get("wikitext") or ""
+
     if not wikitext:
         return []
 
     return _parse_cards_from_wikitext(wikitext)
+
 
 # =================== API: /auth02/cards (con persistencia + force refresh) ===================
 @app.get("/auth02/cards")
@@ -1607,10 +1710,9 @@ async def auth02_cards(request: Request, force: int = Query(0, description="1 = 
 
     - Por defecto, usa BD/cache si está fresco.
     - Si force=1, ignora freshness y fuerza scrape + upsert.
-      *Protegido* por sesión (cookie sid) para evitar abuso.
+      Protegido por sesión (cookie sid) para evitar abuso.
     """
     force = bool(force)
-
     if force:
         sid = request.cookies.get(COOKIE_NAME)
         if not sid or sid not in SESSIONS:
@@ -1618,7 +1720,6 @@ async def auth02_cards(request: Request, force: int = Query(0, description="1 = 
 
     now = datetime.now(timezone.utc)
 
-    # Si no forzamos, intentamos BD (fresh)
     if not force and db_pool:
         async with db_pool.acquire() as conn:
             try:
@@ -1627,14 +1728,12 @@ async def auth02_cards(request: Request, force: int = Query(0, description="1 = 
             except Exception:
                 traceback.print_exc()
 
-    # Si no forzamos, intentamos cache (fresh)
     if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
         return _cards_cache["items"]
 
     async with _cards_lock:
         now = datetime.now(timezone.utc)
 
-        # Re-check dentro del lock
         if not force and db_pool:
             async with db_pool.acquire() as conn:
                 try:
@@ -1674,6 +1773,7 @@ async def auth02_cards(request: Request, force: int = Query(0, description="1 = 
                     if existing:
                         return existing
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
+
 
 # =================== API: /auth02/card-variants ===================
 @app.get("/auth02/card-variants")
@@ -1716,6 +1816,7 @@ async def get_card_variants(href: str = Query(..., description="URL absoluta de 
         traceback.print_exc()
 
     return {"name": page_title, "variants": variants}
+
 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
