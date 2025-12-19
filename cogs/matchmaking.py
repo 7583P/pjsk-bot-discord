@@ -687,11 +687,18 @@ class Matchmaking(commands.Cog):
     def _now_lima(self) -> dt.datetime:
         return dt.datetime.now(tz=LIMA_TZ)
 
+    # Nuevo schedule:
+    # PREP threads: :55, :15, :35
+    # START slots:  :00, :20, :40
+    PREP_MINUTES  = (55, 15, 35)
+    START_MINUTES = (0, 20, 40)
+
     def _is_prepare_minute(self, dt: datetime) -> bool:
-        return dt.minute in (25, 55)
+        return dt.minute in PREP_MINUTES
 
     def _is_start_minute(self, dt: datetime) -> bool:
-        return dt.minute in (0, 30)
+        return dt.minute in START_MINUTES
+
 
     def _slot_key(self, dt: datetime) -> tuple[int,int,int,int]:
         # clave para evitar doble ejecución en la misma marca
@@ -779,6 +786,7 @@ class Matchmaking(commands.Cog):
             # notificar a Rooms cog
             self.bot.dispatch("room_updated", rid)
 
+
     async def _mark_prepared_rooms_started(self, join_channel_id: int):
         dt_local = self._now_lima()
         started_ts = int(dt_local.timestamp())
@@ -791,6 +799,35 @@ class Matchmaking(commands.Cog):
             if info.get("finished", False):
                 continue
 
+            players = [m for m in info.get("players", []) if m and not m.bot]
+            n = len(players)
+
+            # Si por tu spec NO inicia por falta de jugadores:
+            if n < 2:
+                info["finished"] = True
+                info["closed"] = True
+
+                # Remover roles queue (EN/JP) a quienes quedaron
+                try:
+                    await self._remove_queue_roles(players)
+                except Exception:
+                    pass
+
+                try:
+                    await info["thread"].send("⛔ Room did not start (not enough players). Closing room.")
+                except Exception:
+                    pass
+
+                # Notificar y cerrar hilo
+                try:
+                    self.bot.dispatch("room_finished", rid)
+                except Exception:
+                    pass
+
+                asyncio.create_task(self.close_room(info["thread"], delay=5, delete=True))
+                continue
+
+            # Inicia normal con los que estén
             info["phase"] = PHASE_STARTED
             info["started"] = True
             info["started_ts"] = started_ts
@@ -801,6 +838,7 @@ class Matchmaking(commands.Cog):
                 pass
 
             self.bot.dispatch("room_updated", rid)
+
 
 
     async def _fetch_mmrs_batch(self, user_ids: list[int]) -> dict[int, int]:
@@ -971,16 +1009,25 @@ class Matchmaking(commands.Cog):
             info["players"] = desired[:]
             await self.update_room_board(guild, rid)
 
-    async def _announce_need_players(self, join_channel: discord.TextChannel, rid: int, info: dict, minutes_to_start: int):
-        disp = self._disp(info, rid)
-        need = ROOM_CAPACITY - len(info.get("players", []))
+    async def _announce_need_players_tminus5(self, guild: discord.Guild, join_channel: discord.TextChannel):
+        """
+        Se ejecuta en :55/:15/:35.
+        Si la siguiente sala (en cola) está incompleta, anuncia Need (x).
+        """
+        join_id = join_channel.id
+        ordered = await self._get_ordered_queue_members(guild, join_id)
+        if not ordered:
+            return
+
+        rem = len(ordered) % ROOM_CAPACITY
+        need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
         if need <= 0:
             return
-        # singular/plural simple
-        mins = max(1, int(minutes_to_start))
-        await join_channel.send(
-            f"Need ({need}) player(s) to start room ({disp}), Starting in {mins} minute(s) regardless."
-        )
+
+        try:
+            await join_channel.send(f"Need ({need}) player(s) to start the next room.")
+        except Exception:
+            pass
 
     async def _announce_room_start(self, join_channel: discord.TextChannel, rid: int, info: dict):
         disp = self._disp(info, rid)
@@ -1906,31 +1953,24 @@ class Matchmaking(commands.Cog):
                 continue
 
             async with self._join_lock:
-                # :25 / :55 => crear threads + songs
+                # :55/:15/:35 => (1) aviso Need players (T-5) (2) crear threads + songs para grupos completos
                 if self._is_prepare_minute(now) and now.second < 5:
                     k = self._slot_key(now)
                     if self._slot_last_key.get((join_id, "prepare")) != k:
                         self._slot_last_key[(join_id, "prepare")] = k
+
+                        # 1) Aviso T-5 si falta gente para completar la siguiente sala
+                        await self._announce_need_players_tminus5(guild, join_channel)
+
+                        # 2) Preparar salas completas (5/5) => threads + songs
                         await self._prepare_rooms_for_join_channel(guild, join_channel)
 
-                # :00 / :30 => marcar STARTED
+                # :00/:20/:40 => START slot
                 if self._is_start_minute(now) and now.second < 5:
                     k = self._slot_key(now)
                     if self._slot_last_key.get((join_id, "start")) != k:
                         self._slot_last_key[(join_id, "start")] = k
                         await self._mark_prepared_rooms_started(join_id)
-
-                # Need players en ventanas 1–4 y 31–34 (Lima)
-                if self._need_players_window(now) and now.second < 5:
-                    minute_ts = int(now.replace(second=0, microsecond=0).timestamp())
-                    if self._need_last_minute.get(join_id) != minute_ts:
-                        self._need_last_minute[join_id] = minute_ts
-                        need = await self._need_players_count_for_join(guild, join_id)
-                        if need > 0:
-                            try:
-                                await join_channel.send(f"Need ({need}) player(s) to start the next room.")
-                            except Exception:
-                                pass
 
 
 
@@ -3374,186 +3414,123 @@ class Matchmaking(commands.Cog):
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
 
-    @app_commands.command(
-        name="forfeit",
-        description="Starts a forfeit vote to close the room by majority"
-    )
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    async def forfeit(self, interaction: discord.Interaction):
-        ch = interaction.channel
+@app_commands.command(name="forfeit", description="Vote to forfeit the current room.")
+async def forfeit(self, interaction: discord.Interaction):
+    # Debe ejecutarse dentro de un thread de room
+    ch = interaction.channel
+    if not isinstance(ch, (discord.Thread, discord.TextChannel)):
+        await interaction.response.send_message("This command must be used inside a room thread.", ephemeral=True)
+        return
 
-        # Solo funciona dentro de un hilo cuyo padre sea un #join permitido
-        if not (isinstance(ch, Thread) and ch.parent_id in ALLOWED_JOIN_CHANNELS):
-            return await interaction.response.send_message(
-                "This command only works inside a room thread.",
-                ephemeral=True
-            )
+    # Encontrar room por thread
+    room_id = None
+    room = None
 
-        # Buscar la sala asociada a este hilo
-        room = next((r for r in self.rooms.values() if r["thread"].id == ch.id), None)
-        if not room:
-            return await interaction.response.send_message(
-                "⚠️ I can't find the room for this thread.",
-                ephemeral=True
-            )
+    for rid, info in (self.rooms or {}).items():
+        thr = info.get("thread")
+        thr_id = None
+        if isinstance(thr, discord.Thread):
+            thr_id = thr.id
+        else:
+            tid = info.get("thread_id") or info.get("thread_channel_id")
+            if isinstance(tid, int) and tid > 0:
+                thr_id = tid
 
-        # Si la sala ya fue finalizada (submit o forfeit previo), no tiene sentido
-        if room.get("finished", False):
-            return await interaction.response.send_message(
-                "This room is already finished.",
-                ephemeral=True
-            )
+        if thr_id is not None and thr_id == ch.id:
+            room_id = rid
+            room = info
+            break
 
-        # No permitir si hay otra votación (submit o forfeit) en curso
-        if room.get("vote_in_progress", False):
-            return await interaction.response.send_message(
-                "There is already a vote in progress in this room.",
-                ephemeral=True
-            )
+    if room is None:
+        await interaction.response.send_message("This does not look like an active room thread.", ephemeral=True)
+        return
 
-        # Jugadores actuales registrados en la sala (no bots)
-        players = [m for m in room.get("players", []) if not m.bot]
-        if not players:
-            return await interaction.response.send_message(
-                "There are no players in this room.",
-                ephemeral=True
-            )
+    if room.get("finished") or room.get("closed"):
+        await interaction.response.send_message("This room is already closed.", ephemeral=True)
+        return
 
-        # Marcamos que hay una votación en curso para bloquear otros submits/forfeits
-        room["vote_in_progress"] = True
+    # Resolver lista actual de jugadores (Members)
+    raw_players = room.get("players", []) or []
+    players_now: list[discord.Member] = []
+    for p in raw_players:
+        if isinstance(p, discord.Member):
+            if not p.bot:
+                players_now.append(p)
+        elif isinstance(p, discord.User):
+            # best effort: convertir a Member si está en guild
+            if interaction.guild:
+                m = interaction.guild.get_member(p.id)
+                if m and not m.bot:
+                    players_now.append(m)
+        elif isinstance(p, int):
+            if interaction.guild:
+                m = interaction.guild.get_member(p)
+                if m and not m.bot:
+                    players_now.append(m)
 
+    # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
+    n_players = len(players_now)
+    threshold = max(1, (n_players // 2) + 1)  # mayoría simple
+
+    # Estructura de votos
+    votes = room.setdefault("forfeit_votes", {})
+    uid = interaction.user.id
+
+    # Registrar voto "YES"
+    votes[str(uid)] = True
+
+    yes_count = sum(1 for v in votes.values() if v is True)
+
+    # Si no alcanza, solo reporta estado
+    if yes_count < threshold:
         try:
-            # Mensaje de poll (NO efímero, necesitamos reacciones)
-            content = (
-                f"Forfeit vote\n"
-                f"React ✅ to forfeit and close the room, ❎ to cancel "
-                f"(auto-close in {VOTE_TIMEOUT_FORFEIT}s)"
+            await interaction.response.send_message(
+                f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required.",
+                ephemeral=False,
             )
-            await interaction.response.send_message(content)
-            poll_msg = await interaction.original_response()
+        except discord.InteractionResponded:
+            await interaction.followup.send(
+                f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required."
+            )
+        return
 
-            # Reacciones ✅ y ❎
-            try:
-                await poll_msg.add_reaction("✅")
-                await poll_msg.add_reaction("❎")
-            except Exception:
-                pass
+    # Aprobado: cerrar room
+    room["finished"] = True
+    room["closed"] = True
 
-            # Esperamos el timeout completo y luego calculamos TODO al final,
-            # para respetar a quienes se fueron del hilo durante la votación.
-            await asyncio.sleep(float(VOTE_TIMEOUT_FORFEIT))
+    # ✅ PUNTO 5: remover roles de queue a quienes siguen en la room
+    try:
+        await self._remove_queue_roles(players_now)
+    except Exception:
+        pass
 
-            # Refrescamos el mensaje para asegurar tener las reacciones finales
-            try:
-                poll_msg = await ch.fetch_message(poll_msg.id)
-            except discord.NotFound:
-                # Si el mensaje desapareció, cancelamos silenciosamente
-                return
+    # Notificar en el thread
+    try:
+        if isinstance(ch, discord.Thread):
+            await ch.send("🏳️ Forfeit approved by vote. Closing room.")
+        else:
+            await ch.send("🏳️ Forfeit approved by vote. Closing room.")
+    except Exception:
+        pass
 
-            thread: discord.Thread = ch  # para type hint
+    # Disparar evento para Rooms cog
+    try:
+        self.bot.dispatch("room_finished", room_id)
+    except Exception:
+        pass
 
-            # IDs de los jugadores que están registrados en la sala
-            room_player_ids = {p.id for p in room.get("players", [])}
+    # Cerrar hilo
+    try:
+        # Si tu close_room ya maneja delete/archive según flags
+        asyncio.create_task(self.close_room(ch, delay=5, delete=True))
+    except Exception:
+        pass
 
-            # Jugadores ACTIVOS al cierre de la votación:
-            # - Tienen que seguir en el hilo (thread.members)
-            # - y deben estar en room["players"]
-            active_players: set[int] = set()
-            for tm in thread.members:
-                # thread.members devuelve ThreadMember → obtenemos el User/Member real
-                user = getattr(tm, "user", None) or tm
-                if getattr(user, "bot", False):
-                    continue
-                if user.id in room_player_ids:
-                    active_players.add(user.id)
-
-            if not active_players:
-                await ch.send(
-                    "There are no active players left in this room. Forfeit vote canceled."
-                )
-                return
-
-            yes_voters: set[int] = set()
-            no_voters: set[int] = set()
-
-            # Recorremos las reacciones y contamos votos SOLO de jugadores activos
-            for reaction in poll_msg.reactions:
-                emoji_str = str(reaction.emoji)
-                if emoji_str not in ("✅", "❎"):
-                    continue
-
-                async for user in reaction.users():
-                    if user.bot:
-                        continue
-                    if user.id not in active_players:
-                        continue
-
-                    if emoji_str == "✅":
-                        yes_voters.add(user.id)
-                    else:
-                        no_voters.add(user.id)
-
-            # Si alguien puso ambas reacciones, lo limpiamos (no cuenta ningún voto)
-            conflicted = yes_voters & no_voters
-            if conflicted:
-                yes_voters -= conflicted
-                no_voters -= conflicted
-
-            total_active = len(active_players)
-            yes_count = len(yes_voters)
-            no_count = len(no_voters)
-
-            # Mayoría estricta sobre los que QUEDAN en el hilo
-            # (ej. 3 activos → se necesitan 2 ó más ✅)
-            threshold = total_active // 2 + 1
-
-            if yes_count >= threshold:
-                # Forfeit aceptado por mayoría
-                try:
-                    await poll_msg.edit(
-                        content=(
-                            f"🛑 Forfeit accepted — closing room "
-                            f"(✅ {yes_count} / ❎ {no_count}, {total_active} active players)"
-                        )
-                    )
-                except Exception:
-                    pass
-
-                room["finished"] = True
-                room["closed"] = True
-
-                await ch.send(
-                    "Room forfeited by majority of the players that remain in this thread. Closing room..."
-                )
-
-                # Notificar a otros cogs y cerrar el hilo
-                rid = next(
-                    (rid for rid, r in self.rooms.items() if r["thread"].id == ch.id),
-                    None
-                )
-                if rid is not None:
-                    self.bot.dispatch('room_finished', rid)
-
-                # Cerramos el hilo con un pequeño delay
-                asyncio.create_task(self.close_room(ch, delay=5, delete=True))
-
-            else:
-                # No se alcanzó la mayoría
-                try:
-                    await poll_msg.edit(
-                        content=(
-                            f"Forfeit vote did not pass "
-                            f"(✅ {yes_count} / ❎ {no_count}, {total_active} active players; "
-                            f"needed {threshold} ✅)"
-                        )
-                    )
-                except Exception:
-                    pass
-                await ch.send("Forfeit vote failed. Room remains open.")
-
-        finally:
-            # Siempre liberar el flag de votación en curso
-            room["vote_in_progress"] = False
+    # Responder interacción
+    try:
+        await interaction.response.send_message("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
+    except discord.InteractionResponded:
+        await interaction.followup.send("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
 
 
 
@@ -3938,5 +3915,7 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
+
+
 
 
