@@ -12,6 +12,8 @@ CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
     1371951461612912802: 1388515368934309978,  # jp-pjsk    → rooms jp-pjsk
 }
 
+ROOM_CAPACITY = 5
+
 
 class Rooms(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -88,6 +90,65 @@ class Rooms(commands.Cog):
                 return None
         return None
 
+    async def _fetch_mmrs_batch(self, mm, user_ids: list[int], season_id: int | None, has_pool: bool) -> dict[int, int]:
+        """
+        Devuelve {user_id: mmr} usando UNA consulta por lote si hay pool+season.
+        """
+        if not user_ids:
+            return {}
+
+        # Dedup para evitar unnest gigante
+        user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
+
+        mmr_map: dict[int, int] = {}
+        try:
+            if has_pool and season_id:
+                async with mm.db_pool.acquire() as con:
+                    rows_db = await con.fetch(
+                        """
+                        WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
+                        SELECT u.user_id,
+                            COALESCE(sp.mmr, 0) AS mmr
+                        FROM u
+                        LEFT JOIN seasonplayers sp
+                            ON sp.user_id = u.user_id
+                            AND sp.season_id = $2
+                        """,
+                        user_ids,
+                        season_id,
+                    )
+                mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
+            else:
+                # Fallback: una a una
+                for uid in user_ids:
+                    _mmr, _ = await mm.fetch_player(uid)
+                    mmr_map[int(uid)] = int(_mmr)
+        except Exception:
+            # Fallback robusto
+            for uid in user_ids:
+                try:
+                    _mmr, _ = await mm.fetch_player(uid)
+                    mmr_map[int(uid)] = int(_mmr)
+                except Exception:
+                    mmr_map[int(uid)] = 0
+
+        return mmr_map
+
+    def _resolve_users_from_ids(self, guild: discord.Guild, ids: list[int]) -> list[discord.abc.User]:
+        """
+        Mejor esfuerzo: Member si existe, si no User cacheado.
+        """
+        out: list[discord.abc.User] = []
+        for uid in ids:
+            m = guild.get_member(uid)
+            if m is not None:
+                out.append(m)
+                continue
+            u = self.bot.get_user(uid)
+            if u is not None:
+                out.append(u)
+        return out
+
     async def _do_update(self):
         # Serializa updates para evitar condiciones de carrera
         async with self._update_lock:
@@ -98,18 +159,30 @@ class Rooms(commands.Cog):
                     return
 
                 all_rooms = getattr(mm, "rooms", {}) or {}
+                queues = getattr(mm, "queues", {}) or {}
 
                 # 2) Resolver season una sola vez por update
                 season_id = await self._get_active_season_id(mm)
                 has_pool = getattr(mm, "db_pool", None) is not None and bool(season_id)
 
-                # 3) Agrupar por categoría
+                # 3) Construir mapping category_id -> join_channel_id a partir de mm.queues
+                #    (así distinguimos EN vs JP sin hardcodear IDs)
+                cat_to_join: dict[int, int] = {}
+                for join_id in list(queues.keys()):
+                    ch = self.bot.get_channel(join_id)
+                    if isinstance(ch, discord.TextChannel) and ch.category is not None:
+                        cat_id = ch.category.id
+                        if cat_id in CATEGORY_TO_ROOM_CHANNEL:
+                            cat_to_join[cat_id] = join_id
+
+                # 4) Agrupar rooms por categoría
                 # Cada item: (room_id, pdata[(user, mmr)], avg_mmr, started_bool, started_ts|None, thread_id|None)
                 grouped: dict[
                     int,
                     list[tuple[int, list[tuple[discord.abc.User, int]], int, bool, int | None, int | None]],
                 ] = {}
 
+                # Para minimizar I/O, por cada room seguimos tu estrategia (1 consulta por sala).
                 for rid, info in all_rooms.items():
                     cat = info.get("category_id")
                     if cat not in CATEGORY_TO_ROOM_CHANNEL:
@@ -120,12 +193,13 @@ class Rooms(commands.Cog):
                     users: list[discord.abc.User] = []
                     user_ids: list[int] = []
 
+                    # OJO: aquí no tenemos guild directo; lo obtendremos luego por canal rooms.
+                    # Guardamos IDs y resolvemos users por cache/best effort:
                     for p in raw_players:
                         if isinstance(p, (discord.Member, discord.User)):
                             users.append(p)
                             user_ids.append(p.id)
                         elif isinstance(p, int):
-                            # mejor esfuerzo: User cacheado (no hacemos fetch masivo para no golpear rate limits)
                             u = self.bot.get_user(p)
                             if u is not None:
                                 users.append(u)
@@ -134,33 +208,7 @@ class Rooms(commands.Cog):
                     # ---- Obtener MMRs con UNA consulta por sala (menos I/O) ----
                     mmr_map: dict[int, int] = {}
                     if user_ids:
-                        try:
-                            if has_pool:
-                                async with mm.db_pool.acquire() as con:
-                                    rows_db = await con.fetch(
-                                        """
-                                        WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
-                                        SELECT u.user_id,
-                                            COALESCE(sp.mmr, 0) AS mmr
-                                        FROM u
-                                        LEFT JOIN seasonplayers sp
-                                            ON sp.user_id = u.user_id
-                                            AND sp.season_id = $2
-                                        """,
-                                        user_ids,
-                                        season_id,
-                                    )
-                                mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
-                            else:
-                                # Fallback: una a una (si no hay pool o no se pudo resolver season)
-                                for uid in user_ids:
-                                    _mmr, _ = await mm.fetch_player(uid)  # debe leer current season
-                                    mmr_map[uid] = int(_mmr)
-                        except Exception:
-                            # Fallback robusto si falla la consulta por lote
-                            for uid in user_ids:
-                                _mmr, _ = await mm.fetch_player(uid)
-                                mmr_map[uid] = int(_mmr)
+                        mmr_map = await self._fetch_mmrs_batch(mm, user_ids, season_id, has_pool)
 
                     # pdata = [(user, mmr)] ORDENADO por MMR DESC
                     pdata: list[tuple[discord.abc.User, int]] = [(u, mmr_map.get(u.id, 0)) for u in users]
@@ -194,11 +242,9 @@ class Rooms(commands.Cog):
                 # helper: truncar si excede 2000 chars
                 def build_content(lines: list[str], now_ts: int) -> str:
                     footer = f"Last Update <t:{now_ts}:R>"
-                    # Asegura footer presente
                     if not lines or not lines[-1].startswith("Last Update"):
                         lines = lines + [footer]
 
-                    # Truncado conservador
                     content = "\n".join(lines)
                     if len(content) <= 1990:
                         return content
@@ -209,26 +255,25 @@ class Rooms(commands.Cog):
 
                     return "\n".join(body + ["…(truncated)", footer])
 
-                # 4) Para cada categoría, editar o enviar mensaje en su canal rooms
+                # 5) Para cada categoría, editar o enviar mensaje en su canal rooms
                 now_ts = int(time.time())
                 for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
                     channel = self.bot.get_channel(room_chan_id)
                     if not isinstance(channel, discord.TextChannel):
                         continue
 
-                    lines: list[str] = []
-                    rooms_list = grouped.get(cat_id, [])
+                    guild = channel.guild
 
-                    if not rooms_list:
-                        lines.append("**No active rooms**")
-                    else:
-                        # Orden: por Average MMR desc, si empatan por room_id asc
-                        rooms_list.sort(key=lambda x: (-x[2], x[0]))
+                    lines: list[str] = []
+
+                    # ---- A) Active rooms (lo que ya tenías) ----
+                    rooms_list = grouped.get(cat_id, [])
+                    if rooms_list:
+                        rooms_list.sort(key=lambda x: (-x[2], x[0]))  # avg desc, rid asc
 
                         for rid, pdata, avg, started_flag, started_ts, thread_id in rooms_list:
                             count = len(pdata)
 
-                            # Formateo de estado
                             if started_flag:
                                 if isinstance(started_ts, int) and started_ts > 0:
                                     status = f"[STARTED] <t:{started_ts}:t>"
@@ -237,10 +282,8 @@ class Rooms(commands.Cog):
                             else:
                                 status = "[NOT STARTED]"
 
-                            # Referencia al thread/canal si existe
                             ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
 
-                            # Encabezado de la sala
                             if ref:
                                 lines.append(
                                     f"**Room {rid} · {ref} · {count}/5 Players · Average MMR {avg} · {status}**"
@@ -248,11 +291,57 @@ class Rooms(commands.Cog):
                             else:
                                 lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**")
 
-                            # Lista de jugadores (ordenada por MMR DESC)
                             for user, mmr in pdata:
-                                # user puede ser User (cache) o Member; display_name existe en ambos en discord.py 2.x
                                 lines.append(f"- {user.display_name} ({mmr})")
                             lines.append("")
+                    else:
+                        # No imprimimos todavía "No active rooms" porque ahora habrá queue NO-STARTED
+                        pass
+
+                    # ---- B) Queue NO-STARTED (nuevo) ----
+                    join_id = cat_to_join.get(cat_id)
+                    queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
+
+                    # Normalizar a IDs
+                    queue_ids: list[int] = []
+                    for item in (queue_raw or []):
+                        if isinstance(item, int):
+                            queue_ids.append(item)
+                        elif isinstance(item, (discord.Member, discord.User)):
+                            queue_ids.append(item.id)
+
+                    # Construir grupos de 5 (future rooms)
+                    if queue_ids:
+                        # Resolver usuarios best-effort en guild (para display_name)
+                        users_queue = self._resolve_users_from_ids(guild, queue_ids)
+
+                        # Orden: respetar orden de cola, pero necesitamos mmr para imprimir
+                        ids_in_order = [u.id for u in users_queue]
+
+                        mmr_map_q = await self._fetch_mmrs_batch(mm, ids_in_order, season_id, has_pool)
+
+                        # Si hay rooms activos arriba, separador
+                        if lines and not lines[-1].strip():
+                            pass
+                        if lines:
+                            lines.append("**Queue (NO-STARTED)**")
+
+                        # Chunks de 5
+                        for idx in range(0, len(users_queue), ROOM_CAPACITY):
+                            grp = users_queue[idx: idx + ROOM_CAPACITY]
+                            grp_mmrs = [mmr_map_q.get(u.id, 0) for u in grp]
+                            avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
+                            count_q = len(grp)
+
+                            room_n = (idx // ROOM_CAPACITY) + 1
+                            lines.append(f"**Room Q{room_n} · {count_q}/5 Players · Average MMR {avg_q} · [NO-STARTED]**")
+                            for u in grp:
+                                lines.append(f"- {u.display_name} ({mmr_map_q.get(u.id, 0)})")
+                            lines.append("")
+                    else:
+                        # Si no hay active rooms y no hay queue, ahora sí mostramos el mensaje
+                        if not rooms_list:
+                            lines.append("**No active rooms**")
 
                     content = build_content(lines, now_ts)
 
