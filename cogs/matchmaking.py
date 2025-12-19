@@ -3414,123 +3414,123 @@ class Matchmaking(commands.Cog):
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
 
-@app_commands.command(name="forfeit", description="Vote to forfeit the current room.")
-async def forfeit(self, interaction: discord.Interaction):
-    # Debe ejecutarse dentro de un thread de room
-    ch = interaction.channel
-    if not isinstance(ch, (discord.Thread, discord.TextChannel)):
-        await interaction.response.send_message("This command must be used inside a room thread.", ephemeral=True)
-        return
+    @app_commands.command(name="forfeit", description="Vote to forfeit the current room.")
+    async def forfeit(self, interaction: discord.Interaction):
+        # Debe ejecutarse dentro de un thread de room
+        ch = interaction.channel
+        if not isinstance(ch, (discord.Thread, discord.TextChannel)):
+            await interaction.response.send_message("This command must be used inside a room thread.", ephemeral=True)
+            return
 
-    # Encontrar room por thread
-    room_id = None
-    room = None
+        # Encontrar room por thread
+        room_id = None
+        room = None
 
-    for rid, info in (self.rooms or {}).items():
-        thr = info.get("thread")
-        thr_id = None
-        if isinstance(thr, discord.Thread):
-            thr_id = thr.id
-        else:
-            tid = info.get("thread_id") or info.get("thread_channel_id")
-            if isinstance(tid, int) and tid > 0:
-                thr_id = tid
+        for rid, info in (self.rooms or {}).items():
+            thr = info.get("thread")
+            thr_id = None
+            if isinstance(thr, discord.Thread):
+                thr_id = thr.id
+            else:
+                tid = info.get("thread_id") or info.get("thread_channel_id")
+                if isinstance(tid, int) and tid > 0:
+                    thr_id = tid
 
-        if thr_id is not None and thr_id == ch.id:
-            room_id = rid
-            room = info
-            break
+            if thr_id is not None and thr_id == ch.id:
+                room_id = rid
+                room = info
+                break
 
-    if room is None:
-        await interaction.response.send_message("This does not look like an active room thread.", ephemeral=True)
-        return
+        if room is None:
+            await interaction.response.send_message("This does not look like an active room thread.", ephemeral=True)
+            return
 
-    if room.get("finished") or room.get("closed"):
-        await interaction.response.send_message("This room is already closed.", ephemeral=True)
-        return
+        if room.get("finished") or room.get("closed"):
+            await interaction.response.send_message("This room is already closed.", ephemeral=True)
+            return
 
-    # Resolver lista actual de jugadores (Members)
-    raw_players = room.get("players", []) or []
-    players_now: list[discord.Member] = []
-    for p in raw_players:
-        if isinstance(p, discord.Member):
-            if not p.bot:
-                players_now.append(p)
-        elif isinstance(p, discord.User):
-            # best effort: convertir a Member si está en guild
-            if interaction.guild:
-                m = interaction.guild.get_member(p.id)
-                if m and not m.bot:
-                    players_now.append(m)
-        elif isinstance(p, int):
-            if interaction.guild:
-                m = interaction.guild.get_member(p)
-                if m and not m.bot:
-                    players_now.append(m)
+        # Resolver lista actual de jugadores (Members)
+        raw_players = room.get("players", []) or []
+        players_now: list[discord.Member] = []
+        for p in raw_players:
+            if isinstance(p, discord.Member):
+                if not p.bot:
+                    players_now.append(p)
+            elif isinstance(p, discord.User):
+                # best effort: convertir a Member si está en guild
+                if interaction.guild:
+                    m = interaction.guild.get_member(p.id)
+                    if m and not m.bot:
+                        players_now.append(m)
+            elif isinstance(p, int):
+                if interaction.guild:
+                    m = interaction.guild.get_member(p)
+                    if m and not m.bot:
+                        players_now.append(m)
 
-    # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
-    n_players = len(players_now)
-    threshold = max(1, (n_players // 2) + 1)  # mayoría simple
+        # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
+        n_players = len(players_now)
+        threshold = max(1, (n_players // 2) + 1)  # mayoría simple
 
-    # Estructura de votos
-    votes = room.setdefault("forfeit_votes", {})
-    uid = interaction.user.id
+        # Estructura de votos
+        votes = room.setdefault("forfeit_votes", {})
+        uid = interaction.user.id
 
-    # Registrar voto "YES"
-    votes[str(uid)] = True
+        # Registrar voto "YES"
+        votes[str(uid)] = True
 
-    yes_count = sum(1 for v in votes.values() if v is True)
+        yes_count = sum(1 for v in votes.values() if v is True)
 
-    # Si no alcanza, solo reporta estado
-    if yes_count < threshold:
+        # Si no alcanza, solo reporta estado
+        if yes_count < threshold:
+            try:
+                await interaction.response.send_message(
+                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required.",
+                    ephemeral=False,
+                )
+            except discord.InteractionResponded:
+                await interaction.followup.send(
+                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required."
+                )
+            return
+
+        # Aprobado: cerrar room
+        room["finished"] = True
+        room["closed"] = True
+
+        # ✅ PUNTO 5: remover roles de queue a quienes siguen en la room
         try:
-            await interaction.response.send_message(
-                f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required.",
-                ephemeral=False,
-            )
+            await self._remove_queue_roles(players_now)
+        except Exception:
+            pass
+
+        # Notificar en el thread
+        try:
+            if isinstance(ch, discord.Thread):
+                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
+            else:
+                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
+        except Exception:
+            pass
+
+        # Disparar evento para Rooms cog
+        try:
+            self.bot.dispatch("room_finished", room_id)
+        except Exception:
+            pass
+
+        # Cerrar hilo
+        try:
+            # Si tu close_room ya maneja delete/archive según flags
+            asyncio.create_task(self.close_room(ch, delay=5, delete=True))
+        except Exception:
+            pass
+
+        # Responder interacción
+        try:
+            await interaction.response.send_message("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
         except discord.InteractionResponded:
-            await interaction.followup.send(
-                f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required."
-            )
-        return
-
-    # Aprobado: cerrar room
-    room["finished"] = True
-    room["closed"] = True
-
-    # ✅ PUNTO 5: remover roles de queue a quienes siguen en la room
-    try:
-        await self._remove_queue_roles(players_now)
-    except Exception:
-        pass
-
-    # Notificar en el thread
-    try:
-        if isinstance(ch, discord.Thread):
-            await ch.send("🏳️ Forfeit approved by vote. Closing room.")
-        else:
-            await ch.send("🏳️ Forfeit approved by vote. Closing room.")
-    except Exception:
-        pass
-
-    # Disparar evento para Rooms cog
-    try:
-        self.bot.dispatch("room_finished", room_id)
-    except Exception:
-        pass
-
-    # Cerrar hilo
-    try:
-        # Si tu close_room ya maneja delete/archive según flags
-        asyncio.create_task(self.close_room(ch, delay=5, delete=True))
-    except Exception:
-        pass
-
-    # Responder interacción
-    try:
-        await interaction.response.send_message("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
-    except discord.InteractionResponded:
-        await interaction.followup.send("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
+            await interaction.followup.send("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
 
 
 
@@ -3915,6 +3915,8 @@ async def forfeit(self, interaction: discord.Interaction):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
+
+
 
 
 
