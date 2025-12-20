@@ -751,7 +751,7 @@ class Matchmaking(commands.Cog):
         try:
             await join_channel.send(
                 f"⏳ **{mins_left} min left** — A queue will be starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
-                f"{need_part}Type `/c` to join or `/d` to drop the queue."
+                f"{need_part}Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
             pass
@@ -879,7 +879,8 @@ class Matchmaking(commands.Cog):
 
     async def _prepare_rooms_for_join_channel(self, guild: discord.Guild, join_channel: discord.TextChannel):
         """
-        :25/:55 -> crea threads y corre canciones.
+        PREP (:55/:15/:35 windows) -> crea threads y mueve jugadores,
+        PERO NO postea canciones. Las canciones se postean en el slot (:00/:20/:40).
         """
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
@@ -890,19 +891,27 @@ class Matchmaking(commands.Cog):
         if not full_groups:
             return
 
-        dt_local = self._now_lima()
+        now = self._now_lima()
+
+        # slot real al que corresponde este PREP (55->00, 15->20, 35->40)
+        prep_start = self._in_prep_window(now)  # 55/15/35
+        if prep_start is None:
+            return
+        slot_dt = self._slot_start_from_prep_start(now, prep_start)
+        slot_ts = int(slot_dt.timestamp())
+
         server_code = JOIN_CHANNEL_CFG.get(join_id, {}).get("server", "en")
 
-        # para naming: calculamos avg mmr por grupo
-        # (solo mmr de no-placement ya fue batch; aquí hacemos batch para todos por simplicidad)
         for i, group in enumerate(full_groups, start=1):
+            # calcular avg mmr para naming (en base al grupo)
             mmr_map = await self._fetch_mmrs_batch([m.id for m in group])
             mmr_vals = [int(mmr_map.get(m.id, 0)) for m in group]
             avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
             rank = self._rank_label_from_mmr(avg)
-            thread_name = self._build_thread_name(i, dt_local, avg, rank)
 
-            # Crear room/thread (ajusta tu _create_room para aceptar name)
+            # IMPORTANTE: usar slot_dt (no now) para nombre del thread
+            thread_name = self._build_thread_name(i, slot_dt, avg, rank)
+
             rid, info = await self._create_room(join_channel, server_code=server_code, thread_name=thread_name)
 
             # mover de cola a room
@@ -910,19 +919,28 @@ class Matchmaking(commands.Cog):
                 self.queues[join_id].discard(m.id)
                 await self._add_member_to_room(m, rid, info)
 
-            # marcar fase
-            info["phase"] = PHASE_PREPARED
+            # marcar como FUTURE (espera al slot para postear songs)
+            info["phase"] = PHASE_FUTURE
             info["locked_in_thread"] = True
-            info["prepared_ts"] = int(dt_local.timestamp())
+            info["slot_start_ts"] = slot_ts
             info["avg_mmr"] = avg
             info["rank_label"] = rank
-            info["started"] = False  # se setea en :00/:30
+            info["started"] = False
+            info["songs_posted"] = False
 
             mentions = " ".join(m.mention for m in group)
-            await info["thread"].send(f"{mentions}\n(PREPARED) — songs have been posted.")
-            await self.launch_song_poll(info)
 
-            # rol cola fuera (si lo usas)
+            # Ping + aviso de cuándo se publican songs
+            try:
+                await info["thread"].send(
+                    f"{mentions}\n"
+                    f"✅ You are locked in for this slot.\n"
+                    f"🎵 Songs will be displayed at <t:{slot_ts}:T> (<t:{slot_ts}:R>)."
+                )
+            except Exception:
+                pass
+
+            # quitar rol cola
             try:
                 await self._remove_queue_roles(group)
             except Exception:
@@ -932,47 +950,56 @@ class Matchmaking(commands.Cog):
             self.bot.dispatch("room_updated", rid)
 
 
-    async def _mark_prepared_rooms_started(self, join_channel_id: int):
-        dt_local = self._now_lima()
-        started_ts = int(dt_local.timestamp())
+    async def _start_future_rooms_for_slot(self, join_channel_id: int, slot_ts: int):
+        """
+        En el minuto exacto del slot (:00/:20/:40):
+        - Para rooms FUTURE cuyo slot_start_ts == slot_ts:
+            * postea canciones (launch_song_poll)
+            * marca STARTED
+        """
+        started_ts = slot_ts
 
         for rid, info in list(self.rooms.items()):
             if info.get("join_channel_id") != join_channel_id:
                 continue
-            if info.get("phase") != PHASE_PREPARED:
-                continue
             if info.get("finished", False):
+                continue
+
+            if info.get("phase") != PHASE_FUTURE:
+                continue
+
+            if int(info.get("slot_start_ts", 0)) != int(slot_ts):
                 continue
 
             players = [m for m in info.get("players", []) if m and not m.bot]
             n = len(players)
 
-            # Si por tu spec NO inicia por falta de jugadores:
+            # si se quedaron sin gente
             if n < 2:
                 info["finished"] = True
                 info["closed"] = True
-
-                # Remover roles queue (EN/JP) a quienes quedaron
                 try:
                     await self._remove_queue_roles(players)
                 except Exception:
                     pass
-
                 try:
                     await info["thread"].send("⛔ Room did not start (not enough players). Closing room.")
                 except Exception:
                     pass
-
-                # Notificar y cerrar hilo
                 try:
                     self.bot.dispatch("room_finished", rid)
                 except Exception:
                     pass
-
                 asyncio.create_task(self.close_room(info["thread"], delay=5, delete=True))
                 continue
 
-            # Inicia normal con los que estén
+            # 1) Postear songs EXACTAMENTE en el slot
+            try:
+                await self.launch_song_poll(info)  # esto postea "Selected songs..." en el thread
+            except Exception:
+                pass
+
+            # 2) Marcar started
             info["phase"] = PHASE_STARTED
             info["started"] = True
             info["started_ts"] = started_ts
@@ -983,6 +1010,7 @@ class Matchmaking(commands.Cog):
                 pass
 
             self.bot.dispatch("room_updated", rid)
+
 
 
 
@@ -1413,8 +1441,9 @@ class Matchmaking(commands.Cog):
             "join_channel_id": join_channel.id,
             "server": server_code,
             "players": [],
-            "phase": PHASE_PREPARED,          # se confirma tras songs
-            "locked_in_thread": True,
+"phase": PHASE_FUTURE,            # FUTURE: thread listo, songs aún NO
+"locked_in_thread": True,         # si quieres que estén bloqueados desde PREP
+
             "started": False,
             "finished": False,
             "created_ts": int(self._now_lima().timestamp()),
@@ -2180,19 +2209,13 @@ class Matchmaking(commands.Cog):
                     last_min = self._sched_last_minute.get(join_id)
                     if last_min != minute_key:
                         self._sched_last_minute[join_id] = minute_key
-                        await self._mark_prepared_rooms_started(join_id)
 
-                    # Ejecutar SOLO en el minuto exacto del slot (00/20/40) una sola vez
-                    if now.minute == start_base:
-                        slot_key = (now.year, now.month, now.day, now.hour, start_base)
-                        if self._sched_last_slot.get(join_id) != slot_key:
-                            self._sched_last_slot[join_id] = slot_key
+                        # slot exacto (00/20/40) de ESTA hora
+                        slot_dt = now.replace(second=0, microsecond=0, minute=start_base)
+                        slot_ts = int(slot_dt.timestamp())
 
-                            # NUEVO: si el siguiente grupo no se llenó, sacar a esos jugadores de la queue
-                            await self._purge_unfilled_queue_on_slot(guild, join_channel, now)
+                        await self._start_future_rooms_for_slot(join_id, slot_ts)
 
-                            # NUEVO: al llegar al slot, postear timestamps a :55/:15/:35
-                            await self._announce_next_queue_windows_on_00(join_channel, now)
 
 
 
@@ -3348,7 +3371,7 @@ class Matchmaking(commands.Cog):
             rid = self._find_player_room_id(member)
             if rid is not None:
                 info = self.rooms.get(rid, {})
-                if info.get("phase") in (PHASE_PREPARED, PHASE_STARTED) and not info.get("finished", False):
+                if info.get("phase") in (PHASE_FUTURE, PHASE_PREPARED, PHASE_STARTED) and not info.get("finished", False):
                     return await interaction.response.send_message(
                         "❌ You are locked in a room. You can’t leave until the room finishes.",
                         ephemeral=True
@@ -4282,6 +4305,8 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
+
+
 
 
 
