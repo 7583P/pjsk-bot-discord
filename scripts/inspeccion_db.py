@@ -1,7 +1,7 @@
 import sqlite3, os
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-db_path = os.path.join(BASE, "matchmaking.db")
+db_path = os.path.join(BASE, "../matchmaking.db")
 
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()

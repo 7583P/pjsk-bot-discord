@@ -3,7 +3,7 @@
 import aiosqlite
 import asyncio
 
-DB_PATH = "matchmaking.db"
+DB_PATH = "../matchmaking.db"
 
 
 async def reset_all():

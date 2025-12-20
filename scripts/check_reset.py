@@ -1,6 +1,6 @@
 import sqlite3
 
-DB_PATH = "matchmaking.db"
+DB_PATH = "../matchmaking.db"
 conn = sqlite3.connect(DB_PATH)
 cur = conn.cursor()
 
