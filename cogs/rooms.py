@@ -1,6 +1,6 @@
 # cogs/rooms.py
 
-import time
+import time, json
 import asyncio
 import discord
 from discord.ext import commands, tasks
@@ -550,7 +550,8 @@ class Rooms(commands.Cog):
                             pass
                         except discord.HTTPException:
                             pass
-
+            with open("assets/cached_rooms.json", "w+", encoding="utf-8") as f:
+                json.dump(all_rooms, f)
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")
 

@@ -1,4 +1,4 @@
-import os, io, re
+import os, io, re, json
 import random
 import asyncio
 import datetime
@@ -2201,6 +2201,12 @@ class Matchmaking(commands.Cog):
         self._join_lock = asyncio.Lock()
 
         self.rooms: dict[int, dict] = {}
+        try:
+            if os.path.isfile("assets/cached_rooms.json"):
+                with open("assets/cached_rooms.json", "r", encoding="utf-8") as f:
+                    self.rooms = json.load(f)
+        except:
+            pass
         self._sched_last_minute = {}  # parent_id -> minute_ts
         self._sched_last_slot = {}  # parent_id -> (y,m,d,hm)
 
