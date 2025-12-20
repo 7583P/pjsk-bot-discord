@@ -698,10 +698,11 @@ class Matchmaking(commands.Cog):
         return None
 
     def _in_prep_window(self, now: dt.datetime) -> int | None:
-        return self._window_start_minute(now.minute, PREP_WINDOWS)
+        return self._window_start_minute(now.minute, self.PREP_WINDOWS)
 
     def _in_start_window(self, now: dt.datetime) -> int | None:
-        return self._window_start_minute(now.minute, START_WINDOWS)
+        return self._window_start_minute(now.minute, self.START_WINDOWS)
+
 
 
 
@@ -2017,26 +2018,23 @@ class Matchmaking(commands.Cog):
 
             async with self._join_lock:
                 # ---------- PREP (ventana :x5..:x9) ----------
-                prep_start = self._in_prep_window(now)  # 55 / 15 / 35 o None
+                # PREP
+                prep_start = self._in_prep_window(now)
                 if prep_start is not None:
-                    # Gate: ejecutar 1 vez por minuto (tu loop corre cada 5s)
                     minute_key = (now.year, now.month, now.day, now.hour, now.minute)
                     if self._prep_last_minute.get(join_id) != minute_key:
                         self._prep_last_minute[join_id] = minute_key
-
-                        # 1) Preparar rooms (si se completaron grupos en este minuto)
                         await self._prepare_rooms_for_join_channel(guild, join_channel)
-
-                        # 2) Anunciar need players cada minuto en PREP
                         await self._announce_need_players_prep_minute(guild, join_channel, now)
-                                    # ---------- START (ventana :x0..:x4) ----------
-                        start_base = self._in_start_window(now)  # 0 / 20 / 40 o None
-                        if start_base is not None:
-                            minute_key = (now.year, now.month, now.day, now.hour, now.minute)
-                            last = self._sched_last_minute.get(join_id)
-                            if last != minute_key:
-                                self._sched_last_minute[join_id] = minute_key
-                                await self._mark_prepared_rooms_started(join_id)
+
+                # START
+                start_base = self._in_start_window(now)
+                if start_base is not None:
+                    minute_key = (now.year, now.month, now.day, now.hour, now.minute)
+                    last = self._sched_last_minute.get(join_id)
+                    if last != minute_key:
+                        self._sched_last_minute[join_id] = minute_key
+                        await self._mark_prepared_rooms_started(join_id)
 
 
     @room_slot_scheduler.before_loop
@@ -4125,6 +4123,5 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
-
 
 
