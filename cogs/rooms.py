@@ -5,7 +5,6 @@ import asyncio
 import discord
 from discord.ext import commands, tasks
 
-
 # Mapea cada category_id al canal “rooms” correspondiente
 CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
     1371306302671687710: 1371307831176728706,  # pjsk-queue → rooms pjsk-queue
@@ -14,16 +13,28 @@ CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
 
 ROOM_CAPACITY = 5
 
+# Marcador simple para identificar el “mensaje tablero” del bot
+BOARD_MARKER = "Last Update"
+
+# Fases (para que rooms.py pueda renderizar FUTURE correctamente)
+PHASE_FUTURE = "FUTURE"
+PHASE_PREPARED = "PREPARED"
+PHASE_STARTED = "STARTED"
+PHASE_FINISHED = "FINISHED"
+
 
 class Rooms(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # Será un dict: { category_id: discord.Message }
+        # { category_id: discord.Message }
         self.posted_messages: dict[int, discord.Message] = {}
 
-        # Evita que loop + eventos ejecuten _do_update a la vez
+        # Evita condiciones de carrera
         self._update_lock = asyncio.Lock()
+
+        # Coalesce: si llegan muchos eventos, hacemos como máximo 1 update extra al final
+        self._update_pending: bool = False
 
         # Listeners para refrescar al vuelo
         bot.add_listener(self.on_room_updated, "room_updated")
@@ -43,7 +54,7 @@ class Rooms(commands.Cog):
 
     @tasks.loop(seconds=15.0)
     async def update_rooms(self):
-        await self._do_update()
+        await self._request_update()
 
     @update_rooms.before_loop
     async def before_update(self):
@@ -51,12 +62,92 @@ class Rooms(commands.Cog):
 
     async def on_room_updated(self, room_id: int | None = None):
         # Se dispara desde Matchmaking tras /start, /join, /d…
-        await self._do_update()
+        await self._request_update()
 
     async def on_room_finished(self, room_id: int):
         # Tras eliminar una sala vacía
         await asyncio.sleep(1)
-        await self._do_update()
+        await self._request_update()
+
+    async def _request_update(self):
+        """
+        Evita que se encolen muchos updates. Si ya hay uno corriendo, marca pending y sale.
+        El update en curso ejecutará uno extra al finalizar.
+        """
+        if self._update_lock.locked():
+            self._update_pending = True
+            return
+
+        async with self._update_lock:
+            while True:
+                self._update_pending = False
+                await self._do_update_core()
+                if not self._update_pending:
+                    break
+
+    async def _get_text_channel(
+        self,
+        channel_id: int,
+        cache: dict[int, discord.abc.GuildChannel | None] | None = None,
+    ) -> discord.TextChannel | None:
+        """
+        get_channel() depende de caché; fetch_channel() es fallback.
+        Usa cache local por update para no repetir fetches.
+        """
+        if not isinstance(channel_id, int) or channel_id <= 0:
+            return None
+
+        if cache is not None and channel_id in cache:
+            ch = cache[channel_id]
+            return ch if isinstance(ch, discord.TextChannel) else None
+
+        ch = self.bot.get_channel(channel_id)
+        if isinstance(ch, discord.TextChannel):
+            if cache is not None:
+                cache[channel_id] = ch
+            return ch
+
+        try:
+            fetched = await self.bot.fetch_channel(channel_id)
+            if cache is not None:
+                cache[channel_id] = fetched
+            return fetched if isinstance(fetched, discord.TextChannel) else None
+        except Exception:
+            if cache is not None:
+                cache[channel_id] = None
+            return None
+
+    async def _find_last_board_message(self, channel: discord.TextChannel) -> discord.Message | None:
+        """
+        Reutiliza el último mensaje del bot en el canal (para no duplicar mensajes tras reinicios).
+        Requiere permiso de Read Message History.
+        """
+        try:
+            me = channel.guild.me or self.bot.user
+            if me is None:
+                return None
+            async for msg in channel.history(limit=30):
+                if msg.author and msg.author.id == me.id:
+                    # Opcional: filtrar por marcador para evitar editar mensajes del bot no relacionados
+                    if msg.content and BOARD_MARKER in msg.content:
+                        return msg
+            # Si no encontró con marcador, igual intentamos con el último mensaje del bot
+            async for msg in channel.history(limit=30):
+                if msg.author and msg.author.id == me.id:
+                    return msg
+        except Exception:
+            return None
+        return None
+
+    async def _ensure_prev_message(self, cat_id: int, channel: discord.TextChannel):
+        """
+        Si no existe referencia en memoria (reinicio del bot), intenta recuperar un mensaje previo del bot.
+        """
+        if cat_id in self.posted_messages:
+            return
+        prev = await self._find_last_board_message(channel)
+        if prev is not None:
+            self.posted_messages[cat_id] = prev
 
     async def _get_active_season_id(self, mm) -> int | None:
         # intenta reutilizar info del cog Matchmaking si la expone
@@ -91,7 +182,11 @@ class Rooms(commands.Cog):
         return None
 
     async def _fetch_mmrs_batch(
-        self, mm, user_ids: list[int], season_id: int | None, has_pool: bool
+        self,
+        mm,
+        user_ids: list[int],
+        season_id: int | None,
+        has_pool: bool,
     ) -> dict[int, int]:
         """
         Devuelve {user_id: mmr} usando UNA consulta por lote si hay pool+season.
@@ -99,7 +194,7 @@ class Rooms(commands.Cog):
         if not user_ids:
             return {}
 
-        # Dedup para evitar unnest gigante
+        # Dedup conservando orden
         user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
 
         mmr_map: dict[int, int] = {}
@@ -110,11 +205,11 @@ class Rooms(commands.Cog):
                         """
                         WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
                         SELECT u.user_id,
-                            COALESCE(sp.mmr, 0) AS mmr
+                               COALESCE(sp.mmr, 0) AS mmr
                         FROM u
                         LEFT JOIN seasonplayers sp
-                            ON sp.user_id = u.user_id
-                            AND sp.season_id = $2
+                          ON sp.user_id = u.user_id
+                         AND sp.season_id = $2
                         """,
                         user_ids,
                         season_id,
@@ -136,283 +231,306 @@ class Rooms(commands.Cog):
 
         return mmr_map
 
-    def _resolve_users_from_ids(
-        self, guild: discord.Guild, ids: list[int]
-    ) -> list[discord.abc.User]:
+    def _user_label(self, guild: discord.Guild, uid: int) -> str:
         """
-        Mejor esfuerzo: Member si existe, si no User cacheado.
+        Mejor esfuerzo: Member -> User cacheado -> mention por ID.
+        Así NO perdemos jugadores aunque no estén en caché.
         """
-        out: list[discord.abc.User] = []
-        for uid in ids:
-            m = guild.get_member(uid)
-            if m is not None:
-                out.append(m)
-                continue
-            u = self.bot.get_user(uid)
-            if u is not None:
-                out.append(u)
-        return out
+        m = guild.get_member(uid)
+        if m is not None:
+            return m.display_name
+        u = self.bot.get_user(uid)
+        if u is not None:
+            return u.display_name
+        return f"<@{uid}>"
 
-    async def _do_update(self):
-        # Serializa updates para evitar condiciones de carrera
-        async with self._update_lock:
-            try:
-                # 1) Obtener estado actual de Matchmaking
-                mm = self.bot.get_cog("Matchmaking")
-                if mm is None:
-                    return
+    async def _do_update_core(self):
+        try:
+            # 1) Obtener estado actual de Matchmaking
+            mm = self.bot.get_cog("Matchmaking")
+            if mm is None:
+                return
 
-                all_rooms = getattr(mm, "rooms", {}) or {}
-                queues = getattr(mm, "queues", {}) or {}
+            all_rooms = getattr(mm, "rooms", {}) or {}
+            queues = getattr(mm, "queues", {}) or {}
 
-                # 2) Resolver season una sola vez por update
-                season_id = await self._get_active_season_id(mm)
-                has_pool = getattr(mm, "db_pool", None) is not None and bool(season_id)
+            # 2) Resolver season una sola vez por update
+            season_id = await self._get_active_season_id(mm)
+            has_pool = getattr(mm, "db_pool", None) is not None and bool(season_id)
 
-                # 3) Construir mapping category_id -> join_channel_id a partir de mm.queues
-                #    (así distinguimos EN vs JP sin hardcodear IDs)
-                cat_to_join: dict[int, int] = {}
-                for join_id in list(queues.keys()):
-                    ch = self.bot.get_channel(join_id)
-                    if isinstance(ch, discord.TextChannel) and ch.category is not None:
-                        cat_id = ch.category.id
-                        if cat_id in CATEGORY_TO_ROOM_CHANNEL:
-                            cat_to_join[cat_id] = join_id
+            # 3) Construir mapping category_id -> join_channel_id a partir de mm.queues
+            #    (distinguimos EN vs JP sin hardcodear JOIN IDs)
+            ch_cache: dict[int, discord.abc.GuildChannel | None] = {}
+            cat_to_join: dict[int, int] = {}
 
-                # 4) Agrupar rooms por categoría
-                # Cada item: (room_id, pdata[(user, mmr)], avg_mmr, started_bool, started_ts|None, thread_id|None)
-                grouped: dict[
-                    int,
-                    list[
-                        tuple[
-                            int,
-                            list[tuple[discord.abc.User, int]],
-                            int,
-                            bool,
-                            int | None,
-                            int | None,
-                        ]
-                    ],
-                ] = {}
+            for join_id in list(queues.keys()):
+                ch = await self._get_text_channel(join_id, cache=ch_cache)
+                if ch is None or ch.category is None:
+                    continue
+                cat_id = ch.category.id
+                if cat_id in CATEGORY_TO_ROOM_CHANNEL:
+                    cat_to_join[cat_id] = join_id
 
-                # Para minimizar I/O, por cada room seguimos tu estrategia (1 consulta por sala).
-                for rid, info in all_rooms.items():
-                    cat = info.get("category_id")
-                    if cat not in CATEGORY_TO_ROOM_CHANNEL:
-                        continue
+            # 4) Agrupar rooms por categoría
+            # tuple:
+            # (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+            grouped: dict[int, list[tuple]] = {}
 
-                    # ---- players puede venir como Member/User o como IDs (int) ----
-                    raw_players = info.get("players", []) or []
-                    users: list[discord.abc.User] = []
-                    user_ids: list[int] = []
+            for rid, info in all_rooms.items():
+                cat = info.get("category_id")
+                if cat not in CATEGORY_TO_ROOM_CHANNEL:
+                    continue
 
-                    # OJO: aquí no tenemos guild directo; lo obtendremos luego por canal rooms.
-                    # Guardamos IDs y resolvemos users por cache/best effort:
-                    for p in raw_players:
-                        if isinstance(p, (discord.Member, discord.User)):
-                            users.append(p)
-                            user_ids.append(p.id)
-                        elif isinstance(p, int):
-                            u = self.bot.get_user(p)
-                            if u is not None:
-                                users.append(u)
-                            user_ids.append(p)
+                raw_players = info.get("players", []) or []
+                player_ids: list[int] = []
 
-                    # ---- Obtener MMRs con UNA consulta por sala (menos I/O) ----
-                    mmr_map: dict[int, int] = {}
-                    if user_ids:
-                        mmr_map = await self._fetch_mmrs_batch(
-                            mm, user_ids, season_id, has_pool
-                        )
+                for p in raw_players:
+                    if isinstance(p, (discord.Member, discord.User)):
+                        player_ids.append(p.id)
+                    elif isinstance(p, int):
+                        player_ids.append(p)
 
-                    # pdata = [(user, mmr)] ORDENADO por MMR DESC
-                    pdata: list[tuple[discord.abc.User, int]] = [
-                        (u, mmr_map.get(u.id, 0)) for u in users
-                    ]
-                    pdata.sort(key=lambda t: t[1], reverse=True)
+                # dedup conservando orden
+                player_ids = list(dict.fromkeys(player_ids))
 
-                    mmr_vals = [mmr for _, mmr in pdata]
-                    avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+                mmr_map: dict[int, int] = {}
+                if player_ids:
+                    mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool)
 
-                    count = len(pdata)
-                    started_flag = bool(info.get("started")) or (count >= 5)
+                pdata_ids: list[tuple[int, int]] = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
+                pdata_ids.sort(key=lambda t: t[1], reverse=True)
 
-                    started_ts = self._coerce_started_ts(
-                        info.get("started_ts")
-                        or info.get("start_ts")
-                        or info.get("started_at")
-                        or info.get("reached5_ts")
+                mmr_vals = [mmr for _, mmr in pdata_ids]
+                avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+
+                # Fase / scheduling
+                phase = info.get("phase")
+                if isinstance(phase, str):
+                    phase = phase.upper()
+                else:
+                    phase = None
+
+                slot_start_ts = self._coerce_started_ts(info.get("slot_start_ts"))
+                songs_posted = bool(info.get("songs_posted", False))
+
+                # STARTED solo si matchmaking lo marcó explícitamente
+                state = info.get("state")  # opcional: "STARTED"
+                started_flag = (
+                    phase == PHASE_STARTED
+                    or bool(info.get("started"))
+                    or (isinstance(state, str) and state.upper() == PHASE_STARTED)
+                )
+
+                started_ts = self._coerce_started_ts(
+                    info.get("started_ts") or info.get("start_ts") or info.get("started_at")
+                )
+
+                reached5_ts = self._coerce_started_ts(
+                    info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts")
+                )
+
+                thread_id = None
+                raw_thread = info.get("thread")
+                if isinstance(raw_thread, discord.Thread):
+                    thread_id = raw_thread.id
+                else:
+                    tid = info.get("thread_id") or info.get("thread_channel_id")
+                    if isinstance(tid, int) and tid > 0:
+                        thread_id = tid
+
+                grouped.setdefault(cat, []).append(
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
                     )
+                )
 
-                    # Opcional: si Matchmaking guarda thread/canal por sala, lo mostramos
-                    thread_id = None
-                    raw_thread = info.get("thread")
-                    if isinstance(raw_thread, discord.Thread):
-                        thread_id = raw_thread.id
-                    else:
-                        tid = info.get("thread_id") or info.get("thread_channel_id")
-                        if isinstance(tid, int) and tid > 0:
-                            thread_id = tid
+            # helper: truncar si excede 2000 chars
+            def build_content(lines: list[str], now_ts: int) -> str:
+                footer = f"{BOARD_MARKER} <t:{now_ts}:R>"
+                if not lines or not lines[-1].startswith(BOARD_MARKER):
+                    lines = lines + [footer]
 
-                    grouped.setdefault(cat, []).append(
-                        (rid, pdata, avg, started_flag, started_ts, thread_id)
-                    )
+                content = "\n".join(lines)
+                if len(content) <= 1990:
+                    return content
 
-                # helper: truncar si excede 2000 chars
-                def build_content(lines: list[str], now_ts: int) -> str:
-                    footer = f"Last Update <t:{now_ts}:R>"
-                    if not lines or not lines[-1].startswith("Last Update"):
-                        lines = lines + [footer]
+                body = lines[:-1]
+                while body and len("\n".join(body + ["…(truncated)", footer])) > 1990:
+                    body.pop()
 
-                    content = "\n".join(lines)
-                    if len(content) <= 1990:
-                        return content
+                return "\n".join(body + ["…(truncated)", footer])
 
-                    body = lines[:-1]
-                    while (
-                        body and len("\n".join(body + ["…(truncated)", footer])) > 1990
-                    ):
-                        body.pop()
+            # 5) Por cada categoría, editar o enviar mensaje en su canal rooms
+            now_ts = int(time.time())
 
-                    return "\n".join(body + ["…(truncated)", footer])
+            for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
+                channel = await self._get_text_channel(room_chan_id, cache=ch_cache)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
 
-                # 5) Para cada categoría, editar o enviar mensaje en su canal rooms
-                now_ts = int(time.time())
-                for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
-                    channel = self.bot.get_channel(room_chan_id)
-                    if not isinstance(channel, discord.TextChannel):
-                        continue
+                await self._ensure_prev_message(cat_id, channel)
 
-                    guild = channel.guild
+                guild = channel.guild
+                lines: list[str] = []
 
-                    lines: list[str] = []
+                # ---- A) Active rooms ----
+                rooms_list = grouped.get(cat_id, [])
+                if rooms_list:
+                    # Prioridad: STARTED primero, luego FUTURE/SCHEDULED, luego lo demás; dentro por avg desc
+                    def prio(t: tuple) -> int:
+                        started_flag = bool(t[3])
+                        phase = t[7]
+                        if started_flag or phase == PHASE_STARTED:
+                            return 0
+                        if phase == PHASE_FUTURE:
+                            return 1
+                        return 2
 
-                    # ---- A) Active rooms (lo que ya tenías) ----
-                    rooms_list = grouped.get(cat_id, [])
-                    if rooms_list:
-                        rooms_list.sort(
-                            key=lambda x: (-x[2], x[0])
-                        )  # avg desc, rid asc
+                    rooms_list.sort(key=lambda t: (prio(t), -int(t[2]), int(t[0])))
 
-                        for (
-                            rid,
-                            pdata,
-                            avg,
-                            started_flag,
-                            started_ts,
-                            thread_id,
-                        ) in rooms_list:
-                            count = len(pdata)
+                    for (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                    ) in rooms_list:
+                        count = len(pdata_ids)
 
-                            if started_flag:
-                                if isinstance(started_ts, int) and started_ts > 0:
-                                    status = f"[STARTED] <t:{started_ts}:t>"
+                        # Status
+                        if started_flag:
+                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
+                        else:
+                            if phase == PHASE_FUTURE:
+                                if slot_start_ts:
+                                    if songs_posted:
+                                        status = f"[SCHEDULED] songs posted · <t:{slot_start_ts}:t>"
+                                    else:
+                                        status = (
+                                            f"[SCHEDULED] songs at <t:{slot_start_ts}:t> "
+                                            f"(<t:{slot_start_ts}:R>)"
+                                        )
                                 else:
-                                    status = "[STARTED]"
+                                    status = "[SCHEDULED]"
+                            elif phase == PHASE_PREPARED:
+                                # Compat: si por alguna razón usas PREPARED antes de FUTURE
+                                status = "[PREPARED]"
                             else:
-                                status = "[NOT STARTED]"
+                                # Compat con flujos antiguos
+                                if count == ROOM_CAPACITY:
+                                    status = (
+                                        f"[READY 5/5] <t:{reached5_ts}:t>"
+                                        if reached5_ts
+                                        else "[READY 5/5]"
+                                    )
+                                else:
+                                    status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
-                            ref = (
-                                f"<#{thread_id}>"
-                                if isinstance(thread_id, int) and thread_id > 0
-                                else None
-                            )
+                        ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
 
-                            if ref:
-                                lines.append(
-                                    f"**Room {rid} · {ref} · {count}/5 Players · Average MMR {avg} · {status}**"
-                                )
-                            else:
-                                lines.append(
-                                    f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**"
-                                )
-
-                            for user, mmr in pdata:
-                                lines.append(f"- {user.display_name} ({mmr})")
-                            lines.append("")
-                    else:
-                        # No imprimimos todavía "No active rooms" porque ahora habrá queue NO-STARTED
-                        pass
-
-                    # ---- B) Queue NO-STARTED (nuevo) ----
-                    join_id = cat_to_join.get(cat_id)
-                    queue_raw = (
-                        queues.get(join_id, []) if isinstance(join_id, int) else []
-                    )
-
-                    # Normalizar a IDs
-                    queue_ids: list[int] = []
-                    for item in queue_raw or []:
-                        if isinstance(item, int):
-                            queue_ids.append(item)
-                        elif isinstance(item, (discord.Member, discord.User)):
-                            queue_ids.append(item.id)
-
-                    # Construir grupos de 5 (future rooms)
-                    if queue_ids:
-                        # Resolver usuarios best-effort en guild (para display_name)
-                        users_queue = self._resolve_users_from_ids(guild, queue_ids)
-
-                        # Orden: respetar orden de cola, pero necesitamos mmr para imprimir
-                        ids_in_order = [u.id for u in users_queue]
-
-                        mmr_map_q = await self._fetch_mmrs_batch(
-                            mm, ids_in_order, season_id, has_pool
-                        )
-
-                        # Si hay rooms activos arriba, separador
-                        if lines and not lines[-1].strip():
-                            pass
-                        if lines:
-                            lines.append("**Queue (NO-STARTED)**")
-
-                        # Chunks de 5
-                        for idx in range(0, len(users_queue), ROOM_CAPACITY):
-                            grp = users_queue[idx : idx + ROOM_CAPACITY]
-                            grp_mmrs = [mmr_map_q.get(u.id, 0) for u in grp]
-                            avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
-                            count_q = len(grp)
-
-                            room_n = (idx // ROOM_CAPACITY) + 1
+                        if ref:
                             lines.append(
-                                f"**Room Q{room_n} · {count_q}/5 Players · Average MMR {avg_q} · [NO-STARTED]**"
+                                f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
                             )
-                            for u in grp:
-                                lines.append(
-                                    f"- {u.display_name} ({mmr_map_q.get(u.id, 0)})"
-                                )
-                            lines.append("")
-                    else:
-                        # Si no hay active rooms y no hay queue, ahora sí mostramos el mensaje
-                        if not rooms_list:
-                            lines.append("**No active rooms**")
+                        else:
+                            lines.append(
+                                f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
+                            )
 
-                    content = build_content(lines, now_ts)
+                        for uid, mmr in pdata_ids:
+                            lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
+                        lines.append("")
 
-                    prev_msg = self.posted_messages.get(cat_id)
+                # ---- B) Queue ----
+                join_id = cat_to_join.get(cat_id)
+                queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
 
-                    # Si no existe mensaje previo o el canal cambió, mandamos uno nuevo
-                    if prev_msg is None or prev_msg.channel.id != room_chan_id:
+                queue_ids: list[int] = []
+                for item in (queue_raw or []):
+                    if isinstance(item, int):
+                        queue_ids.append(item)
+                    elif isinstance(item, (discord.Member, discord.User)):
+                        queue_ids.append(item.id)
+
+                queue_ids = list(dict.fromkeys(queue_ids))
+
+                if queue_ids:
+                    mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
+
+                    # Separador visual si venimos de rooms activos
+                    if lines and lines[-1].strip() != "":
+                        lines.append("")
+
+                    lines.append("**Queue**")
+
+                    for idx in range(0, len(queue_ids), ROOM_CAPACITY):
+                        grp_ids = queue_ids[idx : idx + ROOM_CAPACITY]
+                        grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
+                        avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
+                        count_q = len(grp_ids)
+
+                        q_status = (
+                            "[READY 5/5]"
+                            if count_q == ROOM_CAPACITY
+                            else f"[WAITING {count_q}/{ROOM_CAPACITY}]"
+                        )
+                        group_n = (idx // ROOM_CAPACITY) + 1
+
+                        lines.append(
+                            f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**"
+                        )
+                        for uid in grp_ids:
+                            lines.append(f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})")
+                        lines.append("")
+                else:
+                    # Si no hay active rooms y no hay queue
+                    if not rooms_list:
+                        lines.append("**No active rooms**")
+
+                content = build_content(lines, now_ts)
+
+                prev_msg = self.posted_messages.get(cat_id)
+
+                # Si no existe mensaje previo o el canal cambió, mandamos uno nuevo
+                if prev_msg is None or prev_msg.channel.id != channel.id:
+                    try:
+                        msg = await channel.send(content)
+                        self.posted_messages[cat_id] = msg
+                    except discord.Forbidden:
+                        continue
+                    except discord.HTTPException:
+                        continue
+                    continue
+
+                # Si existe, intentamos editar; si fue borrado, re-crear
+                if prev_msg.content != content:
+                    try:
+                        await prev_msg.edit(content=content)
+                    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
                         try:
                             msg = await channel.send(content)
+                            self.posted_messages[cat_id] = msg
                         except discord.Forbidden:
-                            continue
-                        self.posted_messages[cat_id] = msg
-                        continue
+                            pass
+                        except discord.HTTPException:
+                            pass
 
-                    # Si existe, intentamos editar; si fue borrado, re-crear
-                    if prev_msg.content != content:
-                        try:
-                            await prev_msg.edit(content=content)
-                        except (discord.NotFound, discord.HTTPException):
-                            try:
-                                msg = await channel.send(content)
-                                self.posted_messages[cat_id] = msg
-                            except discord.Forbidden:
-                                pass
-
-            except Exception as e:
-                print(f"[Rooms] Error en _do_update: {e}")
+        except Exception as e:
+            print(f"[Rooms] Error en _do_update: {e}")
 
 
 async def setup(bot: commands.Bot):
