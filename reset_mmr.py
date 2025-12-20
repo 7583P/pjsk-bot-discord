@@ -3,7 +3,8 @@
 import aiosqlite
 import asyncio
 
-DB_PATH = 'matchmaking.db'
+DB_PATH = "matchmaking.db"
+
 
 async def reset_all():
     # Conecta a la base de datos
@@ -13,6 +14,7 @@ async def reset_all():
     await db.commit()
     await db.close()
     print("✅ Todos los jugadores han sido reseteados a Placement con MMR=0")
+
 
 if __name__ == "__main__":
     asyncio.run(reset_all())

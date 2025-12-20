@@ -90,7 +90,9 @@ class Rooms(commands.Cog):
                 return None
         return None
 
-    async def _fetch_mmrs_batch(self, mm, user_ids: list[int], season_id: int | None, has_pool: bool) -> dict[int, int]:
+    async def _fetch_mmrs_batch(
+        self, mm, user_ids: list[int], season_id: int | None, has_pool: bool
+    ) -> dict[int, int]:
         """
         Devuelve {user_id: mmr} usando UNA consulta por lote si hay pool+season.
         """
@@ -134,7 +136,9 @@ class Rooms(commands.Cog):
 
         return mmr_map
 
-    def _resolve_users_from_ids(self, guild: discord.Guild, ids: list[int]) -> list[discord.abc.User]:
+    def _resolve_users_from_ids(
+        self, guild: discord.Guild, ids: list[int]
+    ) -> list[discord.abc.User]:
         """
         Mejor esfuerzo: Member si existe, si no User cacheado.
         """
@@ -179,7 +183,16 @@ class Rooms(commands.Cog):
                 # Cada item: (room_id, pdata[(user, mmr)], avg_mmr, started_bool, started_ts|None, thread_id|None)
                 grouped: dict[
                     int,
-                    list[tuple[int, list[tuple[discord.abc.User, int]], int, bool, int | None, int | None]],
+                    list[
+                        tuple[
+                            int,
+                            list[tuple[discord.abc.User, int]],
+                            int,
+                            bool,
+                            int | None,
+                            int | None,
+                        ]
+                    ],
                 ] = {}
 
                 # Para minimizar I/O, por cada room seguimos tu estrategia (1 consulta por sala).
@@ -208,10 +221,14 @@ class Rooms(commands.Cog):
                     # ---- Obtener MMRs con UNA consulta por sala (menos I/O) ----
                     mmr_map: dict[int, int] = {}
                     if user_ids:
-                        mmr_map = await self._fetch_mmrs_batch(mm, user_ids, season_id, has_pool)
+                        mmr_map = await self._fetch_mmrs_batch(
+                            mm, user_ids, season_id, has_pool
+                        )
 
                     # pdata = [(user, mmr)] ORDENADO por MMR DESC
-                    pdata: list[tuple[discord.abc.User, int]] = [(u, mmr_map.get(u.id, 0)) for u in users]
+                    pdata: list[tuple[discord.abc.User, int]] = [
+                        (u, mmr_map.get(u.id, 0)) for u in users
+                    ]
                     pdata.sort(key=lambda t: t[1], reverse=True)
 
                     mmr_vals = [mmr for _, mmr in pdata]
@@ -237,7 +254,9 @@ class Rooms(commands.Cog):
                         if isinstance(tid, int) and tid > 0:
                             thread_id = tid
 
-                    grouped.setdefault(cat, []).append((rid, pdata, avg, started_flag, started_ts, thread_id))
+                    grouped.setdefault(cat, []).append(
+                        (rid, pdata, avg, started_flag, started_ts, thread_id)
+                    )
 
                 # helper: truncar si excede 2000 chars
                 def build_content(lines: list[str], now_ts: int) -> str:
@@ -250,7 +269,9 @@ class Rooms(commands.Cog):
                         return content
 
                     body = lines[:-1]
-                    while body and len("\n".join(body + ["…(truncated)", footer])) > 1990:
+                    while (
+                        body and len("\n".join(body + ["…(truncated)", footer])) > 1990
+                    ):
                         body.pop()
 
                     return "\n".join(body + ["…(truncated)", footer])
@@ -269,9 +290,18 @@ class Rooms(commands.Cog):
                     # ---- A) Active rooms (lo que ya tenías) ----
                     rooms_list = grouped.get(cat_id, [])
                     if rooms_list:
-                        rooms_list.sort(key=lambda x: (-x[2], x[0]))  # avg desc, rid asc
+                        rooms_list.sort(
+                            key=lambda x: (-x[2], x[0])
+                        )  # avg desc, rid asc
 
-                        for rid, pdata, avg, started_flag, started_ts, thread_id in rooms_list:
+                        for (
+                            rid,
+                            pdata,
+                            avg,
+                            started_flag,
+                            started_ts,
+                            thread_id,
+                        ) in rooms_list:
                             count = len(pdata)
 
                             if started_flag:
@@ -282,14 +312,20 @@ class Rooms(commands.Cog):
                             else:
                                 status = "[NOT STARTED]"
 
-                            ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
+                            ref = (
+                                f"<#{thread_id}>"
+                                if isinstance(thread_id, int) and thread_id > 0
+                                else None
+                            )
 
                             if ref:
                                 lines.append(
                                     f"**Room {rid} · {ref} · {count}/5 Players · Average MMR {avg} · {status}**"
                                 )
                             else:
-                                lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**")
+                                lines.append(
+                                    f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**"
+                                )
 
                             for user, mmr in pdata:
                                 lines.append(f"- {user.display_name} ({mmr})")
@@ -300,11 +336,13 @@ class Rooms(commands.Cog):
 
                     # ---- B) Queue NO-STARTED (nuevo) ----
                     join_id = cat_to_join.get(cat_id)
-                    queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
+                    queue_raw = (
+                        queues.get(join_id, []) if isinstance(join_id, int) else []
+                    )
 
                     # Normalizar a IDs
                     queue_ids: list[int] = []
-                    for item in (queue_raw or []):
+                    for item in queue_raw or []:
                         if isinstance(item, int):
                             queue_ids.append(item)
                         elif isinstance(item, (discord.Member, discord.User)):
@@ -318,7 +356,9 @@ class Rooms(commands.Cog):
                         # Orden: respetar orden de cola, pero necesitamos mmr para imprimir
                         ids_in_order = [u.id for u in users_queue]
 
-                        mmr_map_q = await self._fetch_mmrs_batch(mm, ids_in_order, season_id, has_pool)
+                        mmr_map_q = await self._fetch_mmrs_batch(
+                            mm, ids_in_order, season_id, has_pool
+                        )
 
                         # Si hay rooms activos arriba, separador
                         if lines and not lines[-1].strip():
@@ -328,15 +368,19 @@ class Rooms(commands.Cog):
 
                         # Chunks de 5
                         for idx in range(0, len(users_queue), ROOM_CAPACITY):
-                            grp = users_queue[idx: idx + ROOM_CAPACITY]
+                            grp = users_queue[idx : idx + ROOM_CAPACITY]
                             grp_mmrs = [mmr_map_q.get(u.id, 0) for u in grp]
                             avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
                             count_q = len(grp)
 
                             room_n = (idx // ROOM_CAPACITY) + 1
-                            lines.append(f"**Room Q{room_n} · {count_q}/5 Players · Average MMR {avg_q} · [NO-STARTED]**")
+                            lines.append(
+                                f"**Room Q{room_n} · {count_q}/5 Players · Average MMR {avg_q} · [NO-STARTED]**"
+                            )
                             for u in grp:
-                                lines.append(f"- {u.display_name} ({mmr_map_q.get(u.id, 0)})")
+                                lines.append(
+                                    f"- {u.display_name} ({mmr_map_q.get(u.id, 0)})"
+                                )
                             lines.append("")
                     else:
                         # Si no hay active rooms y no hay queue, ahora sí mostramos el mensaje

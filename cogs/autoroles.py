@@ -6,6 +6,7 @@ from discord.ext import commands
 DATABASE_URL = os.getenv("DB_HOST")  # e.g. "postgresql://user:pass@host:5432/dbname"
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
+
 class AutoRoles(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -75,7 +76,8 @@ class AutoRoles(commands.Cog):
                     FROM seasonplayers sp
                     WHERE sp.user_id = $1 AND sp.season_id = $2
                     """,
-                    user_id, season_id,
+                    user_id,
+                    season_id,
                 )
 
                 if row:
@@ -89,7 +91,8 @@ class AutoRoles(commands.Cog):
                     ON CONFLICT (user_id, season_id) DO NOTHING
                     RETURNING mmr, role
                     """,
-                    user_id, season_id,
+                    user_id,
+                    season_id,
                 )
 
                 if row is None:
@@ -100,7 +103,8 @@ class AutoRoles(commands.Cog):
                         FROM seasonplayers sp
                         WHERE sp.user_id = $1 AND sp.season_id = $2
                         """,
-                        user_id, season_id,
+                        user_id,
+                        season_id,
                     )
 
                 return ((row["mmr"] or 0), (row["role"] or "Placement"))
@@ -119,7 +123,9 @@ class AutoRoles(commands.Cog):
 
             role = discord.utils.get(member.guild.roles, name=role_name)
             if not role:
-                print(f"[AutoRoles] ❌ Role '{role_name}' not found in {member.guild.name}")
+                print(
+                    f"[AutoRoles] ❌ Role '{role_name}' not found in {member.guild.name}"
+                )
                 return
 
             await member.add_roles(role, reason="Asignación automática al unirse")
@@ -127,6 +133,7 @@ class AutoRoles(commands.Cog):
 
         except Exception as e:
             print(f"[AutoRoles] ❌ Excepción en on_member_join: {e}")
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AutoRoles(bot))

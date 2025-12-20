@@ -39,7 +39,8 @@ level_colors = {
     "Easy": ("#65DC10", "#65DC10"),
 }
 
-def strip_unsupported_chars(text: str, font_path: str|Path) -> str:
+
+def strip_unsupported_chars(text: str, font_path: str | Path) -> str:
     font = TTFont(font_path)
 
     # Collect all Unicode → glyph maps
@@ -53,6 +54,7 @@ def strip_unsupported_chars(text: str, font_path: str|Path) -> str:
     filtered = "".join(ch for ch in text if supported(ch))
 
     return filtered.strip()
+
 
 def add_stroke(img, stroke_width=4, stroke_color=(0, 0, 0, 255)):
     img = img.convert("RGBA")
@@ -146,6 +148,7 @@ def make_gradient_text_image(
     out.paste(gradient, (0, 0), mask)
 
     return out
+
 
 def generate_results_image(
     summary_rows: List[tuple],
@@ -258,7 +261,7 @@ def generate_results_image(
         mmr_delta,
         mmr_new,
         was_placement,
-        rank_name
+        rank_name,
     ) in enumerate(summary_rows):
 
         y = ROW_START_Ys[i]
