@@ -801,33 +801,27 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
-    async def _announce_next_queue_windows_on_00(
-        self,
-        join_channel: discord.TextChannel,
-        now: dt.datetime
-    ):
-        """
-        Al llegar al slot (p.ej. :00), postea timestamps de cuánto falta para :55, :15, :35.
-        (Se calculan como 'próxima ocurrencia' desde now.)
-        """
-        t55 = self._next_occurrence_of_minute(now, 55)
-        t15 = self._next_occurrence_of_minute(now, 15)
-        t35 = self._next_occurrence_of_minute(now, 35)
+    async def _announce_next_queue_windows_on_00(self, join_channel, now):
+        # Próximos PREP windows típicos: :15, :35, :55
+        candidates = [
+            (15, self._next_occurrence_of_minute(now, 15)),
+            (35, self._next_occurrence_of_minute(now, 35)),
+            (55, self._next_occurrence_of_minute(now, 55)),
+        ]
+        candidates.sort(key=lambda x: x[1])  # orden por datetime (lo más cercano primero)
 
-        ts55 = int(t55.timestamp())
-        ts15 = int(t15.timestamp())
-        ts35 = int(t35.timestamp())
+        lines = ["A queue will be starting at:"]
+        for minute, t in candidates:
+            ts = int(t.timestamp())
+            lines.append(f"• **:{minute:02d}** → <t:{ts}:R>")
+
+        lines.append("Type `/c` for join the queue or `/d` to drop the queue.")
 
         try:
-            await join_channel.send(
-                "A queue will be starting at:\n"
-                f"• **:55** → <t:{ts55}:R>\n"
-                f"• **:15** → <t:{ts15}:R>\n"
-                f"• **:35** → <t:{ts35}:R>\n"
-                "Type `/c` for join or `/d` to drop the queue."
-            )
+            await join_channel.send("\n".join(lines))
         except Exception:
             pass
+
 
 
     def _window_start_minute(self, minute: int, windows: tuple[tuple[int,int], ...]) -> int | None:
@@ -2157,6 +2151,7 @@ class Matchmaking(commands.Cog):
         self.rooms: dict[int, dict] = {}
         self._sched_last_minute = {}   # parent_id -> minute_ts
         self._sched_last_slot   = {}   # parent_id -> (y,m,d,hm)
+        
 
 
     def _need_players_window(self, dt_local: datetime) -> bool:
@@ -2205,16 +2200,22 @@ class Matchmaking(commands.Cog):
                 # ---------- START (ventana :x0..:x4) ----------
                 start_base = self._in_start_window(now)
                 if start_base is not None:
-                    minute_key = (now.year, now.month, now.day, now.hour, now.minute)
-                    last_min = self._sched_last_minute.get(join_id)
-                    if last_min != minute_key:
-                        self._sched_last_minute[join_id] = minute_key
+                    # Ejecutar 1 vez por slot (00 / 20 / 40) por canal
+                    slot_key = (now.year, now.month, now.day, now.hour, start_base)
+                    if self._sched_last_slot.get(join_id) != slot_key:
+                        self._sched_last_slot[join_id] = slot_key
 
-                        # slot exacto (00/20/40) de ESTA hora
                         slot_dt = now.replace(second=0, microsecond=0, minute=start_base)
                         slot_ts = int(slot_dt.timestamp())
 
+                        # (1) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
+                        await self._purge_unfilled_queue_on_slot(guild, join_channel, now)
+
+                        # (2) START: inicia rooms FUTURE programadas para este slot
                         await self._start_future_rooms_for_slot(join_id, slot_ts)
+
+                        # (3) ANNOUNCE: publica los próximos horarios (con timestamps)
+                        await self._announce_next_queue_windows_on_00(join_channel, now)
 
 
 
@@ -4305,6 +4306,7 @@ class Matchmaking(commands.Cog):
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
  #ed
+
 
 
 
