@@ -8,3 +8,5 @@ fastapi
 httpx
 beautifulsoup4
 html5lib
+fonttools
+pillow

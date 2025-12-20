@@ -1,5 +1,4 @@
-import os
-import re
+import os, io, re
 import random
 import asyncio
 import datetime
@@ -14,6 +13,9 @@ from discord import Thread, TextChannel, MessageType
 from discord.ext import commands, tasks   # loops periódicos
 from discord.ui import View, button
 from zoneinfo import ZoneInfo
+
+from helpers.image import generate_results_image
+from PIL import Image
 
 
 log = logging.getLogger(__name__)
@@ -694,10 +696,10 @@ class Matchmaking(commands.Cog):
     START_MINUTES = (0, 20, 40)
 
     def _is_prepare_minute(self, dt: datetime) -> bool:
-        return dt.minute in PREP_MINUTES
+        return dt.minute in self.PREP_MINUTES
 
     def _is_start_minute(self, dt: datetime) -> bool:
-        return dt.minute in START_MINUTES
+        return dt.minute in self.START_MINUTES
 
 
     def _slot_key(self, dt: datetime) -> tuple[int,int,int,int]:
@@ -3532,7 +3534,52 @@ class Matchmaking(commands.Cog):
         except discord.InteractionResponded:
             await interaction.followup.send("✅ Forfeit confirmed. Room will be closed.", ephemeral=True)
 
+    @commands.command(name="calc", aliases=["calculate"])
+    async def calc(self, ctx: commands.Context):
+        room = next((r for r in self.rooms.values() if r.get("thread") and r["thread"].id == ctx.channel.id), None)
+        if not room:
+            return await ctx.send("Only works inside a room thread")
 
+        # ⛔ sala ya finalizada
+        if room.get("finished", False):
+            return await ctx.send("this room has been submited results")
+
+        # ⛔ votación en curso
+        if room.get("vote_in_progress", False):
+            return await ctx.send("There is already a submit vote in progress in this room.")
+
+        # Deben haberse seleccionado canciones (started=True)
+        if room.get("started") is False:
+            return await ctx.send(
+                "Songs have not been selected yet. "
+                "The room starts on the scheduled slot when it reaches 5 players."
+            )
+
+        lines = ctx.message.content.splitlines()
+
+        # remove the command itself (!calc)
+        lines = lines[1:]
+
+        if len(lines) != 5:
+            await ctx.send("Format:\n!calc\n(row x5))")
+            return
+
+        rows = lines[:-1]
+
+        greats = goods = bads = misses = 0
+
+        for row in rows:
+            g, gd, b, m = map(int, row.split())
+            greats += g
+            goods += gd
+            bads += b
+            misses += m
+
+        perfects = room.get("total_notes") - (greats + goods + bads + misses)
+
+        await ctx.send(
+            f"{perfects},{greats},{goods},{bads},{misses}"
+        )
 
     @commands.command(name="submit")
     async def submit(self, ctx: commands.Context, *, block: str):
@@ -3817,10 +3864,9 @@ class Matchmaking(commands.Cog):
                     except (discord.Forbidden, discord.HTTPException) as e:
                         await ctx.send(f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}")
 
-                pos_str = medals.get(idx) or f"{idx}."
                 name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append(
-                    (pos_str, name_with_flag, p["total"], p["stats"], mmr_prev, mmr_delta, mmr_final, p["was_placement"])
+                    (idx, name_with_flag, p["total"], p["stats"], mmr_prev, mmr_delta, mmr_final, p["was_placement"], get_rank_from_mmr(mmr_prev))
                 )
 
             # PUBLICAR RESULTADOS
@@ -3841,8 +3887,6 @@ class Matchmaking(commands.Cog):
                     [(result_id, title, lvl, diff, notes) for (title, lvl, diff, notes) in songs]
                 )
 
-            board_block = self._format_results_board(summary)
-
             gap_text = ""
             if gap_low is not None and gap_high is not None:
                 gap_text = f" · Lv {gap_low}-{gap_high}"
@@ -3856,14 +3900,21 @@ class Matchmaking(commands.Cog):
 
             header_line = f"ID: {result_id}{gap_text}{songs_block}"
 
+            buf = generate_results_image(
+                summary,
+                font_path="assets/rodinntlg_eb.otf",
+                side_image=Image.open("assets/logo.png"),
+            )
+            image_bytes = buf.read()
+
             embed = discord.Embed(
                 title=f"RESULTS — {season_name}",
-                description=header_line + "\n" + board_block,
-                color=0x00f7ff,
-            )
+                description=header_line,
+                color=0x00f7ff
+            ).set_image(url="attachment://results.png")
 
-            msg_result = await result_chan.send(embed=embed)
-            await ctx.send(embed=embed)
+            msg_result = await result_chan.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), "results.png"))
+            await ctx.send(embed=embed, file=discord.File(io.BytesIO(image_bytes), "results.png"))
             await result_chan.send("MMR Updated")
             await ctx.send("MMR Updated")
 
