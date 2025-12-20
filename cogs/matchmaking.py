@@ -1513,7 +1513,7 @@ class Matchmaking(commands.Cog):
             "finished": False,
             "created_ts": int(self._now_lima().timestamp()),
         }
-        rid = self._next_room_id()
+        rid = max(self.rooms.keys(), default=0) + 1
         self.rooms[rid] = info
         return rid, info
 
