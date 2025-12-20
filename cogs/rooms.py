@@ -90,14 +90,20 @@ class Rooms(commands.Cog):
                 return None
         return None
 
-    async def _fetch_mmrs_batch(self, mm, user_ids: list[int], season_id: int | None, has_pool: bool) -> dict[int, int]:
+    async def _fetch_mmrs_batch(
+        self,
+        mm,
+        user_ids: list[int],
+        season_id: int | None,
+        has_pool: bool,
+    ) -> dict[int, int]:
         """
         Devuelve {user_id: mmr} usando UNA consulta por lote si hay pool+season.
         """
         if not user_ids:
             return {}
 
-        # Dedup para evitar unnest gigante
+        # Dedup conservando orden para evitar unnest gigante + mantener consistencia visual
         user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
 
         mmr_map: dict[int, int] = {}
@@ -108,11 +114,11 @@ class Rooms(commands.Cog):
                         """
                         WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
                         SELECT u.user_id,
-                            COALESCE(sp.mmr, 0) AS mmr
+                               COALESCE(sp.mmr, 0) AS mmr
                         FROM u
                         LEFT JOIN seasonplayers sp
-                            ON sp.user_id = u.user_id
-                            AND sp.season_id = $2
+                          ON sp.user_id = u.user_id
+                         AND sp.season_id = $2
                         """,
                         user_ids,
                         season_id,
@@ -134,20 +140,18 @@ class Rooms(commands.Cog):
 
         return mmr_map
 
-    def _resolve_users_from_ids(self, guild: discord.Guild, ids: list[int]) -> list[discord.abc.User]:
+    def _user_label(self, guild: discord.Guild, uid: int) -> str:
         """
-        Mejor esfuerzo: Member si existe, si no User cacheado.
+        Mejor esfuerzo: Member -> User cacheado -> mention por ID.
+        Así NO perdemos jugadores aunque no estén en caché.
         """
-        out: list[discord.abc.User] = []
-        for uid in ids:
-            m = guild.get_member(uid)
-            if m is not None:
-                out.append(m)
-                continue
-            u = self.bot.get_user(uid)
-            if u is not None:
-                out.append(u)
-        return out
+        m = guild.get_member(uid)
+        if m is not None:
+            return m.display_name
+        u = self.bot.get_user(uid)
+        if u is not None:
+            return u.display_name
+        return f"<@{uid}>"
 
     async def _do_update(self):
         # Serializa updates para evitar condiciones de carrera
@@ -176,58 +180,67 @@ class Rooms(commands.Cog):
                             cat_to_join[cat_id] = join_id
 
                 # 4) Agrupar rooms por categoría
-                # Cada item: (room_id, pdata[(user, mmr)], avg_mmr, started_bool, started_ts|None, thread_id|None)
+                # Cada item: (room_id, pdata_ids[(uid, mmr)], avg_mmr, started_bool, started_ts|None, reached5_ts|None, thread_id|None)
                 grouped: dict[
                     int,
-                    list[tuple[int, list[tuple[discord.abc.User, int]], int, bool, int | None, int | None]],
+                    list[
+                        tuple[
+                            int,
+                            list[tuple[int, int]],
+                            int,
+                            bool,
+                            int | None,
+                            int | None,
+                            int | None,
+                        ]
+                    ],
                 ] = {}
 
-                # Para minimizar I/O, por cada room seguimos tu estrategia (1 consulta por sala).
                 for rid, info in all_rooms.items():
                     cat = info.get("category_id")
                     if cat not in CATEGORY_TO_ROOM_CHANNEL:
                         continue
 
-                    # ---- players puede venir como Member/User o como IDs (int) ----
                     raw_players = info.get("players", []) or []
-                    users: list[discord.abc.User] = []
-                    user_ids: list[int] = []
+                    player_ids: list[int] = []
 
-                    # OJO: aquí no tenemos guild directo; lo obtendremos luego por canal rooms.
-                    # Guardamos IDs y resolvemos users por cache/best effort:
                     for p in raw_players:
                         if isinstance(p, (discord.Member, discord.User)):
-                            users.append(p)
-                            user_ids.append(p.id)
+                            player_ids.append(p.id)
                         elif isinstance(p, int):
-                            u = self.bot.get_user(p)
-                            if u is not None:
-                                users.append(u)
-                            user_ids.append(p)
+                            player_ids.append(p)
 
-                    # ---- Obtener MMRs con UNA consulta por sala (menos I/O) ----
+                    # dedup conservando orden
+                    player_ids = list(dict.fromkeys(player_ids))
+
                     mmr_map: dict[int, int] = {}
-                    if user_ids:
-                        mmr_map = await self._fetch_mmrs_batch(mm, user_ids, season_id, has_pool)
+                    if player_ids:
+                        mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool)
 
-                    # pdata = [(user, mmr)] ORDENADO por MMR DESC
-                    pdata: list[tuple[discord.abc.User, int]] = [(u, mmr_map.get(u.id, 0)) for u in users]
-                    pdata.sort(key=lambda t: t[1], reverse=True)
+                    pdata_ids: list[tuple[int, int]] = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
+                    pdata_ids.sort(key=lambda t: t[1], reverse=True)
 
-                    mmr_vals = [mmr for _, mmr in pdata]
+                    mmr_vals = [mmr for _, mmr in pdata_ids]
                     avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
 
-                    count = len(pdata)
-                    started_flag = bool(info.get("started")) or (count >= 5)
+                    count = len(player_ids)
 
-                    started_ts = self._coerce_started_ts(
-                        info.get("started_ts")
-                        or info.get("start_ts")
-                        or info.get("started_at")
-                        or info.get("reached5_ts")
+                    # IMPORTANT: STARTED solo si matchmaking lo marcó explícitamente.
+                    state = info.get("state")  # opcional: "STARTED"
+                    started_flag = bool(info.get("started")) or (
+                        isinstance(state, str) and state.upper() == "STARTED"
                     )
 
-                    # Opcional: si Matchmaking guarda thread/canal por sala, lo mostramos
+                    # started_ts: momento real de inicio
+                    started_ts = self._coerce_started_ts(
+                        info.get("started_ts") or info.get("start_ts") or info.get("started_at")
+                    )
+
+                    # reached5_ts: momento en que llegó a 5/5 (READY)
+                    reached5_ts = self._coerce_started_ts(
+                        info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts")
+                    )
+
                     thread_id = None
                     raw_thread = info.get("thread")
                     if isinstance(raw_thread, discord.Thread):
@@ -237,7 +250,9 @@ class Rooms(commands.Cog):
                         if isinstance(tid, int) and tid > 0:
                             thread_id = tid
 
-                    grouped.setdefault(cat, []).append((rid, pdata, avg, started_flag, started_ts, thread_id))
+                    grouped.setdefault(cat, []).append(
+                        (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id)
+                    )
 
                 # helper: truncar si excede 2000 chars
                 def build_content(lines: list[str], now_ts: int) -> str:
@@ -266,43 +281,41 @@ class Rooms(commands.Cog):
 
                     lines: list[str] = []
 
-                    # ---- A) Active rooms (lo que ya tenías) ----
+                    # ---- A) Active rooms ----
                     rooms_list = grouped.get(cat_id, [])
                     if rooms_list:
                         rooms_list.sort(key=lambda x: (-x[2], x[0]))  # avg desc, rid asc
 
-                        for rid, pdata, avg, started_flag, started_ts, thread_id in rooms_list:
-                            count = len(pdata)
+                        for rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id in rooms_list:
+                            count = len(pdata_ids)
 
                             if started_flag:
-                                if isinstance(started_ts, int) and started_ts > 0:
-                                    status = f"[STARTED] <t:{started_ts}:t>"
-                                else:
-                                    status = "[STARTED]"
+                                status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
                             else:
-                                status = "[NOT STARTED]"
+                                if count == ROOM_CAPACITY:
+                                    status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
+                                else:
+                                    status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
                             ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
 
                             if ref:
                                 lines.append(
-                                    f"**Room {rid} · {ref} · {count}/5 Players · Average MMR {avg} · {status}**"
+                                    f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
                                 )
                             else:
-                                lines.append(f"**Room {rid} · {count}/5 Players · Average MMR {avg} · {status}**")
+                                lines.append(
+                                    f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
+                                )
 
-                            for user, mmr in pdata:
-                                lines.append(f"- {user.display_name} ({mmr})")
+                            for uid, mmr in pdata_ids:
+                                lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
                             lines.append("")
-                    else:
-                        # No imprimimos todavía "No active rooms" porque ahora habrá queue NO-STARTED
-                        pass
 
-                    # ---- B) Queue NO-STARTED (nuevo) ----
+                    # ---- B) Queue ----
                     join_id = cat_to_join.get(cat_id)
                     queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
 
-                    # Normalizar a IDs
                     queue_ids: list[int] = []
                     for item in (queue_raw or []):
                         if isinstance(item, int):
@@ -310,36 +323,37 @@ class Rooms(commands.Cog):
                         elif isinstance(item, (discord.Member, discord.User)):
                             queue_ids.append(item.id)
 
-                    # Construir grupos de 5 (future rooms)
+                    # dedup conservando orden
+                    queue_ids = list(dict.fromkeys(queue_ids))
+
                     if queue_ids:
-                        # Resolver usuarios best-effort en guild (para display_name)
-                        users_queue = self._resolve_users_from_ids(guild, queue_ids)
+                        mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
 
-                        # Orden: respetar orden de cola, pero necesitamos mmr para imprimir
-                        ids_in_order = [u.id for u in users_queue]
-
-                        mmr_map_q = await self._fetch_mmrs_batch(mm, ids_in_order, season_id, has_pool)
-
-                        # Si hay rooms activos arriba, separador
-                        if lines and not lines[-1].strip():
+                        # Separador visual si venimos de rooms activos
+                        if lines and lines[-1].strip() != "":
+                            lines.append("")
+                        if lines and lines[-1].strip() == "":
                             pass
-                        if lines:
-                            lines.append("**Queue (NO-STARTED)**")
 
-                        # Chunks de 5
-                        for idx in range(0, len(users_queue), ROOM_CAPACITY):
-                            grp = users_queue[idx: idx + ROOM_CAPACITY]
-                            grp_mmrs = [mmr_map_q.get(u.id, 0) for u in grp]
+                        lines.append("**Queue**")
+
+                        for idx in range(0, len(queue_ids), ROOM_CAPACITY):
+                            grp_ids = queue_ids[idx : idx + ROOM_CAPACITY]
+                            grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
                             avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
-                            count_q = len(grp)
+                            count_q = len(grp_ids)
 
-                            room_n = (idx // ROOM_CAPACITY) + 1
-                            lines.append(f"**Room Q{room_n} · {count_q}/5 Players · Average MMR {avg_q} · [NO-STARTED]**")
-                            for u in grp:
-                                lines.append(f"- {u.display_name} ({mmr_map_q.get(u.id, 0)})")
+                            q_status = "[READY 5/5]" if count_q == ROOM_CAPACITY else f"[WAITING {count_q}/{ROOM_CAPACITY}]"
+                            group_n = (idx // ROOM_CAPACITY) + 1
+
+                            lines.append(
+                                f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**"
+                            )
+                            for uid in grp_ids:
+                                lines.append(f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})")
                             lines.append("")
                     else:
-                        # Si no hay active rooms y no hay queue, ahora sí mostramos el mensaje
+                        # Si no hay active rooms y no hay queue
                         if not rooms_list:
                             lines.append("**No active rooms**")
 
