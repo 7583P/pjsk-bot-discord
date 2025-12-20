@@ -1,4 +1,4 @@
-# cogs/rooms.pyy
+# cogs/rooms.py
 
 import time
 import asyncio
@@ -15,6 +15,12 @@ ROOM_CAPACITY = 5
 
 # Marcador simple para identificar el “mensaje tablero” del bot
 BOARD_MARKER = "Last Update"
+
+# Fases (para que rooms.py pueda renderizar FUTURE correctamente)
+PHASE_FUTURE = "FUTURE"
+PHASE_PREPARED = "PREPARED"
+PHASE_STARTED = "STARTED"
+PHASE_FINISHED = "FINISHED"
 
 
 class Rooms(commands.Cog):
@@ -266,20 +272,9 @@ class Rooms(commands.Cog):
                     cat_to_join[cat_id] = join_id
 
             # 4) Agrupar rooms por categoría
-            grouped: dict[
-                int,
-                list[
-                    tuple[
-                        int,
-                        list[tuple[int, int]],
-                        int,
-                        bool,
-                        int | None,
-                        int | None,
-                        int | None,
-                    ]
-                ],
-            ] = {}
+            # tuple:
+            # (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+            grouped: dict[int, list[tuple]] = {}
 
             for rid, info in all_rooms.items():
                 cat = info.get("category_id")
@@ -308,12 +303,22 @@ class Rooms(commands.Cog):
                 mmr_vals = [mmr for _, mmr in pdata_ids]
                 avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
 
-                count = len(player_ids)
+                # Fase / scheduling
+                phase = info.get("phase")
+                if isinstance(phase, str):
+                    phase = phase.upper()
+                else:
+                    phase = None
+
+                slot_start_ts = self._coerce_started_ts(info.get("slot_start_ts"))
+                songs_posted = bool(info.get("songs_posted", False))
 
                 # STARTED solo si matchmaking lo marcó explícitamente
                 state = info.get("state")  # opcional: "STARTED"
-                started_flag = bool(info.get("started")) or (
-                    isinstance(state, str) and state.upper() == "STARTED"
+                started_flag = (
+                    phase == PHASE_STARTED
+                    or bool(info.get("started"))
+                    or (isinstance(state, str) and state.upper() == PHASE_STARTED)
                 )
 
                 started_ts = self._coerce_started_ts(
@@ -334,7 +339,18 @@ class Rooms(commands.Cog):
                         thread_id = tid
 
                 grouped.setdefault(cat, []).append(
-                    (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id)
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                    )
                 )
 
             # helper: truncar si excede 2000 chars
@@ -369,22 +385,60 @@ class Rooms(commands.Cog):
                 # ---- A) Active rooms ----
                 rooms_list = grouped.get(cat_id, [])
                 if rooms_list:
-                    rooms_list.sort(key=lambda x: (-x[2], x[0]))  # avg desc, rid asc
+                    # Prioridad: STARTED primero, luego FUTURE/SCHEDULED, luego lo demás; dentro por avg desc
+                    def prio(t: tuple) -> int:
+                        started_flag = bool(t[3])
+                        phase = t[7]
+                        if started_flag or phase == PHASE_STARTED:
+                            return 0
+                        if phase == PHASE_FUTURE:
+                            return 1
+                        return 2
 
-                    for rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id in rooms_list:
+                    rooms_list.sort(key=lambda t: (prio(t), -int(t[2]), int(t[0])))
+
+                    for (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                    ) in rooms_list:
                         count = len(pdata_ids)
 
+                        # Status
                         if started_flag:
                             status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
                         else:
-                            if count == ROOM_CAPACITY:
-                                status = (
-                                    f"[READY 5/5] <t:{reached5_ts}:t>"
-                                    if reached5_ts
-                                    else "[READY 5/5]"
-                                )
+                            if phase == PHASE_FUTURE:
+                                if slot_start_ts:
+                                    if songs_posted:
+                                        status = f"[SCHEDULED] songs posted · <t:{slot_start_ts}:t>"
+                                    else:
+                                        status = (
+                                            f"[SCHEDULED] songs at <t:{slot_start_ts}:t> "
+                                            f"(<t:{slot_start_ts}:R>)"
+                                        )
+                                else:
+                                    status = "[SCHEDULED]"
+                            elif phase == PHASE_PREPARED:
+                                # Compat: si por alguna razón usas PREPARED antes de FUTURE
+                                status = "[PREPARED]"
                             else:
-                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                                # Compat con flujos antiguos
+                                if count == ROOM_CAPACITY:
+                                    status = (
+                                        f"[READY 5/5] <t:{reached5_ts}:t>"
+                                        if reached5_ts
+                                        else "[READY 5/5]"
+                                    )
+                                else:
+                                    status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
                         ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
 
@@ -481,3 +535,4 @@ class Rooms(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Rooms(bot))
+))
