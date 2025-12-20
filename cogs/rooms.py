@@ -1,6 +1,6 @@
 # cogs/rooms.py
 
-import time
+import time, json
 import asyncio
 import discord
 from discord.ext import commands, tasks
@@ -117,7 +117,9 @@ class Rooms(commands.Cog):
                 cache[channel_id] = None
             return None
 
-    async def _find_last_board_message(self, channel: discord.TextChannel) -> discord.Message | None:
+    async def _find_last_board_message(
+        self, channel: discord.TextChannel
+    ) -> discord.Message | None:
         """
         Reutiliza el último mensaje del bot en el canal (para no duplicar mensajes tras reinicios).
         Requiere permiso de Read Message History.
@@ -295,9 +297,13 @@ class Rooms(commands.Cog):
 
                 mmr_map: dict[int, int] = {}
                 if player_ids:
-                    mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool)
+                    mmr_map = await self._fetch_mmrs_batch(
+                        mm, player_ids, season_id, has_pool
+                    )
 
-                pdata_ids: list[tuple[int, int]] = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
+                pdata_ids: list[tuple[int, int]] = [
+                    (uid, mmr_map.get(uid, 0)) for uid in player_ids
+                ]
                 pdata_ids.sort(key=lambda t: t[1], reverse=True)
 
                 mmr_vals = [mmr for _, mmr in pdata_ids]
@@ -322,11 +328,15 @@ class Rooms(commands.Cog):
                 )
 
                 started_ts = self._coerce_started_ts(
-                    info.get("started_ts") or info.get("start_ts") or info.get("started_at")
+                    info.get("started_ts")
+                    or info.get("start_ts")
+                    or info.get("started_at")
                 )
 
                 reached5_ts = self._coerce_started_ts(
-                    info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts")
+                    info.get("reached5_ts")
+                    or info.get("ready_ts")
+                    or info.get("full_ts")
                 )
 
                 thread_id = None
@@ -413,7 +423,11 @@ class Rooms(commands.Cog):
 
                         # Status
                         if started_flag:
-                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
+                            status = (
+                                f"[STARTED] <t:{started_ts}:t>"
+                                if started_ts
+                                else "[STARTED]"
+                            )
                         else:
                             if phase == PHASE_FUTURE:
                                 if slot_start_ts:
@@ -440,7 +454,11 @@ class Rooms(commands.Cog):
                                 else:
                                     status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
-                        ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else None
+                        ref = (
+                            f"<#{thread_id}>"
+                            if isinstance(thread_id, int) and thread_id > 0
+                            else None
+                        )
 
                         if ref:
                             lines.append(
@@ -460,7 +478,7 @@ class Rooms(commands.Cog):
                 queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
 
                 queue_ids: list[int] = []
-                for item in (queue_raw or []):
+                for item in queue_raw or []:
                     if isinstance(item, int):
                         queue_ids.append(item)
                     elif isinstance(item, (discord.Member, discord.User)):
@@ -469,7 +487,9 @@ class Rooms(commands.Cog):
                 queue_ids = list(dict.fromkeys(queue_ids))
 
                 if queue_ids:
-                    mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
+                    mmr_map_q = await self._fetch_mmrs_batch(
+                        mm, queue_ids, season_id, has_pool
+                    )
 
                     # Separador visual si venimos de rooms activos
                     if lines and lines[-1].strip() != "":
@@ -494,7 +514,9 @@ class Rooms(commands.Cog):
                             f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**"
                         )
                         for uid in grp_ids:
-                            lines.append(f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})")
+                            lines.append(
+                                f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})"
+                            )
                         lines.append("")
                 else:
                     # Si no hay active rooms y no hay queue
@@ -528,7 +550,8 @@ class Rooms(commands.Cog):
                             pass
                         except discord.HTTPException:
                             pass
-
+            with open("assets/cached_rooms.json", "w+", encoding="utf-8") as f:
+                json.dump(all_rooms, f)
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")
 
