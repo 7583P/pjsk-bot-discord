@@ -798,7 +798,6 @@ class Matchmaking(commands.Cog):
             self.queues.get(join_id, set()).discard(m.id)
             self.queue_join_order.get(join_id, {}).pop(m.id, None)
 
-
         # remover roles de queue
         try:
             await self._remove_queue_roles(leftovers)
@@ -896,14 +895,13 @@ class Matchmaking(commands.Cog):
             )
         )
 
-        placements.sort(
-            key=lambda m: join_order.get(m.id, 10**18)
-        )
+        placements.sort(key=lambda m: join_order.get(m.id, 10**18))
 
         return nonplacements + placements
 
-
-    async def _prepare_rooms_for_join_channel(self, guild: discord.Guild, join_channel: discord.TextChannel):
+    async def _prepare_rooms_for_join_channel(
+        self, guild: discord.Guild, join_channel: discord.TextChannel
+    ):
         """
         PREP (:55/:15/:35 windows) -> crea threads y mueve jugadores,
         PERO NO postea canciones. Las canciones se postean en el slot (:00/:20/:40).
@@ -951,7 +949,6 @@ class Matchmaking(commands.Cog):
                 await self._add_member_to_room(m, rid, info)
                 self.queue_join_order.get(join_id, {}).pop(m.id, None)
 
-
             # marcar como FUTURE (espera al slot para postear songs)
             info["phase"] = PHASE_FUTURE
             info["locked_in_thread"] = True
@@ -971,7 +968,6 @@ class Matchmaking(commands.Cog):
                 f"🎵 Songs will be displayed at <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
                 allowed_mentions=allowed,
             )
-
 
             # quitar rol cola
             try:
@@ -1040,9 +1036,8 @@ class Matchmaking(commands.Cog):
             # 2) Marcar started
             info["phase"] = PHASE_STARTED
             info["started"] = True
-            info["started_at"] = int(started_ts)   # <-- clave que usa el board
+            info["started_at"] = int(started_ts)  # <-- clave que usa el board
             # info["started_ts"] = started_ts      # opcional si quieres mantenerlo, pero no es usado por el board
-
 
             try:
                 await info["thread"].send(
@@ -1507,7 +1502,6 @@ class Matchmaking(commands.Cog):
 
         await asyncio.sleep(0.2)  # 👈 evita “thread not ready” en algunos servers
 
-
         info = {
             "thread": thread,
             "join_channel_id": join_channel.id,
@@ -1568,11 +1562,20 @@ class Matchmaking(commands.Cog):
         try:
             await info["thread"].add_user(member)
         except discord.Forbidden as e:
-            log.error("add_user Forbidden in %s for %s (%s). Check Manage Threads/Create Private Threads perms.",
-                    info["thread"].id, member.id, member.display_name)
+            log.error(
+                "add_user Forbidden in %s for %s (%s). Check Manage Threads/Create Private Threads perms.",
+                info["thread"].id,
+                member.id,
+                member.display_name,
+            )
             raise
         except discord.HTTPException as e:
-            log.error("add_user HTTPException in %s for %s: %r", info["thread"].id, member.id, e)
+            log.error(
+                "add_user HTTPException in %s for %s: %r",
+                info["thread"].id,
+                member.id,
+                e,
+            )
             raise
 
     async def _remove_member_from_room(
@@ -2190,11 +2193,9 @@ class Matchmaking(commands.Cog):
         self.room_slot_scheduler.start()
         self._prep_last_minute = {}  # join_id -> (y,m,d,h,min) gate para PREP
         self._queue_counter = 0
-        self.queue_join_order: dict[int, dict[int, int]] = {cid: {} for cid in ALLOWED_JOIN_CHANNELS}
-
-
-
-
+        self.queue_join_order: dict[int, dict[int, int]] = {
+            cid: {} for cid in ALLOWED_JOIN_CHANNELS
+        }
 
         # ✅ AGREGA ESTO:
         self._join_lock = asyncio.Lock()
@@ -2999,13 +3000,14 @@ class Matchmaking(commands.Cog):
         # Si ya está started, también protege (redundante pero ok)
         if room_info.get("started"):
             try:
-                await room_info["thread"].send("Match already started; songs were selected earlier.")
+                await room_info["thread"].send(
+                    "Match already started; songs were selected earlier."
+                )
             except Exception:
                 pass
             return
 
-
-        thread  = room_info["thread"]
+        thread = room_info["thread"]
         players = room_info["players"]
 
         server_code = room_info.get("server", "en")
@@ -3269,7 +3271,6 @@ class Matchmaking(commands.Cog):
             self.queues.setdefault(ch.id, set()).add(member.id)
             self._queue_counter += 1
             self.queue_join_order[ch.id][member.id] = self._queue_counter
-
 
             # Role queue según canal
             await self._assign_queue_role_for_join(member, ch.id)
