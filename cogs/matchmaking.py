@@ -4128,12 +4128,10 @@ class Matchmaking(commands.Cog):
             await ctx.send("Format:\n!calc\n(row x5))")
             return
 
-        rows = lines[:-1]
-
         greats = goods = bads = misses = 0
 
-        for row in rows:
-            g, gd, b, m = map(int, row.split())
+        for row in lines:
+            g, gd, b, m = map(int, row.strip().split())
             greats += g
             goods += gd
             bads += b
@@ -4141,7 +4139,7 @@ class Matchmaking(commands.Cog):
 
         perfects = room.get("total_notes") - (greats + goods + bads + misses)
 
-        await ctx.send(f"{perfects},{greats},{goods},{bads},{misses}")
+        await ctx.reply(f"{perfects},{greats},{goods},{bads},{misses}")
 
     @commands.command(name="submit")
     async def submit(self, ctx: commands.Context, *, block: str):
