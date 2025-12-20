@@ -300,25 +300,25 @@ DIFFICULTY_PRIORITY = ("normal", "hard", "expert", "master", "append")
 
 # Mapeo de rangos a dificultades permitidas
 ALLOWED_DIFFS_BY_RANK = {
-    "Placement":     ("expert",),
-    "Iron":          ("normal", "hard"),
-    "Iron ⬆":        ("normal", "hard"),
-    "Bronze":        ("normal", "hard"),
-    "Bronze ⬆":      ("hard", "expert"),
-    "Silver":        ("hard", "expert"),
-    "Silver ⬆":      ("hard", "expert"),
-    "Gold":          ("hard", "expert"),
-    "Gold ⬆":        ("hard", "expert", "master"),
-    "Platinum":      ("hard", "expert", "master"),
-    "Platinum ⬆":    ("hard", "expert", "master"),
-    "Diamond":       ("hard","expert", "master", "append"),
-    "Diamond ⬆":     ("hard","expert", "master", "append"),
-    "Crystal":       ("expert", "master", "append"),
-    "Crystal ⬆":     ("expert", "master", "append"),
-    "Master":        ("expert", "master", "append"),
-    "Master ⬆":      ("expert", "master", "append"),
-    "Champion":      ("expert", "master", "append"),
-    "Grand Champion":      ("expert", "master", "append"),
+    "Placement": ("expert",),
+    "Iron": ("normal", "hard"),
+    "Iron ⬆": ("normal", "hard"),
+    "Bronze": ("normal", "hard"),
+    "Bronze ⬆": ("hard", "expert"),
+    "Silver": ("hard", "expert"),
+    "Silver ⬆": ("hard", "expert"),
+    "Gold": ("hard", "expert"),
+    "Gold ⬆": ("hard", "expert", "master"),
+    "Platinum": ("hard", "expert", "master"),
+    "Platinum ⬆": ("hard", "expert", "master"),
+    "Diamond": ("hard", "expert", "master", "append"),
+    "Diamond ⬆": ("hard", "expert", "master", "append"),
+    "Crystal": ("expert", "master", "append"),
+    "Crystal ⬆": ("expert", "master", "append"),
+    "Master": ("expert", "master", "append"),
+    "Master ⬆": ("expert", "master", "append"),
+    "Champion": ("expert", "master", "append"),
+    "Grand Champion": ("expert", "master", "append"),
     "Star": ("expert", "master", "append"),
     "Divine Star": ("master", "append"),
     "Legend": ("master", "append"),
@@ -707,10 +707,12 @@ class Matchmaking(commands.Cog):
         return dt.datetime.now(tz=LIMA_TZ)
 
     # Nuevo schedule:
-    PREP_WINDOWS  = ((55, 59), (15, 19), (35, 39))  # inclusive
-    START_WINDOWS = ((0, 4), (20, 24), (40, 44))    # inclusive
+    PREP_WINDOWS = ((55, 59), (15, 19), (35, 39))  # inclusive
+    START_WINDOWS = ((0, 4), (20, 24), (40, 44))  # inclusive
 
-    def _slot_start_from_prep_start(self, now: dt.datetime, prep_start: int) -> dt.datetime:
+    def _slot_start_from_prep_start(
+        self, now: dt.datetime, prep_start: int
+    ) -> dt.datetime:
         """
         PREP start = 55/15/35  -> slot start = 00/20/40.
         Retorna datetime local Lima del start real del slot.
@@ -737,10 +739,7 @@ class Matchmaking(commands.Cog):
         return cand
 
     async def _announce_queue_countdown_prep_minute(
-        self,
-        guild: discord.Guild,
-        join_channel: discord.TextChannel,
-        now: dt.datetime
+        self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
         En PREP (:x5..:x9): cada minuto manda un mensaje con:
@@ -753,7 +752,9 @@ class Matchmaking(commands.Cog):
             return
 
         slot_dt = self._slot_start_from_prep_start(now, prep_start)
-        mins_left = int((slot_dt - now.replace(second=0, microsecond=0)).total_seconds() // 60)
+        mins_left = int(
+            (slot_dt - now.replace(second=0, microsecond=0)).total_seconds() // 60
+        )
 
         # Debe ser 5..1
         if mins_left < 1 or mins_left > 5:
@@ -765,7 +766,9 @@ class Matchmaking(commands.Cog):
         need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
         slot_ts = int(slot_dt.timestamp())
-        need_part = "" if need == 0 else f"Need ({need}) player(s) to fill the next room. "
+        need_part = (
+            "" if need == 0 else f"Need ({need}) player(s) to fill the next room. "
+        )
 
         try:
             await join_channel.send(
@@ -776,10 +779,7 @@ class Matchmaking(commands.Cog):
             pass
 
     async def _purge_unfilled_queue_on_slot(
-        self,
-        guild: discord.Guild,
-        join_channel: discord.TextChannel,
-        now: dt.datetime
+        self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
         En el minuto exacto del slot (:00 / :20 / :40):
@@ -827,7 +827,9 @@ class Matchmaking(commands.Cog):
             (35, self._next_occurrence_of_minute(now, 35)),
             (55, self._next_occurrence_of_minute(now, 55)),
         ]
-        candidates.sort(key=lambda x: x[1])  # orden por datetime (lo más cercano primero)
+        candidates.sort(
+            key=lambda x: x[1]
+        )  # orden por datetime (lo más cercano primero)
 
         lines = ["A queue will be starting at:"]
         for minute, t in candidates:
@@ -841,9 +843,9 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
-
-
-    def _window_start_minute(self, minute: int, windows: tuple[tuple[int,int], ...]) -> int | None:
+    def _window_start_minute(
+        self, minute: int, windows: tuple[tuple[int, int], ...]
+    ) -> int | None:
         for a, b in windows:
             if a <= minute <= b:
                 return a
@@ -854,8 +856,6 @@ class Matchmaking(commands.Cog):
 
     def _in_start_window(self, now: dt.datetime) -> int | None:
         return self._window_start_minute(now.minute, self.START_WINDOWS)
-
-
 
     def _slot_key(self, dt: datetime) -> tuple[int, int, int, int]:
         # clave para evitar doble ejecución en la misma marca
@@ -931,7 +931,9 @@ class Matchmaking(commands.Cog):
             # IMPORTANTE: usar slot_dt (no now) para nombre del thread
             thread_name = self._build_thread_name(i, slot_dt, avg, rank)
 
-            rid, info = await self._create_room(join_channel, server_code=server_code, thread_name=thread_name)
+            rid, info = await self._create_room(
+                join_channel, server_code=server_code, thread_name=thread_name
+            )
 
             # mover de cola a room
             for m in group:
@@ -967,7 +969,6 @@ class Matchmaking(commands.Cog):
 
             # notificar a Rooms cog
             self.bot.dispatch("room_updated", rid)
-
 
     async def _start_future_rooms_for_slot(self, join_channel_id: int, slot_ts: int):
         """
@@ -1011,12 +1012,16 @@ class Matchmaking(commands.Cog):
                     self.bot.dispatch("room_finished", rid)
                 except Exception:
                     pass
-                asyncio.create_task(self.close_room(info["thread"], delay=5, delete=True))
+                asyncio.create_task(
+                    self.close_room(info["thread"], delay=5, delete=True)
+                )
                 continue
 
             # 1) Postear songs EXACTAMENTE en el slot
             try:
-                await self.launch_song_poll(info)  # esto postea "Selected songs..." en el thread
+                await self.launch_song_poll(
+                    info
+                )  # esto postea "Selected songs..." en el thread
             except Exception:
                 pass
 
@@ -1033,9 +1038,6 @@ class Matchmaking(commands.Cog):
                 pass
 
             self.bot.dispatch("room_updated", rid)
-
-
-
 
     async def _fetch_mmrs_batch(self, user_ids: list[int]) -> dict[int, int]:
         """
@@ -1103,9 +1105,10 @@ class Matchmaking(commands.Cog):
                     )
                 except Exception:
                     pass
-                
 
-    async def _rebalance_parent_queue(self, guild: discord.Guild, join_channel: discord.TextChannel):
+    async def _rebalance_parent_queue(
+        self, guild: discord.Guild, join_channel: discord.TextChannel
+    ):
         """
         Regla:
         - Máximo 5 por sala.
@@ -1223,7 +1226,9 @@ class Matchmaking(commands.Cog):
             info["players"] = desired[:]
             await self.update_room_board(guild, rid)
 
-    async def _announce_need_players_prep_minute(self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime):
+    async def _announce_need_players_prep_minute(
+        self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
+    ):
         """
         En ventana PREP (:x5 a :x9) manda el mismo "Need (n)" cada minuto.
         En :x0 no manda nada (porque ya no estamos en PREP).
@@ -1260,8 +1265,9 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
-
-    async def _announce_room_start(self, join_channel: discord.TextChannel, rid: int, info: dict):
+    async def _announce_room_start(
+        self, join_channel: discord.TextChannel, rid: int, info: dict
+    ):
         disp = self._disp(info, rid)
         players = info.get("players", [])
         # MMR para listar
@@ -1405,7 +1411,6 @@ class Matchmaking(commands.Cog):
         # Al final: reindex/renombrar para reflejar el nuevo orden
         await self._reindex_parent_rooms(guild, parent_id)
 
-
     def _next_start_minute_label(self, now: dt.datetime) -> str:
         """
         Devuelve el próximo ':x0' según tus ventanas START.
@@ -1417,8 +1422,9 @@ class Matchmaking(commands.Cog):
                 return f":{s:02d}"
         return f":{starts[0]:02d}"  # siguiente hora
 
-
-    async def build_future_room_block(self, guild: discord.Guild, join_channel_id: int, now: dt.datetime) -> str:
+    async def build_future_room_block(
+        self, guild: discord.Guild, join_channel_id: int, now: dt.datetime
+    ) -> str:
         """
         Bloque para que el cog Rooms lo agregue debajo de todas las salas:
         ----------------- Future Room (starting at :x0)
@@ -1429,7 +1435,9 @@ class Matchmaking(commands.Cog):
         if not ordered:
             return ""
 
-        mmr_map = await self._fetch_mmrs_batch([m.id for m in ordered if not self._is_placement_member(m)])
+        mmr_map = await self._fetch_mmrs_batch(
+            [m.id for m in ordered if not self._is_placement_member(m)]
+        )
 
         label = self._next_start_minute_label(now)
         lines = [f"----------------- Future Room (starting at {label})"]
@@ -1440,9 +1448,6 @@ class Matchmaking(commands.Cog):
                 lines.append(f"{m.display_name} ({int(mmr_map.get(m.id, 0))})")
 
         return "\n".join(lines)
-
-
-
 
     async def _room_mmrs(self, players: list[discord.Member]) -> dict[int, int]:
         """MMR por user_id (1 query por jugador; si quieres, luego lo optimizamos por batch)."""
@@ -1490,9 +1495,8 @@ class Matchmaking(commands.Cog):
             "join_channel_id": join_channel.id,
             "server": server_code,
             "players": [],
-"phase": PHASE_FUTURE,            # FUTURE: thread listo, songs aún NO
-"locked_in_thread": True,         # si quieres que estén bloqueados desde PREP
-
+            "phase": PHASE_FUTURE,  # FUTURE: thread listo, songs aún NO
+            "locked_in_thread": True,  # si quieres que estén bloqueados desde PREP
             "started": False,
             "finished": False,
             "created_ts": int(self._now_lima().timestamp()),
@@ -2230,17 +2234,12 @@ class Matchmaking(commands.Cog):
         self.room_slot_scheduler.start()
         self._prep_last_minute = {}  # join_id -> (y,m,d,h,min) gate para PREP
 
-
-
-
         # ✅ AGREGA ESTO:
         self._join_lock = asyncio.Lock()
 
         self.rooms: dict[int, dict] = {}
-        self._sched_last_minute = {}   # parent_id -> minute_ts
-        self._sched_last_slot   = {}   # parent_id -> (y,m,d,hm)
-        
-
+        self._sched_last_minute = {}  # parent_id -> minute_ts
+        self._sched_last_slot = {}  # parent_id -> (y,m,d,hm)
 
     def _need_players_window(self, dt_local: datetime) -> bool:
         return dt_local.minute in (1, 2, 3, 4, 31, 32, 33, 34)
@@ -2280,10 +2279,14 @@ class Matchmaking(commands.Cog):
                         await self._prepare_rooms_for_join_channel(guild, join_channel)
 
                         # 2) tu mensaje actual de need (si aplica)
-                        await self._announce_need_players_prep_minute(guild, join_channel, now)
+                        await self._announce_need_players_prep_minute(
+                            guild, join_channel, now
+                        )
 
                         # 3) NUEVO: countdown + timestamp al slot
-                        await self._announce_queue_countdown_prep_minute(guild, join_channel, now)
+                        await self._announce_queue_countdown_prep_minute(
+                            guild, join_channel, now
+                        )
 
                 # ---------- START (ventana :x0..:x4) ----------
                 start_base = self._in_start_window(now)
@@ -2293,11 +2296,15 @@ class Matchmaking(commands.Cog):
                     if self._sched_last_slot.get(join_id) != slot_key:
                         self._sched_last_slot[join_id] = slot_key
 
-                        slot_dt = now.replace(second=0, microsecond=0, minute=start_base)
+                        slot_dt = now.replace(
+                            second=0, microsecond=0, minute=start_base
+                        )
                         slot_ts = int(slot_dt.timestamp())
 
                         # (1) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
-                        await self._purge_unfilled_queue_on_slot(guild, join_channel, now)
+                        await self._purge_unfilled_queue_on_slot(
+                            guild, join_channel, now
+                        )
 
                         # (2) START: inicia rooms FUTURE programadas para este slot
                         await self._start_future_rooms_for_slot(join_id, slot_ts)
@@ -2305,14 +2312,9 @@ class Matchmaking(commands.Cog):
                         # (3) ANNOUNCE: publica los próximos horarios (con timestamps)
                         await self._announce_next_queue_windows_on_00(join_channel, now)
 
-
-
-
     @room_slot_scheduler.before_loop
     async def _before_room_slot_scheduler(self):
         await self.bot.wait_until_ready()
-
-
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -2385,7 +2387,9 @@ class Matchmaking(commands.Cog):
                         if isinstance(ch, discord.TextChannel):
                             try:
                                 qcount = len(q)
-                                await ch.send(f"(<@{member.id}>) Dropped the queue (`{qcount}`)")
+                                await ch.send(
+                                    f"(<@{member.id}>) Dropped the queue (`{qcount}`)"
+                                )
                             except Exception:
                                 pass
 
@@ -2399,13 +2403,18 @@ class Matchmaking(commands.Cog):
 
                     players = info.get("players", []) or []
                     # players suelen ser discord.Member, pero comparamos por id por seguridad
-                    hit = next((p for p in players if getattr(p, "id", None) == member.id), None)
+                    hit = next(
+                        (p for p in players if getattr(p, "id", None) == member.id),
+                        None,
+                    )
                     if not hit:
                         continue
 
                     # remover del array
                     try:
-                        info["players"] = [p for p in players if getattr(p, "id", None) != member.id]
+                        info["players"] = [
+                            p for p in players if getattr(p, "id", None) != member.id
+                        ]
                     except Exception:
                         # fallback ultra seguro
                         try:
@@ -2422,12 +2431,15 @@ class Matchmaking(commands.Cog):
                         pass
 
                     # si el room estaba en countdown/starting y se cayó de 5, cancela countdown si existe
-                    if info.get("starting", False) and len(info.get("players", [])) < ROOM_CAPACITY:
+                    if (
+                        info.get("starting", False)
+                        and len(info.get("players", [])) < ROOM_CAPACITY
+                    ):
                         try:
                             if hasattr(self, "_cancel_countdown_if_any"):
                                 await self._cancel_countdown_if_any(
                                     info,
-                                    reason="Countdown canceled (player left the server)."
+                                    reason="Countdown canceled (player left the server).",
                                 )
                         except Exception:
                             pass
@@ -2435,9 +2447,15 @@ class Matchmaking(commands.Cog):
                     # si queda vacío y aún no empezó, elimina el thread y saca el room del dict
                     try:
                         th = info.get("thread")
-                        if not info.get("started", False) and len(info.get("players", [])) == 0 and isinstance(th, discord.Thread):
+                        if (
+                            not info.get("started", False)
+                            and len(info.get("players", [])) == 0
+                            and isinstance(th, discord.Thread)
+                        ):
                             try:
-                                await th.delete(reason="Empty room after member left server")
+                                await th.delete(
+                                    reason="Empty room after member left server"
+                                )
                             except Exception:
                                 pass
                             self.rooms.pop(rid, None)
@@ -2458,7 +2476,9 @@ class Matchmaking(commands.Cog):
                     # marcar parent para rebalance (si aplica)
                     try:
                         th = info.get("thread")
-                        if isinstance(th, discord.Thread) and isinstance(th.parent_id, int):
+                        if isinstance(th, discord.Thread) and isinstance(
+                            th.parent_id, int
+                        ):
                             affected_parent_ids.add(th.parent_id)
                     except Exception:
                         pass
@@ -2476,7 +2496,11 @@ class Matchmaking(commands.Cog):
                         if isinstance(parent_ch, discord.TextChannel):
                             try:
                                 # Rebalance en background para reordenar rooms y quitar huecos
-                                asyncio.create_task(self._rebalance_parent_queue(member.guild, parent_ch))
+                                asyncio.create_task(
+                                    self._rebalance_parent_queue(
+                                        member.guild, parent_ch
+                                    )
+                                )
                             except Exception:
                                 pass
 
@@ -2966,7 +2990,6 @@ class Matchmaking(commands.Cog):
         # Lockdown exactamente durante PREP (:x5..:x9)
         return self._in_prep_window(now) is not None
 
-
     async def _need_players_next_room(self, guild: discord.Guild, join_id: int) -> int:
         ordered = await self._get_ordered_queue_members(guild, join_id)
         if not ordered:
@@ -2976,7 +2999,9 @@ class Matchmaking(commands.Cog):
             return 0
         return ROOM_CAPACITY - rem
 
-    async def _is_join_locked(self, guild: discord.Guild, join_id: int, now: dt.datetime) -> bool:
+    async def _is_join_locked(
+        self, guild: discord.Guild, join_id: int, now: dt.datetime
+    ) -> bool:
         """
         Regla pedida:
         - Solo durante PREP (:x5..:x9)
@@ -2999,7 +3024,6 @@ class Matchmaking(commands.Cog):
 
         # Si falta gente para completar la siguiente, permitir
         return False
-    
 
     async def launch_song_poll(self, room_info):
         # Evitar re-selección si ya fue iniciada
@@ -3311,11 +3335,10 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
-
-
-
-
-    @app_commands.command(name="stats", description="Shows your position, mmr and rank in the selected season")
+    @app_commands.command(
+        name="stats",
+        description="Shows your position, mmr and rank in the selected season",
+    )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
         season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season"
@@ -3525,7 +3548,11 @@ class Matchmaking(commands.Cog):
             rid = self._find_player_room_id(member)
             if rid is not None:
                 info = self.rooms.get(rid, {})
-                if info.get("phase") in (PHASE_FUTURE, PHASE_PREPARED, PHASE_STARTED) and not info.get("finished", False):
+                if info.get("phase") in (
+                    PHASE_FUTURE,
+                    PHASE_PREPARED,
+                    PHASE_STARTED,
+                ) and not info.get("finished", False):
                     return await interaction.response.send_message(
                         "❌ You are locked in a room. You can’t leave until the room finishes.",
                         ephemeral=True,
@@ -3550,10 +3577,6 @@ class Matchmaking(commands.Cog):
                 return await interaction.response.send_message(
                     "Removed from queue.", ephemeral=True
                 )
-
-
-
-
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
@@ -4598,10 +4621,3 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
-
-
-
-
-
-
