@@ -354,7 +354,6 @@ MIN_LEVEL_GAP = 3
 ROOM_CAPACITY = 5
 VOTE_TIMEOUT_SUBMIT = 30
 VOTE_TIMEOUT_FORFEIT = 30
-ROOM_CAPACITY = 5
 LIMA_TZ = ZoneInfo("America/Lima")
 
 PHASE_FUTURE = "FUTURE"  # en cola (sin hilo)
@@ -797,6 +796,8 @@ class Matchmaking(commands.Cog):
         leftovers = ordered[-rem:]  # los que quedaron “en la sala que no se llenó”
         for m in leftovers:
             self.queues.get(join_id, set()).discard(m.id)
+            self.queue_join_order.get(join_id, {}).pop(m.id, None)
+
 
         # remover roles de queue
         try:
@@ -886,14 +887,23 @@ class Matchmaking(commands.Cog):
         nonplacements = [m for m in members if not self._is_placement_member(m)]
 
         mmr_map = await self._fetch_mmrs_batch([m.id for m in nonplacements])
-        nonplacements.sort(key=lambda m: (-int(mmr_map.get(m.id, 0)), m.id))
-        placements.sort(key=lambda m: m.id)
+        join_order = self.queue_join_order.get(join_channel_id, {})
+
+        nonplacements.sort(
+            key=lambda m: (
+                -int(mmr_map.get(m.id, 0)),
+                join_order.get(m.id, 10**18),  # 👈 desempate por orden real de join
+            )
+        )
+
+        placements.sort(
+            key=lambda m: join_order.get(m.id, 10**18)
+        )
 
         return nonplacements + placements
 
-    async def _prepare_rooms_for_join_channel(
-        self, guild: discord.Guild, join_channel: discord.TextChannel
-    ):
+
+    async def _prepare_rooms_for_join_channel(self, guild: discord.Guild, join_channel: discord.TextChannel):
         """
         PREP (:55/:15/:35 windows) -> crea threads y mueve jugadores,
         PERO NO postea canciones. Las canciones se postean en el slot (:00/:20/:40).
@@ -939,6 +949,8 @@ class Matchmaking(commands.Cog):
             for m in group:
                 self.queues[join_id].discard(m.id)
                 await self._add_member_to_room(m, rid, info)
+                self.queue_join_order.get(join_id, {}).pop(m.id, None)
+
 
             # marcar como FUTURE (espera al slot para postear songs)
             info["phase"] = PHASE_FUTURE
@@ -952,14 +964,14 @@ class Matchmaking(commands.Cog):
             mentions = " ".join(m.mention for m in group)
 
             # Ping + aviso de cuándo se publican songs
-            try:
-                await info["thread"].send(
-                    f"{mentions}\n"
-                    f"✅ You are locked in for this slot.\n"
-                    f"🎵 Songs will be displayed at <t:{slot_ts}:T> (<t:{slot_ts}:R>)."
-                )
-            except Exception:
-                pass
+            allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+            await info["thread"].send(
+                f"{mentions}\n"
+                f"✅ You are locked in for this slot.\n"
+                f"🎵 Songs will be displayed at <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
+                allowed_mentions=allowed,
+            )
+
 
             # quitar rol cola
             try:
@@ -1028,7 +1040,9 @@ class Matchmaking(commands.Cog):
             # 2) Marcar started
             info["phase"] = PHASE_STARTED
             info["started"] = True
-            info["started_ts"] = started_ts
+            info["started_at"] = int(started_ts)   # <-- clave que usa el board
+            # info["started_ts"] = started_ts      # opcional si quieres mantenerlo, pero no es usado por el board
+
 
             try:
                 await info["thread"].send(
@@ -1488,7 +1502,11 @@ class Matchmaking(commands.Cog):
             name=thread_name,
             type=discord.ChannelType.private_thread,
             auto_archive_duration=1440,
+            invitable=True,  # 👈 importante si tu versión lo soporta
         )
+
+        await asyncio.sleep(0.2)  # 👈 evita “thread not ready” en algunos servers
+
 
         info = {
             "thread": thread,
@@ -1549,9 +1567,13 @@ class Matchmaking(commands.Cog):
         info["players"].append(member)
         try:
             await info["thread"].add_user(member)
-        except Exception:
-            pass
-        await self.update_room_board(member.guild, rid)
+        except discord.Forbidden as e:
+            log.error("add_user Forbidden in %s for %s (%s). Check Manage Threads/Create Private Threads perms.",
+                    info["thread"].id, member.id, member.display_name)
+            raise
+        except discord.HTTPException as e:
+            log.error("add_user HTTPException in %s for %s: %r", info["thread"].id, member.id, e)
+            raise
 
     async def _remove_member_from_room(
         self, member: discord.Member, rid: int, info: dict
@@ -2167,6 +2189,12 @@ class Matchmaking(commands.Cog):
         self._need_last_minute = {}
         self.room_slot_scheduler.start()
         self._prep_last_minute = {}  # join_id -> (y,m,d,h,min) gate para PREP
+        self._queue_counter = 0
+        self.queue_join_order: dict[int, dict[int, int]] = {cid: {} for cid in ALLOWED_JOIN_CHANNELS}
+
+
+
+
 
         # ✅ AGREGA ESTO:
         self._join_lock = asyncio.Lock()
@@ -2960,15 +2988,24 @@ class Matchmaking(commands.Cog):
         return False
 
     async def launch_song_poll(self, room_info):
-        # Evitar re-selección si ya fue iniciada
-        if room_info.get("started"):
+        # Evitar re-selección si ya se postearon songs (más fuerte que started)
+        if room_info.get("songs_posted"):
             try:
-                await room_info["thread"].send("songs has been selected")
+                await room_info["thread"].send("Songs already selected for this room.")
             except Exception:
                 pass
             return
 
-        thread = room_info["thread"]
+        # Si ya está started, también protege (redundante pero ok)
+        if room_info.get("started"):
+            try:
+                await room_info["thread"].send("Match already started; songs were selected earlier.")
+            except Exception:
+                pass
+            return
+
+
+        thread  = room_info["thread"]
         players = room_info["players"]
 
         server_code = room_info.get("server", "en")
@@ -3230,6 +3267,9 @@ class Matchmaking(commands.Cog):
 
             # Encolar
             self.queues.setdefault(ch.id, set()).add(member.id)
+            self._queue_counter += 1
+            self.queue_join_order[ch.id][member.id] = self._queue_counter
+
 
             # Role queue según canal
             await self._assign_queue_role_for_join(member, ch.id)
@@ -3437,7 +3477,7 @@ class Matchmaking(commands.Cog):
             app_commands.Choice(name="Current", value="current"),
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
-            app_commands.Choice(name="Alpha Test Season", value="alpha tests eason"),
+            app_commands.Choice(name="Alpha Test Season", value="alpha tests season"),
         ]
     )
     async def cutoffs(
@@ -3496,6 +3536,8 @@ class Matchmaking(commands.Cog):
             q = self.queues.get(ch.id, set())
             if member.id in q:
                 q.discard(member.id)
+                self.queue_join_order.get(ch.id, {}).pop(member.id, None)
+
                 try:
                     await self._remove_queue_roles([member])
                 except Exception:
