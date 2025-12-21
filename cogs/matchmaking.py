@@ -3962,6 +3962,7 @@ class Matchmaking(commands.Cog):
     @app_commands.command(
         name="forfeit", description="Vote to forfeit the current room."
     )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def forfeit(self, interaction: discord.Interaction):
         # Debe ejecutarse dentro de un thread de room
         ch = interaction.channel
