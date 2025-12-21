@@ -765,7 +765,7 @@ class Matchmaking(commands.Cog):
             return
 
         join_id = join_channel.id
-        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}>"
+        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}> "
         ordered = await self._get_ordered_queue_members(guild, join_id)
         rem = len(ordered) % ROOM_CAPACITY
         need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
@@ -774,7 +774,7 @@ class Matchmaking(commands.Cog):
         need_part = (
             ""
             if need == 0
-            else f"{ping} Need ({need}) player(s) to fill the next room. "
+            else f"{ping if mins_left == 5 else ''}Need ({need}) player(s) to fill the next room. "
         )
 
         try:
