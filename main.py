@@ -159,50 +159,61 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
+        error_ch = await bot.fetch_channel(1451649796971692104)
         # Cargar cogs
         try:
             await self.load_extension("cogs.matchmaking")
             print("✅ Cog cargado: cogs.matchmaking")
         except Exception as e:
             print(f"❌ Error cargando cogs.matchmaking: {e}")
+            await error_ch.send(f"❌ Error cargando cogs.matchmaking: {e}")
 
         try:
             await self.load_extension("cogs.rooms")
             print("✅ Cog cargado: cogs.rooms")
         except Exception as e:
             print(f"❌ Error cargando cogs.rooms: {e}")
+            await error_ch.send(f"❌ Error cargando cogs.rooms: {e}")
 
         try:
             await self.load_extension("cogs.autoroles")
             print("✅ Cog cargado: cogs.autoroles")
         except Exception as e:
             print(f"❌ Error cargando cogs.autoroles: {e}")
+            await error_ch.send(f"❌ Error cargando cogs.autoroles: {e}")
 
         try:
             await self.load_extension("cogs.players")
             print("✅ Cog cargado: cogs.players")
         except Exception as e:
             print(f"❌ Error cargando cogs.players: {e}")
-
-        # Sincronizar comandos slash
-        try:
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                synced = await self.tree.sync(guild=guild)
-                print(
-                    f"📋 Slash commands sincronizados en guild {GUILD_ID}: {[c.name for c in synced]}"
-                )
-            else:
-                synced = await self.tree.sync()
-                print(f"📋 Slash commands globales: {[c.name for c in synced]}")
-        except Exception as e:
-            print(f"❗ Error al sincronizar comandos: {e}")
+            await error_ch.send(f"❌ Error cargando cogs.players: {e}")
 
     async def on_ready(self):
         print(f"🤖 Conectado como {self.user} (ID: {self.user.id})")
 
 
 bot = MyBot()
+
+
+@bot.command(name="sync")
+async def sync_commands(ctx: commands.Context):
+    if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+        return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
+    """Synchronize slash commands manually."""
+    try:
+        if GUILD_ID:
+            guild = discord.Object(id=int(GUILD_ID))
+            synced = await bot.tree.sync(guild=guild)
+            await ctx.send(
+                f"📋 Slash commands sincronizados en guild {GUILD_ID}: "
+                f"{[c.name for c in synced]}"
+            )
+        else:
+            synced = await bot.tree.sync()
+            await ctx.send(f"📋 Slash commands globales: {[c.name for c in synced]}")
+    except Exception as e:
+        await ctx.send(f"❗ Error al sincronizar comandos: {e}")
 
 
 @bot.tree.error
