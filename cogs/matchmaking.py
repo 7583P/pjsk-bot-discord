@@ -4645,7 +4645,7 @@ class Matchmaking(commands.Cog):
     async def edit_user_mmr(
         self, ctx: commands.Context, member: discord.Member, new_value: int
     ):
-        if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+        if ctx.author.id not in [878310498720940102, 1364401080661708892]:
             return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
         try:
             season_row = await self.get_current_season()
@@ -4672,7 +4672,7 @@ class Matchmaking(commands.Cog):
 
     @commands.command(name="fix_user_rank_roles")
     async def fix_user_rank_roles(self, ctx: commands.Context, member: discord.Member):
-        if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+        if ctx.author.id not in [878310498720940102, 1364401080661708892]:
             return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
         try:
             result = await self.db_pool.fetchrow(

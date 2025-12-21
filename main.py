@@ -198,7 +198,7 @@ bot = MyBot()
 
 @bot.command(name="sync")
 async def sync_commands(ctx: commands.Context):
-    if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+    if ctx.author.id not in [878310498720940102, 1364401080661708892]:
         return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
     """Synchronize slash commands manually."""
     try:
