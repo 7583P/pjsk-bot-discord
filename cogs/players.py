@@ -189,10 +189,10 @@ class PlayersCog(commands.Cog):
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(
-        name="register", description="Register your country (código ISO2)"
+        name="set_your_country", description="Register your country (código ISO2)"
     )
     @app_commands.describe(country="ISO2 2 letters code (p.ej., PE)")
-    async def register(self, interaction: discord.Interaction, country: str):
+    async def set_your_country(self, interaction: discord.Interaction, country: str):
         code = country.strip().upper()
         if not re.match(r"^[A-Z]{2}$", code):
             return await interaction.response.send_message(

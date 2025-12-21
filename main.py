@@ -159,35 +159,37 @@ class MyBot(commands.Bot):
         )
 
     async def setup_hook(self):
-        error_ch = await bot.fetch_channel(1451649796971692104)
+        log_ch = await bot.fetch_channel(1451649796971692104)
         # Cargar cogs
         try:
             await self.load_extension("cogs.matchmaking")
             print("✅ Cog cargado: cogs.matchmaking")
         except Exception as e:
             print(f"❌ Error cargando cogs.matchmaking: {e}")
-            await error_ch.send(f"❌ Error cargando cogs.matchmaking: {e}")
+            await log_ch.send(f"❌ Error cargando cogs.matchmaking: {e}")
 
         try:
             await self.load_extension("cogs.rooms")
             print("✅ Cog cargado: cogs.rooms")
         except Exception as e:
             print(f"❌ Error cargando cogs.rooms: {e}")
-            await error_ch.send(f"❌ Error cargando cogs.rooms: {e}")
+            await log_ch.send(f"❌ Error cargando cogs.rooms: {e}")
 
         try:
             await self.load_extension("cogs.autoroles")
             print("✅ Cog cargado: cogs.autoroles")
         except Exception as e:
             print(f"❌ Error cargando cogs.autoroles: {e}")
-            await error_ch.send(f"❌ Error cargando cogs.autoroles: {e}")
+            await log_ch.send(f"❌ Error cargando cogs.autoroles: {e}")
 
         try:
             await self.load_extension("cogs.players")
             print("✅ Cog cargado: cogs.players")
         except Exception as e:
             print(f"❌ Error cargando cogs.players: {e}")
-            await error_ch.send(f"❌ Error cargando cogs.players: {e}")
+            await log_ch.send(f"❌ Error cargando cogs.players: {e}")
+
+        await log_ch.send("All cogs loaded.")
 
     async def on_ready(self):
         print(f"🤖 Conectado como {self.user} (ID: {self.user.id})")
