@@ -4647,41 +4647,47 @@ class Matchmaking(commands.Cog):
     ):
         if ctx.author.id not in [878310498720940102, 1423839568729473128]:
             return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
-        season_row = await self.get_current_season()
-        season_id = int(season_row["id"])
-        role_name = get_rank_from_mmr(new_value)
-        await self.db_pool.execute(
-            """
-            INSERT INTO seasonplayers (season_id, user_id, mmr, role)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT (season_id, user_id)
-            DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
-            """,
-            season_id,
-            member.id,
-            new_value,
-            role_name,
-        )
-        await self._apply_rank_role(
-            ctx.guild, member, role_name, reason="Applying user's role (mmr edit)"
-        )
-        await ctx.reply("Done!")
+        try:
+            season_row = await self.get_current_season()
+            season_id = int(season_row["id"])
+            role_name = get_rank_from_mmr(new_value)
+            await self.db_pool.execute(
+                """
+                INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (season_id, user_id)
+                DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+                """,
+                season_id,
+                member.id,
+                new_value,
+                role_name,
+            )
+            await self._apply_rank_role(
+                ctx.guild, member, role_name, reason="Applying user's role (mmr edit)"
+            )
+            await ctx.reply("Done!")
+        except Exception as e:
+            await ctx.reply(str(e))
 
     @commands.command(name="fix_user_rank_roles")
     async def fix_user_rank_roles(self, ctx: commands.Context, member: discord.Member):
         if ctx.author.id not in [878310498720940102, 1423839568729473128]:
             return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
-        result = await self.db_pool.fetchrow(
-            """
-            SELECT role FROM seasonplayers WHERE user_id = $1;
-            """,
-            member.id,
-        )
-        result = dict(result)
-        await self._apply_rank_role(
-            ctx.guild, member, result["role"], reason="Fixing user's ranked roles"
-        )
-        await ctx.reply("Done!")
+        try:
+            result = await self.db_pool.fetchrow(
+                """
+                SELECT role FROM seasonplayers WHERE user_id = $1;
+                """,
+                member.id,
+            )
+            result = dict(result)
+            await self._apply_rank_role(
+                ctx.guild, member, result["role"], reason="Fixing user's ranked roles"
+            )
+            await ctx.reply("Done!")
+        except Exception as e:
+            await ctx.reply(str(e))
 
 
 async def setup(bot: commands.Bot):
