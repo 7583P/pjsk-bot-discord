@@ -4599,6 +4599,90 @@ class Matchmaking(commands.Cog):
         finally:
             room["vote_in_progress"] = False
 
+    async def _apply_rank_role(
+        self, guild: discord.Guild, member_or_id, role_name: str, reason: str = ""
+    ) -> bool:
+        rank_role_ids = set(RANK_ROLE_IDS.values())
+
+        # Resolver member
+        member = (
+            member_or_id
+            if isinstance(member_or_id, discord.Member)
+            else guild.get_member(int(member_or_id))
+        )
+        if member is None:
+            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
+            try:
+                member = await guild.fetch_member(int(member_or_id))
+            except Exception:
+                return False
+
+        # Normaliza y resuelve rol objetivo (fallback a Placement)
+        role_name = (role_name or "Placement").strip()
+        if role_name not in RANK_ROLE_IDS:
+            role_name = "Placement"
+
+        target_role = guild.get_role(RANK_ROLE_IDS[role_name])
+        if not target_role:
+            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
+            target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
+            if not target_role:
+                return False
+
+        # Mantener roles NO-rango y agregar el nuevo rango
+        keep = [r for r in member.roles if r.id not in rank_role_ids]
+        new_roles = list(dict.fromkeys(keep + [target_role]))
+
+        try:
+            await member.edit(
+                roles=new_roles, reason=reason or f"Apply rank {role_name}"
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    @commands.command(name="edit_user_mmr")
+    async def edit_user_mmr(
+        self, ctx: commands.Context, member: discord.Member, new_value: int
+    ):
+        if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+            return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
+        season_row = await self.get_current_season()
+        season_id = int(season_row["id"])
+        role_name = get_rank_from_mmr(new_value)
+        await self.db_pool.execute(
+            """
+            INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (season_id, user_id)
+            DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+            """,
+            season_id,
+            member.id,
+            new_value,
+            role_name,
+        )
+        await self._apply_rank_role(
+            ctx.guild, member, role_name, reason="Applying user's role (mmr edit)"
+        )
+        await ctx.reply("Done!")
+
+    @commands.command(name="fix_user_rank_roles")
+    async def fix_user_rank_roles(self, ctx: commands.Context, member: discord.Member):
+        if ctx.author.id not in [878310498720940102, 1423839568729473128]:
+            return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
+        result = await self.db_pool.fetchrow(
+            """
+            SELECT role FROM seasonplayers WHERE user_id = $1;
+            """,
+            member.id,
+        )
+        result = dict(result)
+        await self._apply_rank_role(
+            ctx.guild, member, result["role"], reason="Fixing user's ranked roles"
+        )
+        await ctx.reply("Done!")
+
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
