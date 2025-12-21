@@ -44,6 +44,11 @@ QUEUE_ROLE_IDS = {
     "jp": 1451255910469996726,
 }
 
+PING_ROLES_BY_JOIN_CHANNEL = {
+    1371307353437110282: 1383874928968994928,  # #join -> @enTags
+    1451255910469996726: 1428578933963489280,  # #jp-join -> @jpTags
+}
+
 ALLOWED_JOIN_CHANNELS = set(JOIN_CHANNEL_IDS.values())
 
 JOIN_TO_RESULTS = {
@@ -760,13 +765,16 @@ class Matchmaking(commands.Cog):
             return
 
         join_id = join_channel.id
+        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}>"
         ordered = await self._get_ordered_queue_members(guild, join_id)
         rem = len(ordered) % ROOM_CAPACITY
         need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
         slot_ts = int(slot_dt.timestamp())
         need_part = (
-            "" if need == 0 else f"Need ({need}) player(s) to fill the next room. "
+            ""
+            if need == 0
+            else f"{ping} Need ({need}) player(s) to fill the next room. "
         )
 
         try:
@@ -962,7 +970,9 @@ class Matchmaking(commands.Cog):
 
             # Ping + aviso de cuándo se publican songs
             allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
-            await info["thread"].send(
+            await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                info["thread"]
+            ).send(
                 f"{mentions}\n"
                 f"✅ You are locked in for this slot.\n"
                 f"🎵 Songs will be displayed at <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
@@ -1011,9 +1021,9 @@ class Matchmaking(commands.Cog):
                 except Exception:
                     pass
                 try:
-                    await info["thread"].send(
-                        "⛔ Room did not start (not enough players). Closing room."
-                    )
+                    await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                        info["thread"]
+                    ).send("⛔ Room did not start (not enough players). Closing room.")
                 except Exception:
                     pass
                 try:
@@ -1021,7 +1031,13 @@ class Matchmaking(commands.Cog):
                 except Exception:
                     pass
                 asyncio.create_task(
-                    self.close_room(info["thread"], delay=5, delete=True)
+                    self.close_room(
+                        self.bot.get_channel(info["join_channel_id"]).get_thread(
+                            info["thread"]
+                        ),
+                        delay=5,
+                        delete=True,
+                    )
                 )
                 continue
 
@@ -1040,9 +1056,9 @@ class Matchmaking(commands.Cog):
             # info["started_ts"] = started_ts      # opcional si quieres mantenerlo, pero no es usado por el board
 
             try:
-                await info["thread"].send(
-                    "✅ Match started (scheduled slot). Good luck."
-                )
+                await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                    info["thread"]
+                ).send("✅ Match started (scheduled slot). Good luck.")
             except Exception:
                 pass
 
@@ -1149,7 +1165,9 @@ class Matchmaking(commands.Cog):
             for rid, info in active_rooms:
                 if not info.get("players"):
                     try:
-                        await info["thread"].delete(reason="Empty queue room")
+                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                            info["thread"]
+                        ).delete(reason="Empty queue room")
                     except Exception:
                         pass
                     self.rooms.pop(rid, None)
@@ -1194,14 +1212,16 @@ class Matchmaking(commands.Cog):
                 # vaciar si tenía gente (no debería en este esquema, pero por seguridad)
                 for m in list(info.get("players", [])):
                     try:
-                        await info["thread"].remove_user(m)
+                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                            info["thread"]
+                        ).remove_user(m)
                     except Exception:
                         pass
                 info["players"] = []
                 try:
-                    await info["thread"].delete(
-                        reason="Extra queue room after rebalance"
-                    )
+                    await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                        info["thread"]
+                    ).delete(reason="Extra queue room after rebalance")
                 except Exception:
                     pass
                 self.rooms.pop(rid, None)
@@ -1211,7 +1231,9 @@ class Matchmaking(commands.Cog):
             zip(rooms_in_use, groups), start=1
         ):
             info["display_num"] = idx
-            th: discord.Thread = info["thread"]
+            th: discord.Thread = self.bot.get_channel(
+                info["join_channel_id"]
+            ).get_thread(info["thread"])
             try:
                 await th.edit(name=f"room-{idx}")
             except Exception:
@@ -1408,10 +1430,12 @@ class Matchmaking(commands.Cog):
                 # si abajo se quedó vacío, lo borramos y cortamos (no hay más para donar)
                 if not info_down.get("players", []):
                     try:
-                        await info_down["thread"].edit(archived=True, locked=True)
-                        await info_down["thread"].delete(
-                            reason="Empty room after rebalance"
-                        )
+                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                            info["thread"]
+                        ).edit(archived=True, locked=True)
+                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                            info["thread"]
+                        ).delete(reason="Empty room after rebalance")
                     except Exception:
                         pass
                     self.rooms.pop(rid_down, None)
@@ -1503,7 +1527,7 @@ class Matchmaking(commands.Cog):
         await asyncio.sleep(0.2)  # 👈 evita “thread not ready” en algunos servers
 
         info = {
-            "thread": thread,
+            "thread": thread.id,
             "join_channel_id": join_channel.id,
             "server": server_code,
             "players": [],
@@ -1540,7 +1564,9 @@ class Matchmaking(commands.Cog):
 
         for idx, (_started, _negavg, _created, rid, info) in enumerate(scored, start=1):
             info["display_num"] = idx
-            th: discord.Thread = info["thread"]
+            th: discord.Thread = self.bot.get_channel(
+                info["join_channel_id"]
+            ).get_thread(info["thread"])
             try:
                 await th.edit(name=f"room-{idx}")
             except Exception:
@@ -1560,11 +1586,13 @@ class Matchmaking(commands.Cog):
             return
         info["players"].append(member)
         try:
-            await info["thread"].add_user(member)
+            await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                info["thread"]
+            ).add_user(member)
         except discord.Forbidden as e:
             log.error(
                 "add_user Forbidden in %s for %s (%s). Check Manage Threads/Create Private Threads perms.",
-                info["thread"].id,
+                info["thread"],
                 member.id,
                 member.display_name,
             )
@@ -1572,7 +1600,7 @@ class Matchmaking(commands.Cog):
         except discord.HTTPException as e:
             log.error(
                 "add_user HTTPException in %s for %s: %r",
-                info["thread"].id,
+                info["thread"],
                 member.id,
                 e,
             )
@@ -1585,7 +1613,9 @@ class Matchmaking(commands.Cog):
             return
         info["players"].remove(member)
         try:
-            await info["thread"].remove_user(member)
+            await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                info["thread"]
+            ).remove_user(member)
         except Exception:
             pass
         await self.update_room_board(member.guild, rid)
@@ -2079,7 +2109,7 @@ class Matchmaking(commands.Cog):
                 (
                     rid
                     for rid, info in self.rooms.items()
-                    if info["thread"].id == thread.id
+                    if info["thread"] == thread.id
                 ),
                 None,
             )
@@ -2148,7 +2178,9 @@ class Matchmaking(commands.Cog):
         if info.get("finished", False):
             return
 
-        thread: discord.Thread = info["thread"]
+        thread: discord.Thread = self.bot.get_channel(
+            info["join_channel_id"]
+        ).get_thread(info["thread"])
         try:
             content = await self._render_room_board_text(guild, rid)
             msg_id = info.get("board_msg_id")
@@ -2177,7 +2209,12 @@ class Matchmaking(commands.Cog):
     async def refresh_rooms_board_for_guild(self, guild: discord.Guild):
         """Re-renderiza todos los rooms del guild (para cambios de nombres)."""
         for rid, info in list(self.rooms.items()):
-            if info["thread"].guild.id == guild.id:
+            if (
+                self.bot.get_channel(info["join_channel_id"])
+                .get_thread(info["thread"])
+                .guild.id
+                == guild.id
+            ):
                 await self.update_room_board(guild, rid)
 
     @staticmethod
@@ -2295,7 +2332,7 @@ class Matchmaking(commands.Cog):
                 (
                     r
                     for r in self.rooms.values()
-                    if r.get("thread") and r["thread"].id == message.channel.id
+                    if r.get("thread") and r["thread"] == message.channel.id
                 ),
                 None,
             )
@@ -2998,7 +3035,9 @@ class Matchmaking(commands.Cog):
         # Evitar re-selección si ya se postearon songs (más fuerte que started)
         if room_info.get("songs_posted"):
             try:
-                await room_info["thread"].send("Songs already selected for this room.")
+                await self.bot.get_channel(room_info["join_channel_id"]).get_thread(
+                    room_info["thread"]
+                ).send("Songs already selected for this room.")
             except Exception:
                 pass
             return
@@ -3006,14 +3045,16 @@ class Matchmaking(commands.Cog):
         # Si ya está started, también protege (redundante pero ok)
         if room_info.get("started"):
             try:
-                await room_info["thread"].send(
-                    "Match already started; songs were selected earlier."
-                )
+                await self.bot.get_channel(room_info["join_channel_id"]).get_thread(
+                    room_info["thread"]
+                ).send("Match already started; songs were selected earlier.")
             except Exception:
                 pass
             return
 
-        thread = room_info["thread"]
+        thread = self.bot.get_channel(room_info["join_channel_id"]).get_thread(
+            room_info["thread"]
+        )
         players = room_info["players"]
 
         server_code = room_info.get("server", "en")
@@ -3164,11 +3205,12 @@ class Matchmaking(commands.Cog):
             for i, (title, lvl, diff, notes) in enumerate(picks, start=1)
         )
 
-        await thread.send(
-            f"Selected songs (Lv {low}–{high})\n"
+        msg = await thread.send(
+            f"Selected songs (Lv {low}-{high})\n"
             f"(Total {total_notes} notes)\n"
             f"{song_lines}"
         )
+        await msg.pin()
 
         # ——— MARCAR INICIO + TIMESTAMP ———
         room_info["songs_posted"] = True
@@ -3178,7 +3220,7 @@ class Matchmaking(commands.Cog):
 
         # refrescar el tablero del room y #rooms
         rid = next(
-            (rid for rid, r in self.rooms.items() if r["thread"].id == thread.id), None
+            (rid for rid, r in self.rooms.items() if r["thread"] == thread.id), None
         )
         if rid is not None:
             await self.update_room_board(thread.guild, rid)
@@ -3977,14 +4019,7 @@ class Matchmaking(commands.Cog):
         room = None
 
         for rid, info in (self.rooms or {}).items():
-            thr = info.get("thread")
-            thr_id = None
-            if isinstance(thr, discord.Thread):
-                thr_id = thr.id
-            else:
-                tid = info.get("thread_id") or info.get("thread_channel_id")
-                if isinstance(tid, int) and tid > 0:
-                    thr_id = tid
+            thr_id = info.get("thread")
 
             if thr_id is not None and thr_id == ch.id:
                 room_id = rid
@@ -4096,7 +4131,7 @@ class Matchmaking(commands.Cog):
             (
                 r
                 for r in self.rooms.values()
-                if r.get("thread") and r["thread"].id == ctx.channel.id
+                if r.get("thread") and r["thread"] == ctx.channel.id
             ),
             None,
         )
@@ -4148,7 +4183,7 @@ class Matchmaking(commands.Cog):
             (
                 r
                 for r in self.rooms.values()
-                if r.get("thread") and r["thread"].id == ctx.channel.id
+                if r.get("thread") and r["thread"] == ctx.channel.id
             ),
             None,
         )
@@ -4585,7 +4620,7 @@ class Matchmaking(commands.Cog):
                 (
                     rid
                     for rid, r in self.rooms.items()
-                    if r.get("thread") and r["thread"].id == ctx.channel.id
+                    if r.get("thread") and r["thread"] == ctx.channel.id
                 ),
                 None,
             )

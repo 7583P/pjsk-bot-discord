@@ -339,14 +339,7 @@ class Rooms(commands.Cog):
                     or info.get("full_ts")
                 )
 
-                thread_id = None
-                raw_thread = info.get("thread")
-                if isinstance(raw_thread, discord.Thread):
-                    thread_id = raw_thread.id
-                else:
-                    tid = info.get("thread_id") or info.get("thread_channel_id")
-                    if isinstance(tid, int) and tid > 0:
-                        thread_id = tid
+                thread_id = info["thread"]
 
                 grouped.setdefault(cat, []).append(
                     (
