@@ -840,7 +840,7 @@ class Matchmaking(commands.Cog):
         ]
         candidates.sort(key=lambda x: x[1])
 
-        lines = ["Next queue PREP windows (start happens 5 minutes later):"]
+        lines = ["Next queue will start at:"]
         for minute, t_prep in candidates:
             ts_prep = int(t_prep.timestamp())
             t_start = t_prep + dt.timedelta(minutes=5)
