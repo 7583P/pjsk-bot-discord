@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 # -----------------------------
 load_dotenv()
 
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1371306026917298267"))
 if GUILD_ID == 0:
     raise RuntimeError("GUILD_ID env var not set (it cannot be 0).")
 
