@@ -847,7 +847,7 @@ class Matchmaking(commands.Cog):
             ts_start = int(t_start.timestamp())
 
             lines.append(
-                f"• **:{minute:02d}** → <t:{ts_prep}:R>  |  starts at <t:{ts_start}:T> (<t:{ts_start}:R>)"
+                f"• **:{minute:02d}** → <t:{ts_prep}:R>  | rooms starts at <t:{ts_start}:T> (<t:{ts_start}:R>)"
             )
 
         lines.append("Type `/c` to join the queue or `/d` to drop the queue.")
