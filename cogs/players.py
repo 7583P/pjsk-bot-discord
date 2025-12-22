@@ -76,8 +76,15 @@ class PlayersCog(commands.Cog):
             command_timeout=30,
         )
 
-        # Sincroniza comandos del guild (rápido, no espera propagación global)
-        await self.bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        # Forzar limpieza + sync en el GUILD para que el comando aparezca al instante
+        guild = discord.Object(id=GUILD_ID)
+        self.bot.tree.clear_commands(guild=guild)
+        synced = await self.bot.tree.sync(guild=guild)
+
+        print(f"[PlayersCog] Synced {len(synced)} commands to guild {GUILD_ID}:")
+        for c in synced:
+            print(" -", c.name)
+
         print("[PlayersCog] asyncpg pool ready and commands synced.")
 
     async def cog_unload(self):
@@ -253,7 +260,7 @@ class PlayersCog(commands.Cog):
         )
 
     # -----------------------------
-    # Season utilities (unchanged logic, now pool-based)
+    # Season utilities
     # -----------------------------
     @staticmethod
     def _month_bounds_utc(today: dt.date) -> tuple[dt.date, dt.date]:
@@ -271,7 +278,6 @@ class PlayersCog(commands.Cog):
             raise RuntimeError("DB pool not initialized.")
 
         today = dt.date.today()
-        startdate, enddate = self._month_bounds_utc(today)
 
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
@@ -299,6 +305,7 @@ class PlayersCog(commands.Cog):
                     return current_id, (int(prev["id"]) if prev else None), False
 
                 # create a new season spanning the current month
+                startdate, enddate = self._month_bounds_utc(today)
                 await conn.execute("UPDATE seasons SET active = false WHERE active = true")
                 row = await conn.fetchrow(
                     """
@@ -475,4 +482,5 @@ class PlayersCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayersCog(bot))
+
 
