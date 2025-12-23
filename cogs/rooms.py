@@ -304,9 +304,7 @@ class Rooms(commands.Cog):
                 pdata_ids: list[tuple[int, int]] = [
                     (uid, mmr_map.get(uid, 0)) for uid in player_ids
                 ]
-
-                # Orden jugadores: MMR desc, y en empate user_id desc (estable)
-                pdata_ids.sort(key=lambda t: (int(t[1]), int(t[0])), reverse=True)
+                pdata_ids.sort(key=lambda t: t[1], reverse=True)
 
                 mmr_vals = [mmr for _, mmr in pdata_ids]
                 avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
@@ -436,6 +434,7 @@ class Rooms(commands.Cog):
                                 else:
                                     status = "[SCHEDULED]"
                             elif phase == PHASE_PREPARED:
+                                # Compat: si por alguna razón usas PREPARED antes de FUTURE
                                 status = "[PREPARED]"
                             else:
                                 # Compat con flujos antiguos
@@ -463,7 +462,6 @@ class Rooms(commands.Cog):
                                 f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
                             )
 
-                        # Jugadores ya vienen ordenados desc por MMR
                         for uid, mmr in pdata_ids:
                             lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
                         lines.append("")
@@ -492,15 +490,8 @@ class Rooms(commands.Cog):
 
                     lines.append("**Queue**")
 
-                    # Orden SOLO para display (no altera la cola real en mm.queues)
-                    queue_ids_sorted = sorted(
-                        queue_ids,
-                        key=lambda uid: (int(mmr_map_q.get(uid, 0)), int(uid)),
-                        reverse=True,
-                    )
-
-                    for idx in range(0, len(queue_ids_sorted), ROOM_CAPACITY):
-                        grp_ids = queue_ids_sorted[idx : idx + ROOM_CAPACITY]
+                    for idx in range(0, len(queue_ids), ROOM_CAPACITY):
+                        grp_ids = queue_ids[idx : idx + ROOM_CAPACITY]
                         grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
                         avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
                         count_q = len(grp_ids)
@@ -521,6 +512,7 @@ class Rooms(commands.Cog):
                             )
                         lines.append("")
                 else:
+                    # Si no hay active rooms y no hay queue
                     if not rooms_list:
                         lines.append("**No active rooms**")
 
@@ -551,10 +543,8 @@ class Rooms(commands.Cog):
                             pass
                         except discord.HTTPException:
                             pass
-
             with open("assets/cached_rooms.json", "w+", encoding="utf-8") as f:
                 json.dump(all_rooms, f)
-
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")
 
