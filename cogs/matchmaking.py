@@ -715,9 +715,8 @@ class Matchmaking(commands.Cog):
     # Nuevo schedule (Lima):
     # PREP:  :25–:29 y :55–:59
     # START: :30–:34 y :00–:04
-    PREP_WINDOWS = ((25, 29), (55, 59))  # inclusive
-    START_WINDOWS = ((0, 4), (30, 34))   # inclusive
-
+    PREP_WINDOWS = ((55, 59), (15, 19), (35, 39))  # inclusive
+    START_WINDOWS = ((0, 4), (20, 24), (40, 44))  # inclusive
 
     def _slot_start_from_prep_start(
         self, now: dt.datetime, prep_start: int
@@ -913,9 +912,10 @@ class Matchmaking(commands.Cog):
             pass
 
     async def _announce_next_queue_windows_on_00(self, join_channel, now):
-        # Próximos PREP windows: :25 y :55 (inicio real: :30 y :00)
+        # Próximos PREP windows típicos: :15, :35, :55
         candidates = [
-            (25, self._next_occurrence_of_minute(now, 25)),
+            (15, self._next_occurrence_of_minute(now, 15)),
+            (35, self._next_occurrence_of_minute(now, 35)),
             (55, self._next_occurrence_of_minute(now, 55)),
         ]
         candidates.sort(key=lambda x: x[1])
@@ -936,7 +936,6 @@ class Matchmaking(commands.Cog):
             await join_channel.send("\n".join(lines))
         except Exception:
             pass
-
 
     def _window_start_minute(
         self, minute: int, windows: tuple[tuple[int, int], ...]

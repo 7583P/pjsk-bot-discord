@@ -551,4 +551,3 @@ class Rooms(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Rooms(bot))
-
