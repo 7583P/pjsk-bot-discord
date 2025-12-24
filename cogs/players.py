@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 # Cargar variables de entorno
 load_dotenv()
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID", "1371306026917298267"))
 DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
 
 # Diccionario con todos los roles de rango (Discord Role IDs)

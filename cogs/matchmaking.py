@@ -712,8 +712,12 @@ class Matchmaking(commands.Cog):
         return dt.datetime.now(tz=LIMA_TZ)
 
     # Nuevo schedule:
-    PREP_WINDOWS = ((55, 59), (15, 19), (35, 39))  # inclusive
-    START_WINDOWS = ((0, 4), (20, 24), (40, 44))  # inclusive
+    # Nuevo schedule (Lima):
+    # PREP:  :25–:29 y :55–:59
+    # START: :30–:34 y :00–:04
+    PREP_WINDOWS = ((25, 29), (55, 59))  # inclusive
+    START_WINDOWS = ((0, 4), (30, 34))   # inclusive
+
 
     def _slot_start_from_prep_start(
         self, now: dt.datetime, prep_start: int
@@ -780,7 +784,7 @@ class Matchmaking(commands.Cog):
 
         try:
             await join_channel.send(
-                f"⏳ **{mins_left} min left** — A queue will be starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
+                f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
                 f"{need_part}Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
@@ -896,7 +900,7 @@ class Matchmaking(commands.Cog):
         mentions = " ".join(m.mention for m in leftovers)
         try:
             await join_channel.send(
-                f"⛔ Slot reached and the room did not fill. Dropping **{len(leftovers)}** player(s) from queue: {mentions}\n"
+                f"Not enough players to start the room, Dropping **{len(leftovers)}** player(s) from queue: {mentions}\n"
                 f"Type `/c` to re-join for the next slot."
             )
         except Exception:
@@ -909,27 +913,30 @@ class Matchmaking(commands.Cog):
             pass
 
     async def _announce_next_queue_windows_on_00(self, join_channel, now):
-        # Próximos PREP windows típicos: :15, :35, :55
+        # Próximos PREP windows: :25 y :55 (inicio real: :30 y :00)
         candidates = [
-            (15, self._next_occurrence_of_minute(now, 15)),
-            (35, self._next_occurrence_of_minute(now, 35)),
+            (25, self._next_occurrence_of_minute(now, 25)),
             (55, self._next_occurrence_of_minute(now, 55)),
         ]
-        candidates.sort(
-            key=lambda x: x[1]
-        )  # orden por datetime (lo más cercano primero)
+        candidates.sort(key=lambda x: x[1])
 
-        lines = ["A queue will be starting at:"]
-        for minute, t in candidates:
-            ts = int(t.timestamp())
-            lines.append(f"• **:{minute:02d}** → <t:{ts}:R>")
+        lines = ["Next queue will start at:"]
+        for minute, t_prep in candidates:
+            ts_prep = int(t_prep.timestamp())
+            t_start = t_prep + dt.timedelta(minutes=5)
+            ts_start = int(t_start.timestamp())
 
-        lines.append("Type `/c` for join the queue or `/d` to drop the queue.")
+            lines.append(
+                f"• **:{minute:02d}** → <t:{ts_prep}:R>  | rooms starts at <t:{ts_start}:T> (<t:{ts_start}:R>)"
+            )
+
+        lines.append("Type `/c` to join the queue or `/d` to drop the queue.")
 
         try:
             await join_channel.send("\n".join(lines))
         except Exception:
             pass
+
 
     def _window_start_minute(
         self, minute: int, windows: tuple[tuple[int, int], ...]
@@ -1206,7 +1213,7 @@ class Matchmaking(commands.Cog):
             try:
                 await self.bot.get_channel(info["join_channel_id"]).get_thread(
                     info["thread"]
-                ).send("✅ Match started (scheduled slot). Good luck.")
+                ).send(" Match started, Good luck and have fun!")
             except Exception:
                 pass
 
