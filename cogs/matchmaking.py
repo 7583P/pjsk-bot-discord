@@ -1,4 +1,4 @@
-import os, io, re, json
+import os, io, re, json, secrets
 import random
 import asyncio
 import datetime
@@ -364,6 +364,7 @@ LIMA_TZ = ZoneInfo("America/Lima")
 PHASE_FUTURE = "FUTURE"  # en cola (sin hilo)
 PHASE_PREPARED = "PREPARED"  # hilo creado + canciones posteadas (locked-in)
 PHASE_STARTED = "STARTED"  # inicio real en :00/:30
+PHASE_PENDING = "PENDING"  # unfilled rooms past queue time
 PHASE_FINISHED = "FINISHED"
 
 
@@ -785,6 +786,85 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
+    async def _pend_unfilled_queue_on_slot(
+        self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
+    ):
+        """
+        En el minuto exacto del slot (:00 / :20 / :40):
+        si la cola NO completó el siguiente grupo de 5, room state -> pending
+        """
+        join_id = join_channel.id
+        ordered = await self._get_ordered_queue_members(guild, join_id)
+        if not ordered:
+            return
+
+        rem = len(ordered) % ROOM_CAPACITY
+        if rem == 0:
+            return  # no hay grupo incompleto
+
+        leftovers = ordered[-rem:]  # los que quedaron “en la sala que no se llenó”
+
+        # mensaje público con quiénes salieron
+        mentions = " ".join(m.mention for m in leftovers)
+        try:
+            await join_channel.send(
+                f"⛔ Slot reached and the room did not fill. Waiting for **{5 - len(leftovers)}** player(s) to fill your room, {mentions}\n"
+                f"Type `/c` to join this room!"
+            )
+        except Exception:
+            pass
+
+        join_id = join_channel.id
+        ordered = await self._get_ordered_queue_members(guild, join_id)
+
+        now = self._now_lima()
+
+        server_code = JOIN_CHANNEL_CFG.get(join_id, {}).get("server", "en")
+
+        # calcular avg mmr para naming (en base al grupo)
+        mmr_map = await self._fetch_mmrs_batch([m.id for m in leftovers])
+        mmr_vals = [int(mmr_map.get(m.id, 0)) for m in leftovers]
+        avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+        rank = self._rank_label_from_mmr(avg)
+
+        thread_name = f"unfilled a{avg} {rank}"
+
+        rid, info = await self._create_room(
+            join_channel, server_code=server_code, thread_name=thread_name
+        )
+
+        # mover de cola a room
+        for m in leftovers:
+            self.queues[join_id].discard(m.id)
+            await self._add_member_to_room(m, rid, info)
+            self.queue_join_order.get(join_id, {}).pop(m.id, None)
+
+        # marcar como PENDING
+        info["phase"] = PHASE_PENDING
+        info["locked_in_thread"] = True
+        info["slot_start_ts"] = None
+        info["avg_mmr"] = avg
+        info["rank_label"] = rank
+        info["started"] = False
+        info["songs_posted"] = False
+
+        mentions = " ".join(m.mention for m in leftovers)
+
+        # Ping + aviso de cuándo se publican songs
+        allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
+        await self.bot.get_channel(info["join_channel_id"]).get_thread(
+            info["thread"]
+        ).send(
+            f"{mentions}\n" + f"Waiting for {5-len(leftovers)} players to start room.",
+            allowed_mentions=allowed,
+        )
+
+        # refrescar #rooms
+        try:
+            self.bot.dispatch("room_updated", None)
+        except Exception:
+            pass
+
     async def _purge_unfilled_queue_on_slot(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
@@ -987,6 +1067,74 @@ class Matchmaking(commands.Cog):
 
             # notificar a Rooms cog
             self.bot.dispatch("room_updated", rid)
+
+    async def _start_pending_room(self, rid: int):
+        info = self.rooms.get(rid, None)
+        if not info:
+            return
+
+        if info.get("finished", False):
+            return
+
+        if info.get("phase") != PHASE_PENDING:
+            return
+
+        if info.get("slot_start_ts", 0) != None:
+            return
+
+        players = [m for m in info.get("players", []) if m and not m.bot]
+        n = len(players)
+
+        # si se quedaron sin gente
+        if n < 2:
+            info["finished"] = True
+            info["closed"] = True
+            try:
+                await self._remove_queue_roles(players)
+            except Exception:
+                pass
+            try:
+                await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                    info["thread"]
+                ).send("⛔ Room did not start (not enough players). Closing room.")
+            except Exception:
+                pass
+            try:
+                self.bot.dispatch("room_finished", rid)
+            except Exception:
+                pass
+            asyncio.create_task(
+                self.close_room(
+                    self.bot.get_channel(info["join_channel_id"]).get_thread(
+                        info["thread"]
+                    ),
+                    delay=5,
+                    delete=True,
+                )
+            )
+            return
+
+        # 1) Postear songs EXACTAMENTE en el slot
+        try:
+            await self.launch_song_poll(
+                info
+            )  # esto postea "Selected songs..." en el thread
+        except Exception:
+            pass
+
+        # 2) Marcar started
+        info["phase"] = PHASE_STARTED
+        info["started"] = True
+        info["started_at"] = int(self._now_lima().timestamp())
+
+        try:
+            await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                info["thread"]
+            ).send("✅ Match started (unfilled room). Good luck.")
+        except Exception:
+            pass
+
+        self.bot.dispatch("room_updated", rid)
 
     async def _start_future_rooms_for_slot(self, join_channel_id: int, slot_ts: int):
         """
@@ -2308,7 +2456,10 @@ class Matchmaking(commands.Cog):
                         slot_ts = int(slot_dt.timestamp())
 
                         # (1) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
-                        await self._purge_unfilled_queue_on_slot(
+                        # await self._purge_unfilled_queue_on_slot(
+                        #     guild, join_channel, now
+                        # )
+                        await self._pend_unfilled_queue_on_slot(
                             guild, join_channel, now
                         )
 
@@ -3033,7 +3184,7 @@ class Matchmaking(commands.Cog):
 
     async def launch_song_poll(self, room_info):
         # Evitar re-selección si ya se postearon songs (más fuerte que started)
-        if room_info.get("songs_posted"):
+        if room_info.get("songs_posted") and not room_info.get("rerolling"):
             try:
                 await self.bot.get_channel(room_info["join_channel_id"]).get_thread(
                     room_info["thread"]
@@ -3043,7 +3194,7 @@ class Matchmaking(commands.Cog):
             return
 
         # Si ya está started, también protege (redundante pero ok)
-        if room_info.get("started"):
+        if room_info.get("started") and not room_info.get("rerolling"):
             try:
                 await self.bot.get_channel(room_info["join_channel_id"]).get_thread(
                     room_info["thread"]
@@ -3179,7 +3330,7 @@ class Matchmaking(commands.Cog):
                     picks.extend(pool_append[:remaining])
 
             # Máximo 5 canciones
-            picks = picks[:5]
+            final_picks = secrets.SystemRandom().sample(picks, k=5)
 
             # e) Decidir qué gap mostrar
             if used_append and append_range is not None:
@@ -3192,17 +3343,20 @@ class Matchmaking(commands.Cog):
                 low, high = base_lo, base_hi
 
         # 4) Construir el mensaje
-        total_notes = sum(int(n or 0) for *_, n in picks)  # suma segura
+        total_notes = sum(int(n or 0) for *_, n in final_picks)  # suma segura
 
         # Guardar info de la sala
         room_info["total_notes"] = total_notes
         room_info["gap_low"] = low
         room_info["gap_high"] = high
-        room_info["songs"] = picks  # 👈 NEW: guardamos las canciones seleccionadas
+        room_info["songs"] = (
+            final_picks  # 👈 NEW: guardamos las canciones seleccionadas
+        )
+        room_info["rerolling"] = False
 
         song_lines = "\n".join(
             f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
-            for i, (title, lvl, diff, notes) in enumerate(picks, start=1)
+            for i, (title, lvl, diff, notes) in enumerate(final_picks, start=1)
         )
 
         msg = await thread.send(
@@ -3272,7 +3426,10 @@ class Matchmaking(commands.Cog):
                 return ch
         return await guild.create_text_channel(JOIN_CHANNEL_NAME)
 
-    @app_commands.command(name="c", description="Join queue for the next room slot")
+    @app_commands.command(
+        name="c",
+        description="Join queue for the next room slot (or next unfilled room)",
+    )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
         ch = interaction.channel
@@ -3314,6 +3471,41 @@ class Matchmaking(commands.Cog):
                 return await interaction.response.send_message(
                     "⛔ Queue is locked down until the next slot.", ephemeral=True
                 )
+
+            for rid, info in list(self.rooms.items()):
+                if info.get("join_channel_id") != ch.id:
+                    continue
+                if info.get("finished", False):
+                    continue
+
+                if info.get("phase") != PHASE_PENDING:
+                    continue
+
+                players = [m for m in info.get("players", []) if m and not m.bot]
+                n = len(players)
+
+                # si se quedaron sin gente
+                if n < 5:
+                    await self._add_member_to_room(interaction.user, rid, info)
+                    # calcular avg mmr para naming (en base al grupo)
+                    mmr_map = await self._fetch_mmrs_batch(
+                        [m.id for m in info["players"]]
+                    )
+                    mmr_vals = [int(mmr_map.get(m.id, 0)) for m in info["players"]]
+                    avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+                    rank = self._rank_label_from_mmr(avg)
+
+                    if n + 1 == 5:
+                        thread_name = f"r{rid} a{avg} {rank}"
+                    else:
+                        thread_name = f"unfilled a{avg} {rank}"
+                    self.bot.dispatch("room_updated", rid)
+                    await self.bot.get_channel(info["join_channel_id"]).get_thread(
+                        info["thread"]
+                    ).edit(name=thread_name)
+                    if n + 1 == 5:
+                        await self._start_pending_room(rid)
+                    return
 
             # Encolar
             self.queues.setdefault(ch.id, set()).add(member.id)
@@ -3551,7 +3743,7 @@ class Matchmaking(commands.Cog):
         await interaction.response.send_message(board)
 
     @app_commands.command(
-        name="d", description="Leave queue (only in #join / #jp-join)"
+        name="d", description="Leave queue (only in #join / #jp-join) (or pending room)"
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def leave_queue(self, interaction: discord.Interaction):
@@ -3577,9 +3769,54 @@ class Matchmaking(commands.Cog):
                     PHASE_STARTED,
                 ) and not info.get("finished", False):
                     return await interaction.response.send_message(
-                        "❌ You are locked in a room. You can’t leave until the room finishes.",
+                        "❌ You are locked in a room. You can't leave until the room finishes.",
                         ephemeral=True,
                     )
+                if info.get("phase") == PHASE_PENDING:
+                    if info.get("join_channel_id") != ch.id:
+                        return
+                    if info.get("finished", False):
+                        return
+
+                    players = [m for m in info.get("players", []) if m and not m.bot]
+                    n = len(players)
+
+                    # si se quedaron sin gente
+                    if n < 5:
+                        await self._remove_member_from_room(interaction.user, rid, info)
+                        # calcular avg mmr para naming (en base al grupo)
+                        if n - 1 == 0:
+                            await self.close_room(
+                                self.bot.get_channel(
+                                    info["join_channel_id"]
+                                ).get_thread(info["thread"]),
+                                delay=0,
+                                delete=True,
+                            )
+                        else:
+                            mmr_map = await self._fetch_mmrs_batch(
+                                [m.id for m in info["players"]]
+                            )
+                            mmr_vals = [
+                                int(mmr_map.get(m.id, 0)) for m in info["players"]
+                            ]
+                            avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+                            rank = self._rank_label_from_mmr(avg)
+                            thread_name = f"unfilled a{avg} {rank}"
+                            self.bot.dispatch("room_updated", rid)
+                            await self.bot.get_channel(
+                                info["join_channel_id"]
+                            ).get_thread(info["thread"]).edit(name=thread_name)
+                        await ch.send(f"({member.mention}) left the pending room.")
+                        return await interaction.response.send_message(
+                            "Room left.",
+                            ephemeral=True,
+                        )
+                    else:
+                        return await interaction.response.send_message(
+                            "❌ You are locked in a room. You can't leave until the room finishes.",
+                            ephemeral=True,
+                        )
 
             # Si está en cola de este canal, lo sacamos
             q = self.queues.get(ch.id, set())
@@ -4000,6 +4237,123 @@ class Matchmaking(commands.Cog):
         except Exception:
             # Si no lo encuentro o no tengo permisos, vuelvo al canal actual
             return fallback
+
+    @app_commands.command(
+        name="reroll", description="Vote to reroll the songs in the current room."
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def reroll(self, interaction: discord.Interaction):
+        # Debe ejecutarse dentro de un thread de room
+        ch = interaction.channel
+        if not isinstance(ch, (discord.Thread, discord.TextChannel)):
+            await interaction.response.send_message(
+                "This command must be used inside a room thread.", ephemeral=True
+            )
+            return
+
+        # Encontrar room por thread
+        room_id = None
+        room = None
+
+        for rid, info in (self.rooms or {}).items():
+            thr_id = info.get("thread")
+
+            if thr_id is not None and thr_id == ch.id:
+                room_id = rid
+                room = info
+                break
+
+        if room is None:
+            await interaction.response.send_message(
+                "This does not look like an active room thread.", ephemeral=True
+            )
+            return
+
+        if room.get("finished") or room.get("closed"):
+            await interaction.response.send_message(
+                "This room is already closed.", ephemeral=True
+            )
+            return
+
+        if room.get("rerolled"):
+            await interaction.response.send_message(
+                "You can only reroll the songs once.", ephemeral=True
+            )
+            return
+
+        # Resolver lista actual de jugadores (Members)
+        raw_players = room.get("players", []) or []
+        players_now: list[discord.Member] = []
+        for p in raw_players:
+            if isinstance(p, discord.Member):
+                if not p.bot:
+                    players_now.append(p)
+            elif isinstance(p, discord.User):
+                # best effort: convertir a Member si está en guild
+                if interaction.guild:
+                    m = interaction.guild.get_member(p.id)
+                    if m and not m.bot:
+                        players_now.append(m)
+            elif isinstance(p, int):
+                if interaction.guild:
+                    m = interaction.guild.get_member(p)
+                    if m and not m.bot:
+                        players_now.append(m)
+
+        # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
+        n_players = len(players_now)
+        threshold = max(1, (n_players // 2) + 1)  # mayoría simple
+
+        # Estructura de votos
+        votes = room.setdefault("reroll_votes", {})
+        uid = interaction.user.id
+
+        # Registrar voto "YES"
+        votes[str(uid)] = True
+
+        yes_count = sum(1 for v in votes.values() if v is True)
+
+        # Si no alcanza, solo reporta estado
+        if yes_count < threshold:
+            try:
+                await interaction.response.send_message(
+                    f"🗳️ Reroll vote registered. YES: {yes_count}/{threshold} required.",
+                    ephemeral=False,
+                )
+            except discord.InteractionResponded:
+                await interaction.followup.send(
+                    f"🗳️ Reroll vote registered. YES: {yes_count}/{threshold} required."
+                )
+            return
+
+        # Aprobado: cerrar room
+        room["rerolled"] = True
+
+        # Notificar en el thread
+        try:
+            await ch.send("🔄 Song reroll approved by vote.")
+        except Exception:
+            pass
+
+        room["rerolling"] = True
+
+        # Disparar evento para Rooms cog
+        try:
+            self.bot.dispatch("room_updated", room_id)
+        except Exception:
+            pass
+
+        await self.launch_song_poll(
+            room
+        )  # esto postea "Selected songs..." en el thread
+
+        # Responder interacción
+        try:
+            await interaction.response.send_message(
+                "✅ Reroll confirmed.", ephemeral=True
+            )
+        except discord.InteractionResponded:
+            await interaction.followup.send("✅ Reroll confirmed.", ephemeral=True)
 
     @app_commands.command(
         name="forfeit", description="Vote to forfeit the current room."
