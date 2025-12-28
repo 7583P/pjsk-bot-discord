@@ -1084,9 +1084,10 @@ class Matchmaking(commands.Cog):
 
         if info.get("phase") != PHASE_PENDING:
             return
-
-        if info.get("slot_start_ts", 0) != None:
+        
+        if info.get("slot_start_ts") is not None:
             return
+
 
         players = [m for m in info.get("players", []) if m and not m.bot]
         n = len(players)
@@ -1469,13 +1470,16 @@ class Matchmaking(commands.Cog):
         await join_channel.send(f"Starting room {disp} with players:\n{block}")
 
     def _rooms_for_parent(self, parent_id: int) -> list[tuple[int, dict]]:
-        """Salas activas (no finished) cuyo thread.parent_id == parent_id."""
-        out = []
+        """
+        Salas activas (no finished) asociadas a un join_channel (parent_id).
+        Nota: info["thread"] se guarda como thread_id (int), no como objeto Thread.
+        Por eso la forma correcta de agrupar es por join_channel_id.
+        """
+        out: list[tuple[int, dict]] = []
         for rid, info in self.rooms.items():
             if info.get("finished", False):
                 continue
-            th: discord.Thread = info.get("thread")
-            if th and th.parent_id == parent_id:
+            if int(info.get("join_channel_id") or 0) == int(parent_id):
                 out.append((rid, info))
         return out
 
@@ -1584,16 +1588,24 @@ class Matchmaking(commands.Cog):
                 # si abajo se quedó vacío, lo borramos y cortamos (no hay más para donar)
                 if not info_down.get("players", []):
                     try:
-                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
-                            info["thread"]
-                        ).edit(archived=True, locked=True)
-                        await self.bot.get_channel(info["join_channel_id"]).get_thread(
-                            info["thread"]
-                        ).delete(reason="Empty room after rebalance")
+                        down_parent = self.bot.get_channel(info_down["join_channel_id"])
+                        if down_parent and isinstance(down_parent, discord.TextChannel):
+                            down_thread = down_parent.get_thread(info_down["thread"])
+                            if down_thread:
+                                try:
+                                    await down_thread.edit(archived=True, locked=True)
+                                except Exception:
+                                    pass
+                                try:
+                                    await down_thread.delete(reason="Empty room after rebalance")
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
+
                     self.rooms.pop(rid_down, None)
                     break
+
 
         # Al final: reindex/renombrar para reflejar el nuevo orden
         await self._reindex_parent_rooms(guild, parent_id)
@@ -3405,26 +3417,29 @@ class Matchmaking(commands.Cog):
 
     async def fetch_player(self, user_id: int):
         season = await self.get_current_season()
+        if not season:
+            return 0, "Placement"
         season_id = season["id"]
 
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1 and sp.season_id  = $2",
+                """
+                SELECT sp.mmr, sp.role
+                FROM players p
+                INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
+                WHERE p.user_id = $1
+                AND sp.season_id = $2
+                """,
                 user_id,
                 season_id,
             )
-            if row:
-                return row["mmr"], row["role"]
-            # await conn.execute(
-            #     "INSERT INTO players (user_id, mmr, role) VALUES ($1, 0, 'Placement')",
-            #     user_id,
-            # )
-            row = await conn.fetchrow(
-                "SELECT sp.mmr, sp.role FROM players p inner join seasonplayers sp on p.user_id = sp.user_id WHERE p.user_id = $1 and sp.season_id  = $2",
-                user_id,
-                season_id,
-            )
-            return row["mmr"], row["role"]
+
+            if not row:
+                # Fail-safe: evita crash cuando aún no existe registro
+                return 0, "Placement"
+
+            return int(row["mmr"]), str(row["role"])
+
 
     async def ensure_join_channel(self, guild: discord.Guild):
         for ch in guild.text_channels:
