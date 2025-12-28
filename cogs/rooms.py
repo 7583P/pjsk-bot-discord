@@ -385,20 +385,73 @@ class Rooms(commands.Cog):
                 guild = channel.guild
                 lines: list[str] = []
 
-                # ---- A) Active rooms ----
-                rooms_list = grouped.get(cat_id, [])
-                if rooms_list:
-                    # Prioridad: STARTED primero, luego FUTURE/SCHEDULED, luego lo demás; dentro por avg desc
-                    def prio(t: tuple) -> int:
-                        started_flag = bool(t[3])
-                        phase = t[7]
-                        if started_flag or phase == PHASE_STARTED:
-                            return 0
-                        if phase == PHASE_FUTURE:
-                            return 1
-                        return 2
+                # ---- A) Active rooms + Next Slot (waiting) ----
+                rooms_list = grouped.get(cat_id, []) or []
 
-                    rooms_list.sort(key=lambda t: (prio(t), -int(t[2]), int(t[0])))
+                active_rooms: list[tuple] = []
+                future_rooms: list[tuple] = []
+
+                for t in rooms_list:
+                    # t =
+                    # (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+                    phase = t[7]
+                    if phase == PHASE_FUTURE and not bool(t[3]):
+                        # FUTURE que aún no ha empezado => “next slot”
+                        future_rooms.append(t)
+                    else:
+                        # STARTED o WAITING/READY del slot actual
+                        active_rooms.append(t)
+
+                # Orden:
+                # - Active: STARTED primero, luego waiting/ready; dentro por avg desc
+                def active_prio(t: tuple) -> int:
+                    started_flag = bool(t[3])
+                    phase = t[7]
+                    if started_flag or phase == PHASE_STARTED:
+                        return 0
+                    return 1
+
+                active_rooms.sort(key=lambda t: (active_prio(t), -int(t[2]), int(t[0])))
+
+                # - Future: por slot_start_ts asc (si existe) y luego avg desc
+                def future_sort_key(t: tuple):
+                    slot_ts = t[8] if isinstance(t[8], int) else 0
+                    # 0 al final si no hay ts
+                    slot_ts = slot_ts if slot_ts > 0 else 10**12
+                    return (slot_ts, -int(t[2]), int(t[0]))
+
+                future_rooms.sort(key=future_sort_key)
+
+                def render_room(
+                    rid: int,
+                    pdata_ids: list[tuple[int, int]],
+                    avg: int,
+                    status: str,
+                    thread_id: int,
+                ):
+                    count = len(pdata_ids)
+                    ref = (
+                        f"<#{thread_id}>"
+                        if isinstance(thread_id, int) and thread_id > 0
+                        else None
+                    )
+
+                    if ref:
+                        lines.append(
+                            f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
+                        )
+                    else:
+                        lines.append(
+                            f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
+                        )
+
+                    for uid, mmr in pdata_ids:
+                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
+                    lines.append("")
+
+                if active_rooms:
+                    lines.append("**Active Rooms**")
+                    lines.append("")
 
                     for (
                         rid,
@@ -411,60 +464,60 @@ class Rooms(commands.Cog):
                         phase,
                         slot_start_ts,
                         songs_posted,
-                    ) in rooms_list:
+                    ) in active_rooms:
                         count = len(pdata_ids)
 
-                        # Status
-                        if started_flag:
+                        if started_flag or phase == PHASE_STARTED:
                             status = (
                                 f"[STARTED] <t:{started_ts}:t>"
                                 if started_ts
                                 else "[STARTED]"
                             )
                         else:
-                            if phase == PHASE_FUTURE:
-                                if slot_start_ts:
-                                    if songs_posted:
-                                        status = f"[SCHEDULED] songs posted · <t:{slot_start_ts}:t>"
-                                    else:
-                                        status = (
-                                            f"[SCHEDULED] songs at <t:{slot_start_ts}:t> "
-                                            f"(<t:{slot_start_ts}:R>)"
-                                        )
-                                else:
-                                    status = "[SCHEDULED]"
-                            elif phase == PHASE_PREPARED:
-                                # Compat: si por alguna razón usas PREPARED antes de FUTURE
-                                status = "[PREPARED]"
+                            # “Activas” pero aún sin empezar (slot actual)
+                            if count == ROOM_CAPACITY:
+                                status = (
+                                    f"[READY 5/5] <t:{reached5_ts}:t>"
+                                    if reached5_ts
+                                    else "[READY 5/5]"
+                                )
                             else:
-                                # Compat con flujos antiguos
-                                if count == ROOM_CAPACITY:
-                                    status = (
-                                        f"[READY 5/5] <t:{reached5_ts}:t>"
-                                        if reached5_ts
-                                        else "[READY 5/5]"
-                                    )
-                                else:
-                                    status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
-                        ref = (
-                            f"<#{thread_id}>"
-                            if isinstance(thread_id, int) and thread_id > 0
-                            else None
-                        )
+                        render_room(rid, pdata_ids, avg, status, thread_id)
 
-                        if ref:
-                            lines.append(
-                                f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
+                # FUTURE rooms (next slot) SIEMPRE ABAJO de las activas
+                if future_rooms:
+                    if lines and lines[-1].strip() != "":
+                        lines.append("")
+
+                    lines.append("**Next Slot (waiting)**")
+                    lines.append("")
+
+                    for (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                    ) in future_rooms:
+                        count = len(pdata_ids)
+
+                        # Requisito: aunque sea FUTURE, si se está llenando => WAITING (no SCHEDULED)
+                        if slot_start_ts:
+                            status = (
+                                f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> "
+                                f"(<t:{slot_start_ts}:R>)"
                             )
                         else:
-                            lines.append(
-                                f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
-                            )
+                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
 
-                        for uid, mmr in pdata_ids:
-                            lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
-                        lines.append("")
+                        render_room(rid, pdata_ids, avg, status, thread_id)
 
                 # ---- B) Queue ----
                 join_id = cat_to_join.get(cat_id)
@@ -512,7 +565,7 @@ class Rooms(commands.Cog):
                             )
                         lines.append("")
                 else:
-                    # Si no hay active rooms y no hay queue
+                    # Si no hay rooms y no hay queue
                     if not rooms_list:
                         lines.append("**No active rooms**")
 
@@ -543,8 +596,10 @@ class Rooms(commands.Cog):
                             pass
                         except discord.HTTPException:
                             pass
+
             with open("assets/cached_rooms.json", "w+", encoding="utf-8") as f:
                 json.dump(all_rooms, f)
+
         except Exception as e:
             print(f"[Rooms] Error en _do_update: {e}")
 
