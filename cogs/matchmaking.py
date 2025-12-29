@@ -761,45 +761,47 @@ class Matchmaking(commands.Cog):
     async def _announce_queue_countdown_prep_minute(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
-        """
-        En PREP (:x5..:x9): manda "X min left" SOLO si falta gente para completar el próximo room.
-        Si no falta gente (need == 0), NO manda countdown.
-        """
         prep_start = self._in_prep_window(now)  # 55 / 25
         if prep_start is None:
             return
 
         slot_dt = self._slot_start_from_prep_start(now, prep_start)
-        mins_left = int(
-            (slot_dt - now.replace(second=0, microsecond=0)).total_seconds() // 60
-        )
 
-        # Debe ser 5..1
+        # now puede venir con segundos; lo normalizamos para que 14:59:xx -> 1 min left
+        now0 = now.replace(second=0, microsecond=0)
+        mins_left = int((slot_dt - now0).total_seconds() // 60)
+
+        # Solo 5..1
         if mins_left < 1 or mins_left > 5:
             return
 
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
-        if not ordered:
-            return
+        qlen = len(ordered)
 
-        rem = len(ordered) % ROOM_CAPACITY
-        need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
+        # Need incluso si no hay nadie
+        if qlen == 0:
+            need = ROOM_CAPACITY
+        else:
+            rem = qlen % ROOM_CAPACITY
+            need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
-        # ✅ REGLA: countdown SOLO si falta gente
-        if need == 0:
-            return
-
-        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}> "
         slot_ts = int(slot_dt.timestamp())
 
-        # Ping solo al inicio del PREP (mins_left == 5)
-        ping_part = ping if mins_left == 5 else ""
+        # Ping seguro (sin KeyError)
+        ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(join_id)
+        ping_part = f"<@&{ping_role_id}> " if (ping_role_id and mins_left == 5) else ""
+
+        # Texto cuando ya está completo
+        if need == 0:
+            need_txt = "Next room is already full."
+        else:
+            need_txt = f"Need ({need}) player(s) to fill the next room."
 
         try:
             await join_channel.send(
                 f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
-                f"{ping_part}Need ({need}) player(s) to fill the next room. "
+                f"{ping_part}{need_txt} "
                 f"Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
@@ -2518,11 +2520,6 @@ class Matchmaking(commands.Cog):
 
                         # 1) crear threads para grupos completos y postear canciones
                         await self._prepare_rooms_for_join_channel(guild, join_channel)
-
-                        # 2) tu mensaje actual de need (si aplica)
-                        await self._announce_need_players_prep_minute(
-                            guild, join_channel, now
-                        )
 
                         # 3) NUEVO: countdown + timestamp al slot
                         await self._announce_queue_countdown_prep_minute(
@@ -5146,6 +5143,8 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
+
 
 
 
