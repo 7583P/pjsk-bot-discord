@@ -737,7 +737,7 @@ class Matchmaking(commands.Cog):
 
     def _next_occurrence_of_minute(self, now: dt.datetime, minute: int) -> dt.datetime:
         """
-        Próxima ocurrencia (>= now) de un minuto específico (:15/:35/:55) en hora local.
+        Próxima ocurrencia (>= now) de un minuto específico (:25/:55) en hora local.
         Si ya pasó en esta hora, usa la siguiente hora.
         """
         base = now.replace(second=0, microsecond=0)
@@ -914,8 +914,7 @@ class Matchmaking(commands.Cog):
     async def _announce_next_queue_windows_on_00(self, join_channel, now):
         # Próximos PREP windows típicos: :15, :35, :55
         candidates = [
-            (15, self._next_occurrence_of_minute(now, 15)),
-            (35, self._next_occurrence_of_minute(now, 35)),
+            (25, self._next_occurrence_of_minute(now, 25)),
             (55, self._next_occurrence_of_minute(now, 55)),
         ]
         candidates.sort(key=lambda x: x[1])
@@ -997,7 +996,7 @@ class Matchmaking(commands.Cog):
         self, guild: discord.Guild, join_channel: discord.TextChannel
     ):
         """
-        PREP (:55/:15/:35 windows) -> crea threads y mueve jugadores,
+        PREP (:55/:25 windows) -> crea threads y mueve jugadores,
         PERO NO postea canciones. Las canciones se postean en el slot (:00/:20/:40).
         """
         join_id = join_channel.id
@@ -5103,4 +5102,5 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+))
 
