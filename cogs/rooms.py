@@ -1,405 +1,594 @@
-# rooms.py
-# PJSK Lounge - Rooms status updater
-#
-# Fix: mantiene 1 mensaje por canal de status (global vs JP) y SOLO muestra el join correspondiente.
-# - #rooms  -> muestra SOLO #join
-# - #jp-rooms -> muestra SOLO #jp-join
-#
-# Requisitos:
-# - discord.py 2.x
-# - permisos del bot en ambos canales: View Channel, Read Message History, Send Messages, Embed Links
+# cogs/rooms.py
 
 from __future__ import annotations
 
 import asyncio
-import logging
+import json
 import os
-import sqlite3
-from dataclasses import dataclass
+import time
 from datetime import datetime, timedelta
-from typing import Optional, Sequence
+from typing import Optional
 
 import discord
 from discord.ext import commands, tasks
 
-try:
-    from zoneinfo import ZoneInfo  # py>=3.9
-except Exception:  # pragma: no cover
-    ZoneInfo = None  # type: ignore
+# -----------------------------
+# CONFIG
+# -----------------------------
+
+# Mapea cada category_id al canal “rooms” correspondiente
+CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
+    1371306302671687710: 1371307831176728706,  # pjsk-queue → #rooms
+    1371951461612912802: 1388515368934309978,  # jp-pjsk    → #jp-rooms
+}
+
+ROOM_CAPACITY = 5
+
+# Marcadores
+HUMAN_LAST_UPDATE_LABEL = "Last update"
+BOARD_MARKER = "[PJSK_ROOMS_BOARD]"  # marcador único para localizar el mensaje correcto
+
+# Fases (para renderizar FUTURE correctamente)
+PHASE_FUTURE = "FUTURE"
+PHASE_PREPARED = "PREPARED"
+PHASE_STARTED = "STARTED"
+PHASE_FINISHED = "FINISHED"
+
+# Slot “next” (solo para display). Si tu Matchmaking ya maneja slots, esto solo es UI.
+SLOT_INTERVAL_MINUTES = 30
+
+# Estado persistente del mensaje tablero (para no depender del history)
+STATE_PATH = "assets/rooms_board_state.json"
+
+# Cache debug serializable (no revienta por objetos discord)
+DEBUG_SNAPSHOT_PATH = "assets/cached_rooms.json"
 
 
-log = logging.getLogger(__name__)
+# -----------------------------
+# Helpers de estado persistente
+# -----------------------------
+
+def _ensure_assets_dir() -> None:
+    os.makedirs("assets", exist_ok=True)
 
 
-# ----------------------------
-# Config (importa tu config.py si existe, si no usa ENV)
-# ----------------------------
-
-def _env_int(name: str, default: Optional[int] = None) -> int:
-    v = os.getenv(name)
-    if v is None:
-        if default is None:
-            raise RuntimeError(f"Missing required env var: {name}")
-        return default
+def _load_state() -> dict:
+    _ensure_assets_dir()
     try:
-        return int(v)
-    except ValueError as e:
-        raise RuntimeError(f"Invalid int env var {name}={v!r}") from e
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f) or {}
+    except Exception:
+        return {}
 
 
-def _env_str(name: str, default: str) -> str:
-    return os.getenv(name, default)
+def _save_state(state: dict) -> None:
+    _ensure_assets_dir()
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_PATH)
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+def _round_up_to_next_slot(now: datetime, interval_minutes: int) -> datetime:
+    base = now.replace(second=0, microsecond=0)
+    remainder = base.minute % interval_minutes
+    if remainder == 0:
+        return base + timedelta(minutes=interval_minutes)
+    return base + timedelta(minutes=(interval_minutes - remainder))
 
 
-# Intenta leer desde config.py (recomendado)
-try:
-    from config import (  # type: ignore
-        ROOMS_CHANNEL_ID,
-        JOIN_CHANNEL_ID,
-        JP_ROOMS_CHANNEL_ID,
-        JP_JOIN_CHANNEL_ID,
-        ROOMS_UPDATE_INTERVAL_SECONDS,
-        ROOMS_SLOT_INTERVAL_MINUTES,
-        ROOMS_STATUS_SCAN_LIMIT,
-        ROOMS_TIMEZONE,
-        ROOMS_PIN_STATUS_MESSAGE,
-        SQLITE_PATH,
-    )
-except Exception:
-    # Fallback a env vars
-    ROOMS_CHANNEL_ID = _env_int("ROOMS_CHANNEL_ID")
-    JOIN_CHANNEL_ID = _env_int("JOIN_CHANNEL_ID")
-    JP_ROOMS_CHANNEL_ID = _env_int("JP_ROOMS_CHANNEL_ID")
-    JP_JOIN_CHANNEL_ID = _env_int("JP_JOIN_CHANNEL_ID")
+# -----------------------------
+# Cog
+# -----------------------------
 
-    ROOMS_UPDATE_INTERVAL_SECONDS = _env_int("ROOMS_UPDATE_INTERVAL_SECONDS", 30)
-    ROOMS_SLOT_INTERVAL_MINUTES = _env_int("ROOMS_SLOT_INTERVAL_MINUTES", 30)
-    ROOMS_STATUS_SCAN_LIMIT = _env_int("ROOMS_STATUS_SCAN_LIMIT", 50)
-
-    ROOMS_TIMEZONE = _env_str("ROOMS_TIMEZONE", "America/Lima")
-    ROOMS_PIN_STATUS_MESSAGE = _env_bool("ROOMS_PIN_STATUS_MESSAGE", False)
-    SQLITE_PATH = _env_str("SQLITE_PATH", "pjsk_lounge.db")
-
-
-# ----------------------------
-# SQLite state store (solo para recordar el message_id por canal)
-# ----------------------------
-
-class BotStateStore:
-    def __init__(self, path: str) -> None:
-        self.path = path
-
-    def _ensure(self) -> None:
-        conn = sqlite3.connect(self.path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS bot_state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def _get(self, key: str) -> Optional[str]:
-        conn = sqlite3.connect(self.path)
-        try:
-            cur = conn.cursor()
-            cur.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
-            row = cur.fetchone()
-            return row[0] if row else None
-        finally:
-            conn.close()
-
-    def _set(self, key: str, value: str) -> None:
-        conn = sqlite3.connect(self.path)
-        try:
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO bot_state(key, value) VALUES(?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    async def init(self) -> None:
-        await asyncio.to_thread(self._ensure)
-
-    async def get(self, key: str) -> Optional[str]:
-        return await asyncio.to_thread(self._get, key)
-
-    async def set(self, key: str, value: str) -> None:
-        await asyncio.to_thread(self._set, key, value)
-
-
-# ----------------------------
-# Rooms status Cog
-# ----------------------------
-
-@dataclass(frozen=True)
-class RegionConfig:
-    key: str
-    status_channel_id: int
-    join_channel_id: int
-    state_message_id_key: str
-
-
-class RoomsStatusCog(commands.Cog):
-    def __init__(self, bot: commands.Bot) -> None:
+class Rooms(commands.Cog):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.store = BotStateStore(SQLITE_PATH)
 
-        self.regions: Sequence[RegionConfig] = (
-            RegionConfig(
-                key="global",
-                status_channel_id=ROOMS_CHANNEL_ID,
-                join_channel_id=JOIN_CHANNEL_ID,
-                state_message_id_key="rooms_status_message_id_global",
-            ),
-            RegionConfig(
-                key="jp",
-                status_channel_id=JP_ROOMS_CHANNEL_ID,
-                join_channel_id=JP_JOIN_CHANNEL_ID,
-                state_message_id_key="rooms_status_message_id_jp",
-            ),
-        )
+        # { category_id: discord.Message }
+        self.posted_messages: dict[int, discord.Message] = {}
 
-        self._tz = None
-        if ZoneInfo is not None:
-            try:
-                self._tz = ZoneInfo(ROOMS_TIMEZONE)
-            except Exception:
-                self._tz = None
+        # Evita condiciones de carrera
+        self._update_lock = asyncio.Lock()
 
-        self.update_rooms_status.start()
+        # Coalesce: si llegan muchos eventos, hacemos como máximo 1 update extra al final
+        self._update_pending: bool = False
 
-    def cog_unload(self) -> None:
-        self.update_rooms_status.cancel()
+        # Estado persistente: {str(cat_id): {"channel_id": int, "message_id": int}}
+        self._state = _load_state()
 
-    def _now(self) -> datetime:
-        now = datetime.utcnow()
-        if self._tz is not None:
-            return now.replace(tzinfo=discord.utils.UTC).astimezone(self._tz)
-        return now
+        # Listeners para refrescar al vuelo
+        bot.add_listener(self.on_room_updated, "room_updated")
+        bot.add_listener(self.on_room_finished, "room_finished")
 
-    @tasks.loop(seconds=ROOMS_UPDATE_INTERVAL_SECONDS)
-    async def update_rooms_status(self) -> None:
-        for cfg in self.regions:
-            try:
-                await self._update_one_region(cfg)
-            except Exception:
-                log.exception("rooms status update failed for region=%s", cfg.key)
+        # Loop de respaldo
+        self.update_rooms.start()
 
-    @update_rooms_status.before_loop
-    async def _before(self) -> None:
+    def cog_unload(self):
+        self.update_rooms.cancel()
+        self.bot.remove_listener(self.on_room_updated, "room_updated")
+        self.bot.remove_listener(self.on_room_finished, "room_finished")
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        print("✅ Cog cargado: cogs.rooms")
+
+    @tasks.loop(seconds=15.0)
+    async def update_rooms(self):
+        await self._request_update()
+
+    @update_rooms.before_loop
+    async def before_update(self):
         await self.bot.wait_until_ready()
-        await self.store.init()
 
-    async def _update_one_region(self, cfg: RegionConfig) -> None:
-        status_ch = await self._get_text_channel(cfg.status_channel_id)
-        join_ch = await self._get_text_channel(cfg.join_channel_id)
+    async def on_room_updated(self, room_id: int | None = None):
+        await self._request_update()
 
-        if status_ch is None:
-            log.warning("Status channel not found: %s (%s)", cfg.status_channel_id, cfg.key)
-            return
-        if join_ch is None:
-            log.warning("Join channel not found: %s (%s)", cfg.join_channel_id, cfg.key)
-            return
+    async def on_room_finished(self, room_id: int):
+        await asyncio.sleep(1)
+        await self._request_update()
 
-        embed = await self._build_embed(join_ch, cfg_key=cfg.key)
-
-        msg = await self._get_or_discover_status_message(status_ch, cfg.state_message_id_key)
-        if msg is None:
-            # Crea uno nuevo
-            msg = await status_ch.send(embed=embed)
-            if ROOMS_PIN_STATUS_MESSAGE:
-                try:
-                    await msg.pin(reason="Rooms status message")
-                except Exception:
-                    pass
-            await self.store.set(cfg.state_message_id_key, str(msg.id))
+    async def _request_update(self):
+        """
+        Evita que se encolen muchos updates.
+        Si ya hay uno corriendo, marca pending y sale.
+        El update en curso ejecutará uno extra al finalizar.
+        """
+        if self._update_lock.locked():
+            self._update_pending = True
             return
 
-        # Edita el mensaje existente (respeta canal + mensaje)
-        await msg.edit(content="", embed=embed)
+        async with self._update_lock:
+            while True:
+                self._update_pending = False
+                await self._do_update_core()
+                if not self._update_pending:
+                    break
 
-    async def _get_text_channel(self, channel_id: int) -> Optional[discord.TextChannel]:
+    async def _get_text_channel(
+        self,
+        channel_id: int,
+        cache: dict[int, discord.abc.GuildChannel | None] | None = None,
+    ) -> discord.TextChannel | None:
+        if not isinstance(channel_id, int) or channel_id <= 0:
+            return None
+
+        if cache is not None and channel_id in cache:
+            ch = cache[channel_id]
+            return ch if isinstance(ch, discord.TextChannel) else None
+
         ch = self.bot.get_channel(channel_id)
         if isinstance(ch, discord.TextChannel):
+            if cache is not None:
+                cache[channel_id] = ch
             return ch
+
         try:
             fetched = await self.bot.fetch_channel(channel_id)
+            if cache is not None:
+                cache[channel_id] = fetched
             return fetched if isinstance(fetched, discord.TextChannel) else None
         except Exception:
+            if cache is not None:
+                cache[channel_id] = None
             return None
 
-    async def _get_or_discover_status_message(
-        self,
-        status_channel: discord.TextChannel,
-        state_key: str,
-    ) -> Optional[discord.Message]:
-        # 1) Intenta por ID persistido (lo más seguro)
-        stored = await self.store.get(state_key)
-        if stored:
-            try:
-                mid = int(stored)
-                return await status_channel.fetch_message(mid)
-            except Exception:
-                # si ya no existe / no se puede leer, cae a discovery
-                pass
+    async def _find_last_board_message(self, channel: discord.TextChannel) -> discord.Message | None:
+        """
+        Reutiliza el último mensaje tablero del bot en el canal (para no duplicar mensajes tras reinicios).
+        Requiere Read Message History.
+        """
+        try:
+            me = self.bot.user
+            if me is None:
+                return None
 
-        # 2) Discovery: busca el último mensaje del bot en ese canal
-        me_id = self.bot.user.id if self.bot.user else None
-        if me_id is None:
+            async for msg in channel.history(limit=50):
+                if msg.author and msg.author.id == me.id:
+                    # Primero intentamos con marker nuevo
+                    if msg.content and BOARD_MARKER in msg.content:
+                        return msg
+
+            async for msg in channel.history(limit=50):
+                if msg.author and msg.author.id == me.id:
+                    # Compatibilidad con tu marker viejo
+                    if msg.content and ("Last Update" in msg.content or "Last update" in msg.content):
+                        return msg
+
+            # Último fallback: último mensaje del bot, aunque sea embed (lo vamos a limpiar)
+            async for msg in channel.history(limit=50):
+                if msg.author and msg.author.id == me.id:
+                    return msg
+
+        except Exception:
             return None
-
-        async for m in status_channel.history(limit=ROOMS_STATUS_SCAN_LIMIT, oldest_first=False):
-            if m.author and m.author.id == me_id:
-                # Preferimos el que ya es "PJSK ROOMS" embed, pero también aceptamos el viejo "No active rooms"
-                if m.embeds:
-                    e = m.embeds[0]
-                    if (e.title or "").strip().upper() == "PJSK ROOMS":
-                        await self.store.set(state_key, str(m.id))
-                        return m
-                # fallback por contenido legacy
-                if m.content and ("No active rooms" in m.content or "Last Update" in m.content or "PJSK" in m.content):
-                    await self.store.set(state_key, str(m.id))
-                    return m
 
         return None
 
-    def _compute_next_slot(self, now: datetime, interval_minutes: int) -> datetime:
-        # Redondea hacia arriba al próximo múltiplo del intervalo
-        base = now.replace(second=0, microsecond=0)
-        minutes = base.minute
-        remainder = minutes % interval_minutes
-        if remainder == 0:
-            # si ya está exacto, toma el siguiente slot (evita que "next slot" sea ahora)
-            return base + timedelta(minutes=interval_minutes)
-        delta = interval_minutes - remainder
-        return base + timedelta(minutes=delta)
-
-    async def _build_embed(self, join_channel: discord.TextChannel, cfg_key: str) -> discord.Embed:
-        now = self._now()
-        now_ts = int(now.timestamp())
-        next_slot = self._compute_next_slot(now, ROOMS_SLOT_INTERVAL_MINUTES)
-        next_ts = int(next_slot.timestamp())
-
-        active_threads = await self._get_active_threads_for(join_channel)
-
-        # Render de rooms
-        if not active_threads:
-            rooms_lines = ["_No active rooms._"]
-        else:
-            rooms_lines = []
-            for t in active_threads[:25]:
-                # member_count puede ser None; lo mostramos sólo si existe
-                mc = getattr(t, "member_count", None)
-                suffix = f" — **{mc}/5**" if isinstance(mc, int) and mc > 0 else ""
-                rooms_lines.append(f"• <#{t.id}>{suffix}")
-
-        # Queue (opcional: intenta leer desde un provider si existe; si no, muestra vacío)
-        queue_lines = await self._render_queue(cfg_key)
-        if not queue_lines:
-            queue_lines = ["_Queue empty._"]
-
-        desc = []
-        desc.append(f"**Last update:** <t:{now_ts}:T> (<t:{now_ts}:R>)")
-        desc.append("")
-        desc.append(f"**#{join_channel.name}**")
-        desc.extend(rooms_lines)
-        desc.append("────────────────────────")
-        desc.append(f"**FUTURE ROOMS** (next slot <t:{next_ts}:T>, <t:{next_ts}:R>)")
-        desc.extend(queue_lines)
-
-        embed = discord.Embed(
-            title="PJSK ROOMS",
-            description="\n".join(desc),
-        )
-        return embed
-
-    async def _get_active_threads_for(self, join_channel: discord.TextChannel) -> list[discord.Thread]:
-        # Asegura lista completa (sin depender solo de cache)
-        threads: list[discord.Thread] = []
-
-        # 1) cache local del canal
-        try:
-            threads.extend([t for t in join_channel.threads if not t.archived])
-        except Exception:
-            pass
-
-        # 2) fetch global de threads activos del guild (más confiable)
-        try:
-            active = await join_channel.guild.active_threads()
-            # discord.py devuelve objeto con .threads en algunas versiones; en otras, lista directa
-            active_threads = getattr(active, "threads", active)
-            for t in active_threads:
-                if isinstance(t, discord.Thread) and t.parent_id == join_channel.id and not t.archived:
-                    threads.append(t)
-        except Exception:
-            pass
-
-        # Dedup por id
-        uniq: dict[int, discord.Thread] = {}
-        for t in threads:
-            uniq[t.id] = t
-
-        # Orden: más nuevos primero
-        out = list(uniq.values())
-        out.sort(key=lambda x: x.created_at or discord.utils.snowflake_time(x.id), reverse=True)
-        return out
-
-    async def _render_queue(self, cfg_key: str) -> list[str]:
+    async def _ensure_prev_message(self, cat_id: int, channel: discord.TextChannel) -> None:
         """
-        Intenta obtener la cola desde distintos providers sin acoplar rooms.py a tu matchmaking.
-        Si no encuentra nada, devuelve [] y el embed mostrará Queue empty.
+        1) Si ya está en memoria, ok.
+        2) Si hay message_id persistido, fetch.
+        3) Si no, busca en history.
         """
-        # 1) Si existe un cog con método get_queue_snapshot(region_key) -> list[int]
-        for cog_name in ("Matchmaking", "MatchmakingCog", "Queue", "QueueCog"):
-            cog = self.bot.get_cog(cog_name)
-            if cog is None:
-                continue
-            fn = getattr(cog, "get_queue_snapshot", None)
-            if callable(fn):
+        if cat_id in self.posted_messages:
+            return
+
+        # 2) persistido
+        try:
+            st = self._state.get(str(cat_id)) or {}
+            mid = st.get("message_id")
+            ch_id = st.get("channel_id")
+            if isinstance(mid, int) and isinstance(ch_id, int) and ch_id == channel.id:
                 try:
-                    user_ids = await fn(cfg_key)  # type: ignore[misc]
-                    return self._format_queue_user_ids(user_ids)
+                    msg = await channel.fetch_message(mid)
+                    self.posted_messages[cat_id] = msg
+                    return
                 except Exception:
                     pass
+        except Exception:
+            pass
 
-        # 2) Si el bot expone un atributo queue_by_region / queues
-        for attr in ("queue_by_region", "queues", "queue"):
-            q = getattr(self.bot, attr, None)
-            if isinstance(q, dict):
-                user_ids = q.get(cfg_key) or q.get(cfg_key.upper()) or q.get(cfg_key.lower())
-                if isinstance(user_ids, (list, tuple)):
-                    return self._format_queue_user_ids(user_ids)
+        # 3) history
+        prev = await self._find_last_board_message(channel)
+        if prev is not None:
+            self.posted_messages[cat_id] = prev
+            self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": prev.id}
+            _save_state(self._state)
 
-        return []
+    async def _get_active_season_id(self, mm) -> int | None:
+        sid = getattr(mm, "current_season_id", None)
+        if isinstance(sid, int) and sid > 0:
+            return sid
 
-    def _format_queue_user_ids(self, user_ids: Sequence[int]) -> list[str]:
-        ids = [int(x) for x in user_ids if isinstance(x, int) or (isinstance(x, str) and str(x).isdigit())]
-        if not ids:
-            return []
-        # Muestra máximo 10 para no hacer embed gigante
-        shown = ids[:10]
-        mentions = " ".join(f"<@{uid}>" for uid in shown)
-        more = f" (+{len(ids) - len(shown)} more)" if len(ids) > len(shown) else ""
-        return [f"**{len(ids)} queued:** {mentions}{more}"]
+        if getattr(mm, "db_pool", None) is None:
+            return None
+
+        try:
+            async with mm.db_pool.acquire() as con:
+                row = await con.fetchrow(
+                    "SELECT id FROM seasons WHERE active = true ORDER BY startdate DESC LIMIT 1"
+                )
+                return int(row["id"]) if row else None
+        except Exception:
+            return None
+
+    def _coerce_ts(self, raw) -> int | None:
+        if isinstance(raw, (int, float)):
+            ts = int(raw)
+            return ts if ts > 0 else None
+        if raw is not None and hasattr(raw, "timestamp"):
+            try:
+                ts = int(raw.timestamp())
+                return ts if ts > 0 else None
+            except Exception:
+                return None
+        return None
+
+    async def _fetch_mmrs_batch(
+        self,
+        mm,
+        user_ids: list[int],
+        season_id: int | None,
+        has_pool: bool,
+    ) -> dict[int, int]:
+        if not user_ids:
+            return {}
+
+        # Dedup
+        user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
+
+        mmr_map: dict[int, int] = {}
+        try:
+            if has_pool and season_id:
+                async with mm.db_pool.acquire() as con:
+                    rows_db = await con.fetch(
+                        """
+                        WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
+                        SELECT u.user_id, COALESCE(sp.mmr, 0) AS mmr
+                        FROM u
+                        LEFT JOIN seasonplayers sp
+                          ON sp.user_id = u.user_id AND sp.season_id = $2
+                        """,
+                        user_ids,
+                        season_id,
+                    )
+                    mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
+            else:
+                for uid in user_ids:
+                    _mmr, _ = await mm.fetch_player(uid)
+                    mmr_map[int(uid)] = int(_mmr)
+        except Exception:
+            for uid in user_ids:
+                try:
+                    _mmr, _ = await mm.fetch_player(uid)
+                    mmr_map[int(uid)] = int(_mmr)
+                except Exception:
+                    mmr_map[int(uid)] = 0
+
+        return mmr_map
+
+    def _user_label(self, guild: discord.Guild, uid: int) -> str:
+        m = guild.get_member(uid)
+        if m is not None:
+            return m.display_name
+        u = self.bot.get_user(uid)
+        if u is not None:
+            return u.display_name
+        # Mantengo mención para que sea clickeable, pero NO pingea por allowed_mentions=none
+        return f"<@{uid}>"
+
+    def _build_content(self, lines: list[str], now_ts: int) -> str:
+        footer = f"{HUMAN_LAST_UPDATE_LABEL}: <t:{now_ts}:T> (<t:{now_ts}:R>) {BOARD_MARKER}"
+        if not lines or BOARD_MARKER not in (lines[-1] if lines else ""):
+            lines = lines + [footer]
+
+        content = "\n".join(lines)
+        if len(content) <= 1990:
+            return content
+
+        body = lines[:-1]
+        while body and len("\n".join(body + ["…(truncated)", footer])) > 1990:
+            body.pop()
+        return "\n".join(body + ["…(truncated)", footer])
+
+    async def _do_update_core(self):
+        mm = self.bot.get_cog("Matchmaking")
+        if mm is None:
+            return
+
+        # Snapshot de estado
+        all_rooms = getattr(mm, "rooms", {}) or {}
+        queues = getattr(mm, "queues", {}) or {}
+
+        # Resolver season 1 vez
+        season_id = await self._get_active_season_id(mm)
+        has_pool = getattr(mm, "db_pool", None) is not None and bool(season_id)
+
+        # Cache de canales por update
+        ch_cache: dict[int, discord.abc.GuildChannel | None] = {}
+
+        # category_id -> join_channel_id (derivado de queues)
+        cat_to_join: dict[int, int] = {}
+        for join_id in list(queues.keys()):
+            ch = await self._get_text_channel(join_id, cache=ch_cache)
+            if ch is None or ch.category is None:
+                continue
+            cat_id = ch.category.id
+            if cat_id in CATEGORY_TO_ROOM_CHANNEL:
+                cat_to_join[cat_id] = join_id
+
+        # Agrupar rooms por categoría
+        grouped: dict[int, list[tuple]] = {}
+        for rid, info in (all_rooms.items() if isinstance(all_rooms, dict) else []):
+            try:
+                cat = info.get("category_id")
+                if cat not in CATEGORY_TO_ROOM_CHANNEL:
+                    continue
+
+                raw_players = info.get("players", []) or []
+                player_ids: list[int] = []
+                for p in raw_players:
+                    if isinstance(p, (discord.Member, discord.User)):
+                        player_ids.append(p.id)
+                    elif isinstance(p, int):
+                        player_ids.append(p)
+                    elif isinstance(p, dict) and isinstance(p.get("id"), int):
+                        player_ids.append(int(p["id"]))
+
+                player_ids = list(dict.fromkeys(player_ids))
+
+                mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool) if player_ids else {}
+                pdata_ids = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
+                pdata_ids.sort(key=lambda t: t[1], reverse=True)
+
+                mmr_vals = [mmr for _, mmr in pdata_ids]
+                avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
+
+                phase = info.get("phase")
+                phase = phase.upper() if isinstance(phase, str) else None
+
+                slot_start_ts = self._coerce_ts(info.get("slot_start_ts"))
+                songs_posted = bool(info.get("songs_posted", False))
+
+                state = info.get("state")
+                started_flag = (
+                    phase == PHASE_STARTED
+                    or bool(info.get("started"))
+                    or (isinstance(state, str) and state.upper() == PHASE_STARTED)
+                )
+                started_ts = self._coerce_ts(info.get("started_ts") or info.get("start_ts") or info.get("started_at"))
+                reached5_ts = self._coerce_ts(info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts"))
+
+                thread_id = info.get("thread")  # puede ser None
+                grouped.setdefault(cat, []).append(
+                    (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+                )
+            except Exception:
+                # No dejes que una sala rota rompa todo el update
+                continue
+
+        # Debug snapshot serializable (no rompe update)
+        try:
+            _ensure_assets_dir()
+            snap = {
+                "rooms": {
+                    str(rid): {
+                        "category_id": (info.get("category_id") if isinstance(info, dict) else None),
+                        "thread": (info.get("thread") if isinstance(info, dict) else None),
+                        "phase": (info.get("phase") if isinstance(info, dict) else None),
+                        "players": [
+                            (p.id if isinstance(p, (discord.Member, discord.User)) else p)
+                            for p in ((info.get("players") or []) if isinstance(info, dict) else [])
+                            if isinstance(p, (int, discord.Member, discord.User))
+                        ],
+                    }
+                    for rid, info in (all_rooms.items() if isinstance(all_rooms, dict) else [])
+                },
+                "queues": {str(k): list(v) if isinstance(v, list) else [] for k, v in (queues.items() if isinstance(queues, dict) else [])},
+                "cat_to_join": {str(k): v for k, v in cat_to_join.items()},
+            }
+            with open(DEBUG_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        now_ts = int(time.time())
+        now_dt = datetime.utcnow()
+        next_slot_dt = _round_up_to_next_slot(now_dt, SLOT_INTERVAL_MINUTES)
+        next_slot_ts = int(next_slot_dt.timestamp())
+
+        # IMPORTANTE: procesa cada categoría con try/except para no bloquear JP
+        for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
+            try:
+                channel = await self._get_text_channel(room_chan_id, cache=ch_cache)
+                if not isinstance(channel, discord.TextChannel):
+                    continue
+
+                await self._ensure_prev_message(cat_id, channel)
+                guild = channel.guild
+
+                join_id = cat_to_join.get(cat_id)
+                join_ch = await self._get_text_channel(join_id, cache=ch_cache) if isinstance(join_id, int) else None
+                join_label = f"#{join_ch.name}" if isinstance(join_ch, discord.TextChannel) else "join"
+
+                rooms_list = grouped.get(cat_id, []) or []
+
+                active_rooms: list[tuple] = []
+                future_rooms: list[tuple] = []
+
+                for t in rooms_list:
+                    phase = t[7]
+                    started_flag = bool(t[3])
+                    if phase == PHASE_FUTURE and not started_flag:
+                        future_rooms.append(t)
+                    else:
+                        active_rooms.append(t)
+
+                def active_prio(t: tuple) -> int:
+                    started_flag = bool(t[3])
+                    phase = t[7]
+                    return 0 if (started_flag or phase == PHASE_STARTED) else 1
+
+                active_rooms.sort(key=lambda t: (active_prio(t), -int(t[2]), int(t[0])))
+
+                def future_sort_key(t: tuple):
+                    slot_ts = t[8] if isinstance(t[8], int) else 0
+                    slot_ts = slot_ts if slot_ts > 0 else 10**12
+                    return (slot_ts, -int(t[2]), int(t[0]))
+
+                future_rooms.sort(key=future_sort_key)
+
+                lines: list[str] = []
+                lines.append("**PJSK ROOMS**")
+                lines.append(f"**{join_label}**")
+                lines.append("")
+
+                def render_room(rid: int, pdata_ids: list[tuple[int, int]], avg: int, status: str, thread_id: Optional[int]):
+                    count = len(pdata_ids)
+                    ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else ""
+                    if ref:
+                        lines.append(f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
+                    else:
+                        lines.append(f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
+                    for uid, mmr in pdata_ids:
+                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
+                    lines.append("")
+
+                if not active_rooms:
+                    lines.append("_No active rooms._")
+                    lines.append("")
+                else:
+                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in active_rooms:
+                        count = len(pdata_ids)
+                        if started_flag or phase == PHASE_STARTED:
+                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
+                        else:
+                            if count == ROOM_CAPACITY:
+                                status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
+                            else:
+                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_room(rid, pdata_ids, avg, status, thread_id)
+
+                lines.append("────────────────────────")
+
+                # FUTURE header siempre (como tu screenshot)
+                lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
+
+                # Si hay rooms FUTURE explícitas, muéstralas
+                if future_rooms:
+                    lines.append("")
+                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
+                        count = len(pdata_ids)
+                        if slot_start_ts:
+                            status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
+                        else:
+                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_room(rid, pdata_ids, avg, status, thread_id)
+
+                # Queue (derivada del join correspondiente)
+                queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
+                queue_ids: list[int] = []
+                for item in (queue_raw or []):
+                    if isinstance(item, int):
+                        queue_ids.append(item)
+                    elif isinstance(item, (discord.Member, discord.User)):
+                        queue_ids.append(item.id)
+                queue_ids = list(dict.fromkeys(queue_ids))
+
+                if not queue_ids:
+                    lines.append("_Queue empty._")
+                else:
+                    mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
+                    lines.append("")
+                    for idx in range(0, len(queue_ids), ROOM_CAPACITY):
+                        grp_ids = queue_ids[idx: idx + ROOM_CAPACITY]
+                        grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
+                        avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
+                        count_q = len(grp_ids)
+                        q_status = "[READY 5/5]" if count_q == ROOM_CAPACITY else f"[WAITING {count_q}/{ROOM_CAPACITY}]"
+                        group_n = (idx // ROOM_CAPACITY) + 1
+                        lines.append(f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**")
+                        for uid in grp_ids:
+                            lines.append(f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})")
+                        lines.append("")
+
+                content = self._build_content(lines, now_ts)
+
+                prev_msg = self.posted_messages.get(cat_id)
+
+                # Si no existe mensaje previo o el canal cambió, mandamos uno nuevo
+                if prev_msg is None or prev_msg.channel.id != channel.id:
+                    msg = await channel.send(
+                        content,
+                        allowed_mentions=discord.AllowedMentions.none(),
+                    )
+                    self.posted_messages[cat_id] = msg
+                    self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": msg.id}
+                    _save_state(self._state)
+                    continue
+
+                # Edit seguro: LIMPIA embeds (esto arregla tu caso donde quedó el embed “PJSK ROOMS” mezclado)
+                if prev_msg.content != content:
+                    try:
+                        await prev_msg.edit(
+                            content=content,
+                            embeds=[],
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        msg = await channel.send(
+                            content,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                        self.posted_messages[cat_id] = msg
+                        self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": msg.id}
+                        _save_state(self._state)
+
+            except Exception as e:
+                print(f"[Rooms] Error actualizando categoría {cat_id}: {e}")
+                continue
 
 
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(RoomsStatusCog(bot))
+async def setup(bot: commands.Bot):
+    await bot.add_cog(Rooms(bot))
