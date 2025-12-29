@@ -788,9 +788,18 @@ class Matchmaking(commands.Cog):
 
         slot_ts = int(slot_dt.timestamp())
 
-        # Ping seguro (sin KeyError)
+        # Ping seguro (sin KeyError) — solo si:
+        # - hay gente en cola (qlen > 0)
+        # - el siguiente room NO está lleno todavía (need > 0)
+        # - es el aviso de 5 minutos
         ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(join_id)
-        ping_part = f"<@&{ping_role_id}> " if (ping_role_id and mins_left == 5) else ""
+        do_ping = (
+            ping_role_id is not None
+            and mins_left == 5
+            and qlen > 0
+            and need > 0
+        )
+        ping_part = f"<@&{ping_role_id}> " if do_ping else ""
 
         # Texto cuando ya está completo
         if need == 0:
@@ -5143,8 +5152,6 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
-xxxxxz
 
 
 
