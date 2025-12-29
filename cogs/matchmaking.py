@@ -715,14 +715,14 @@ class Matchmaking(commands.Cog):
     # Nuevo schedule (Lima):
     # PREP:  :25–:29 y :55–:59
     # START: :30–:34 y :00–:04
-    PREP_WINDOWS = ((55, 59), (15, 19), (35, 39))  # inclusive
-    START_WINDOWS = ((0, 4), (20, 24), (40, 44))  # inclusive
+    PREP_WINDOWS = ((55, 59), (25, 29))  # inclusive
+    START_WINDOWS = ((0, 4), (30, 34))  # inclusive
 
     def _slot_start_from_prep_start(
         self, now: dt.datetime, prep_start: int
     ) -> dt.datetime:
         """
-        PREP start = 55/15/35  -> slot start = 00/20/40.
+        PREP start = 55//25  -> slot start = 00/30.
         Retorna datetime local Lima del start real del slot.
         """
         base = now.replace(second=0, microsecond=0)
@@ -746,16 +746,26 @@ class Matchmaking(commands.Cog):
             cand += dt.timedelta(hours=1)
         return cand
 
+    def _find_room_by_thread_id(self, thread_id: int) -> tuple[int | None, dict | None]:
+        """
+        Devuelve (rid, info) para un thread activo (no finished) por su thread_id.
+        """
+        for rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if int(info.get("thread", 0) or 0) == int(thread_id):
+                return rid, info
+        return None, None
+
+
     async def _announce_queue_countdown_prep_minute(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
-        En PREP (:x5..:x9): cada minuto manda un mensaje con:
-        - minutos restantes (5..1) para el slot (:x0)
-        - timestamp del slot
-        - opcional: need players para completar el próximo room
+        En PREP (:x5..:x9): manda "X min left" SOLO si falta gente para completar el próximo room.
+        Si no falta gente (need == 0), NO manda countdown.
         """
-        prep_start = self._in_prep_window(now)  # 55 / 15 / 35
+        prep_start = self._in_prep_window(now)  # 55 / 25
         if prep_start is None:
             return
 
@@ -769,32 +779,40 @@ class Matchmaking(commands.Cog):
             return
 
         join_id = join_channel.id
-        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}> "
         ordered = await self._get_ordered_queue_members(guild, join_id)
+        if not ordered:
+            return
+
         rem = len(ordered) % ROOM_CAPACITY
         need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
+        # ✅ REGLA: countdown SOLO si falta gente
+        if need == 0:
+            return
+
+        ping = f"<@&{PING_ROLES_BY_JOIN_CHANNEL[join_id]}> "
         slot_ts = int(slot_dt.timestamp())
-        need_part = (
-            ""
-            if need == 0
-            else f"{ping if mins_left == 5 else ''}Need ({need}) player(s) to fill the next room. "
-        )
+
+        # Ping solo al inicio del PREP (mins_left == 5)
+        ping_part = ping if mins_left == 5 else ""
 
         try:
             await join_channel.send(
                 f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
-                f"{need_part}Type `/c` to join the queue or `/d` to drop the queue."
+                f"{ping_part}Need ({need}) player(s) to fill the next room. "
+                f"Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
             pass
+
 
     async def _pend_unfilled_queue_on_slot(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
-        En el minuto exacto del slot (:00 / :20 / :40):
-        si la cola NO completó el siguiente grupo de 5, room state -> pending
+        En el minuto exacto del slot (:00 / :30):
+        Si la queue no completa el siguiente grupo de 5, NO crea thread "unfilled".
+        Solo anuncia y deja a esos jugadores en la queue.
         """
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
@@ -805,68 +823,24 @@ class Matchmaking(commands.Cog):
         if rem == 0:
             return  # no hay grupo incompleto
 
-        leftovers = ordered[-rem:]  # los que quedaron “en la sala que no se llenó”
+        leftovers = ordered[-rem:]
+        need = ROOM_CAPACITY - rem
 
-        # mensaje público con quiénes salieron
         mentions = " ".join(m.mention for m in leftovers)
         try:
             await join_channel.send(
-                f"⛔ Slot reached and the room did not fill. Waiting for **{5 - len(leftovers)}** player(s) to fill your room, {mentions}\n"
-                f"Type `/c` to join this room!"
+                f"⛔ Slot reached and the next room did not fill. "
+                f"Waiting for **{need}** player(s) to complete the room. {mentions}\n"
+                f"Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
             pass
 
-        join_id = join_channel.id
-        ordered = await self._get_ordered_queue_members(guild, join_id)
-
-        now = self._now_lima()
-
-        server_code = JOIN_CHANNEL_CFG.get(join_id, {}).get("server", "en")
-
-        # calcular avg mmr para naming (en base al grupo)
-        mmr_map = await self._fetch_mmrs_batch([m.id for m in leftovers])
-        mmr_vals = [int(mmr_map.get(m.id, 0)) for m in leftovers]
-        avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
-        rank = self._rank_label_from_mmr(avg)
-
-        thread_name = f"unfilled a{avg} {rank}"
-
-        rid, info = await self._create_room(
-            join_channel, server_code=server_code, thread_name=thread_name
-        )
-
-        # mover de cola a room
-        for m in leftovers:
-            self.queues[join_id].discard(m.id)
-            await self._add_member_to_room(m, rid, info)
-            self.queue_join_order.get(join_id, {}).pop(m.id, None)
-
-        # marcar como PENDING
-        info["phase"] = PHASE_PENDING
-        info["locked_in_thread"] = True
-        info["slot_start_ts"] = None
-        info["avg_mmr"] = avg
-        info["rank_label"] = rank
-        info["started"] = False
-        info["songs_posted"] = False
-
-        mentions = " ".join(m.mention for m in leftovers)
-
-        # Ping + aviso de cuándo se publican songs
-        allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
-        await self.bot.get_channel(info["join_channel_id"]).get_thread(
-            info["thread"]
-        ).send(
-            f"{mentions}\n" + f"Waiting for {5-len(leftovers)} players to start room.",
-            allowed_mentions=allowed,
-        )
-
-        # refrescar #rooms
-        try:
-            self.bot.dispatch("room_updated", None)
-        except Exception:
-            pass
+        # ✅ IMPORTANTE:
+        # - NO crear thread
+        # - NO mover jugadores fuera de self.queues
+        # - NO tocar queue_join_order
+        # Se quedan esperando para el siguiente PREP/slot.
 
     async def _purge_unfilled_queue_on_slot(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
@@ -912,7 +886,7 @@ class Matchmaking(commands.Cog):
             pass
 
     async def _announce_next_queue_windows_on_00(self, join_channel, now):
-        # Próximos PREP windows típicos: :15, :35, :55
+        # Próximos PREP windows típicos: :25, :55
         candidates = [
             (25, self._next_occurrence_of_minute(now, 25)),
             (55, self._next_occurrence_of_minute(now, 55)),
@@ -1612,13 +1586,109 @@ class Matchmaking(commands.Cog):
     def _next_start_minute_label(self, now: dt.datetime) -> str:
         """
         Devuelve el próximo ':x0' según tus ventanas START.
-        START_WINDOWS = ((0,4),(20,24),(40,44)) -> minutos base: 0,20,40
+        START_WINDOWS = ((0,4),(30,34)) -> minutos base: 0,30
         """
         starts = [a for (a, _b) in self.START_WINDOWS]  # [0,20,40]
         for s in starts:
             if s > now.minute:
                 return f":{s:02d}"
         return f":{starts[0]:02d}"  # siguiente hora
+
+    def _next_slot_dt_local(self, now: dt.datetime) -> dt.datetime:
+        # START_WINDOWS = ((0,4),(20,24),(40,44)) -> bases: 0, 20, 40
+        bases = sorted({a for (a, _b) in self.START_WINDOWS})
+        base = now.replace(second=0, microsecond=0)
+        for m in bases:
+            if m > base.minute:
+                return base.replace(minute=m)
+        # next hour
+        return (base + dt.timedelta(hours=1)).replace(minute=bases[0])
+
+
+    async def build_rooms_overview_text(self, guild: discord.Guild, join_channel_id: int) -> str:
+        """
+        Texto para #rooms:
+        - Lista rooms STARTED (con timestamp)
+        - Luego lista FUTURE ROOMS (desde la queue /c), agrupadas de 5 y con huecos
+        """
+        now = self._now_lima()
+
+        # ---------- STARTED ROOMS (threads existentes) ----------
+        started_rooms: list[tuple[int, dict]] = []
+        for rid, info in self._rooms_for_parent(join_channel_id):
+            if info.get("finished", False):
+                continue
+            if info.get("phase") == PHASE_STARTED or info.get("started", False):
+                started_rooms.append((rid, info))
+
+        started_rooms.sort(key=lambda t: int(t[1].get("display_num") or 999999))
+
+        # batch mmr para players de rooms started
+        started_member_ids: list[int] = []
+        for _rid, info in started_rooms:
+            for m in info.get("players", []) or []:
+                if m and not m.bot and not self._is_placement_member(m):
+                    started_member_ids.append(m.id)
+
+        started_mmr_map = await self._fetch_mmrs_batch(list(set(started_member_ids)))
+
+        lines: list[str] = []
+
+        for rid, info in started_rooms:
+            disp = self._disp(info, rid)
+            started_at = info.get("started_at")
+            ts_part = f"<t:{int(started_at)}:T>" if started_at else "—"
+
+            lines.append(f"ROOM {disp} STARTED {ts_part}")
+
+            players = [m for m in (info.get("players", []) or []) if m and not m.bot]
+            rows = []
+            for m in players:
+                if self._is_placement_member(m):
+                    rows.append((m.display_name, -1, True))
+                else:
+                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), False))
+
+            # non-placement primero, luego placement; MMR desc
+            rows.sort(key=lambda x: (x[2], -x[1], x[0].lower()))
+            for name, mmr, is_pl in rows:
+                if is_pl:
+                    lines.append(f"{name} Placement")
+                else:
+                    lines.append(f"{name} {mmr}MMR")
+            lines.append("")  # blank line entre rooms
+
+        # ---------- FUTURE ROOMS (desde la QUEUE /c; sin thread) ----------
+        ordered = await self._get_ordered_queue_members(guild, join_channel_id)
+        if ordered:
+            future_slot = self._next_slot_dt_local(now)
+            future_slot_ts = int(future_slot.timestamp())
+
+            lines.append("----------------")
+            lines.append(f"FUTURE ROOMS (next slot <t:{future_slot_ts}:T>)")
+
+            mmr_map = await self._fetch_mmrs_batch(
+                [m.id for m in ordered if not self._is_placement_member(m)]
+            )
+
+            groups = [ordered[i:i + ROOM_CAPACITY] for i in range(0, len(ordered), ROOM_CAPACITY)]
+            for idx, g in enumerate(groups, start=1):
+                lines.append(f"ROOM {idx}")
+                for m in g:
+                    if self._is_placement_member(m):
+                        lines.append(f"{m.display_name} Placement")
+                    else:
+                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
+
+                # huecos visuales hasta 5
+                for _ in range(ROOM_CAPACITY - len(g)):
+                    lines.append("")
+
+                lines.append("")
+
+        return "\n".join(lines).rstrip()
+
+            
 
     async def build_future_room_block(
         self, guild: discord.Guild, join_channel_id: int, now: dt.datetime
@@ -2471,14 +2541,8 @@ class Matchmaking(commands.Cog):
                             second=0, microsecond=0, minute=start_base
                         )
                         slot_ts = int(slot_dt.timestamp())
-
                         # (1) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
-                        # await self._purge_unfilled_queue_on_slot(
-                        #     guild, join_channel, now
-                        # )
-                        await self._pend_unfilled_queue_on_slot(
-                            guild, join_channel, now
-                        )
+                        await self._purge_unfilled_queue_on_slot(guild, join_channel, now)
 
                         # (2) START: inicia rooms FUTURE programadas para este slot
                         await self._start_future_rooms_for_slot(join_id, slot_ts)
@@ -3448,29 +3512,24 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="c",
-        description="Join queue for the next room slot (or next unfilled room)",
+        description="Join queue for the next room slot",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
         ch = interaction.channel
-        if (
-            not isinstance(ch, discord.TextChannel)
-            or ch.id not in ALLOWED_JOIN_CHANNELS
-        ):
+        if not isinstance(ch, discord.TextChannel) or ch.id not in ALLOWED_JOIN_CHANNELS:
             return await interaction.response.send_message(
                 "This command only works on #join / #jp-join.", ephemeral=True
             )
 
         guild = interaction.guild
         if guild is None:
-            return await interaction.response.send_message(
-                "Guild not found.", ephemeral=True
-            )
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
         member: discord.Member = interaction.user  # type: ignore
 
         async with self._join_lock:
-            # Guard: ya estás en una sala activa (STARTING/STARTED/NO STARTED si aún existiera)
+            # Guard: ya estás en una sala activa (cualquier fase no-finished)
             already_room = self._find_player_room_id(member)
             if already_room is not None:
                 return await interaction.response.send_message(
@@ -3478,88 +3537,51 @@ class Matchmaking(commands.Cog):
                     ephemeral=True,
                 )
 
-            # Guard: ya estás en cola (en cualquiera de los join channels)
+            # Guard: ya estás en cola (EN o JP)
             for cid in ALLOWED_JOIN_CHANNELS:
                 if member.id in self.queues.get(cid, set()):
                     return await interaction.response.send_message(
                         "❌ You are already in the queue.", ephemeral=True
                     )
 
-            # Lock-down: :55–:00 y :25–:30 se bloquea, EXCEPTO si faltan jugadores para completar la siguiente sala
+            # Lock-down: durante PREP se bloquea SOLO si need==0 (tu lógica actual)
             now = self._now_lima()
             if await self._is_join_locked(guild, ch.id, now):
                 return await interaction.response.send_message(
                     "⛔ Queue is locked down until the next slot.", ephemeral=True
                 )
 
-            for rid, info in list(self.rooms.items()):
-                if info.get("join_channel_id") != ch.id:
-                    continue
-                if info.get("finished", False):
-                    continue
-
-                if info.get("phase") != PHASE_PENDING:
-                    continue
-
-                players = [m for m in info.get("players", []) if m and not m.bot]
-                n = len(players)
-
-                # si se quedaron sin gente
-                if n < 5:
-                    await self._add_member_to_room(interaction.user, rid, info)
-                    # calcular avg mmr para naming (en base al grupo)
-                    mmr_map = await self._fetch_mmrs_batch(
-                        [m.id for m in info["players"]]
-                    )
-                    mmr_vals = [int(mmr_map.get(m.id, 0)) for m in info["players"]]
-                    avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
-                    rank = self._rank_label_from_mmr(avg)
-
-                    if n + 1 == 5:
-                        thread_name = f"r{rid} a{avg} {rank}"
-                    else:
-                        thread_name = f"unfilled a{avg} {rank}"
-                    self.bot.dispatch("room_updated", rid)
-                    await self.bot.get_channel(info["join_channel_id"]).get_thread(
-                        info["thread"]
-                    ).edit(name=thread_name)
-                    if n + 1 == 5:
-                        await self._start_pending_room(rid)
-                    return
-
-            # Encolar
+            # Siempre encola (no se intenta meter a rooms “unfilled”)
             self.queues.setdefault(ch.id, set()).add(member.id)
             self._queue_counter += 1
             self.queue_join_order[ch.id][member.id] = self._queue_counter
 
-            # Role queue según canal
+            # Rol de queue según canal
             await self._assign_queue_role_for_join(member, ch.id)
 
-            # Orden determinístico (MMR desc, Placement al final) para calcular "future room" del usuario
+            # Calcular posición informativa (orden determinístico)
             ordered = await self._get_ordered_queue_members(guild, ch.id)
             try:
                 idx = ordered.index(member)
             except ValueError:
                 idx = len(ordered) - 1
 
-            room_no = (idx // 5) + 1
-            pos_in_room = (idx % 5) + 1
-
-            # Info adicional: cuántos faltan para completar la siguiente sala
+            room_no = (idx // ROOM_CAPACITY) + 1
+            pos_in_room = (idx % ROOM_CAPACITY) + 1
             need = await self._need_players_next_room(guild, ch.id)
+
+            # Slot informativo
+            slot_dt = self._next_slot_dt_local(now)
+            slot_ts = int(slot_dt.timestamp())
 
             # Notificar al cog Rooms para refrescar #rooms
             self.bot.dispatch("room_updated", None)
 
-        # Respuestas fuera del lock
-        try:
-            mmr_val, _ = await self.fetch_player(member.id)
-        except Exception:
-            mmr_val = 0
-
+        # Respuesta (fuera del lock)
         await interaction.response.send_message(
             f"Queued. Future room **{room_no}** ({pos_in_room}/5). "
-            f"{'Room complete.' if need == 0 else f'Need {need} more to complete the next room.'}",
+            f"{'Room complete.' if need == 0 else f'Need {need} more to complete the next room.'}\n"
+            f"Next slot: <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
             ephemeral=True,
         )
 
@@ -3569,6 +3591,125 @@ class Matchmaking(commands.Cog):
             await ch.send(f"({member.mention}) Joined the queue (`{qcount}`)")
         except Exception:
             pass
+
+
+    @app_commands.command(
+        name="d",
+        description="Drop queue in #join/#jp-join OR leave your current room thread",
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def leave_queue(self, interaction: discord.Interaction):
+        ch = interaction.channel
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        member: discord.Member = interaction.user  # type: ignore
+
+        # ------------------------------------------------------------
+        # CASO A: /d dentro de un ROOM THREAD -> salir de la sala actual
+        # ------------------------------------------------------------
+        if isinstance(ch, discord.Thread):
+            async with self._join_lock:
+                rid, info = self._find_room_by_thread_id(ch.id)
+                if not info:
+                    return await interaction.response.send_message(
+                        "ℹ️ This thread is not an active room.", ephemeral=True
+                    )
+
+                if member not in (info.get("players", []) or []):
+                    return await interaction.response.send_message(
+                        "ℹ️ You are not listed as a player in this room.", ephemeral=True
+                    )
+
+                # Si ya empezó, no permitir /d (usa /forfeit según tu flujo)
+                if info.get("phase") == PHASE_STARTED or info.get("started", False):
+                    return await interaction.response.send_message(
+                        "❌ This match already started. Use `/forfeit` if everyone agrees to close the room.",
+                        ephemeral=True,
+                    )
+
+                # Remover del room + del thread
+                await self._remove_member_from_room(member, int(rid), info)
+
+                # Best-effort: quitar roles de queue (por si acaso)
+                try:
+                    await self._remove_queue_roles([member])
+                except Exception:
+                    pass
+
+                # Mensaje público dentro del thread
+                try:
+                    await ch.send(f"({member.mention}) Left the room.")
+                except Exception:
+                    pass
+
+                # Si queda vacío -> archivar/cerrar el hilo
+                if len(info.get("players", []) or []) == 0:
+                    try:
+                        await ch.send("Room is empty. Archiving this thread.")
+                    except Exception:
+                        pass
+
+                    # close_room ya saca del dict y dispara room_finished
+                    try:
+                        await self.close_room(ch, delay=0, delete=False)  # archive+lock
+                    except Exception:
+                        pass
+
+                # Reindex visual (room-1, room-2, ...)
+                try:
+                    await self._reindex_parent_rooms(guild, int(info["join_channel_id"]))
+                except Exception:
+                    pass
+
+                # Refrescar #rooms
+                try:
+                    self.bot.dispatch("room_updated", None)
+                except Exception:
+                    pass
+
+            return await interaction.response.send_message("Removed from room.", ephemeral=True)
+
+        # ------------------------------------------------------------
+        # CASO B: /d en #join / #jp-join -> salir SOLO de la queue
+        # ------------------------------------------------------------
+        if not isinstance(ch, discord.TextChannel) or ch.id not in ALLOWED_JOIN_CHANNELS:
+            return await interaction.response.send_message(
+                "This command works in #join/#jp-join (drop queue) or inside a room thread (leave room).",
+                ephemeral=True,
+            )
+
+        async with self._join_lock:
+            q = self.queues.get(ch.id, set())
+            if member.id not in q:
+                return await interaction.response.send_message(
+                    "ℹ️ You are not in the queue.", ephemeral=True
+                )
+
+            q.discard(member.id)
+            self.queue_join_order.get(ch.id, {}).pop(member.id, None)
+
+            try:
+                await self._remove_queue_roles([member])
+            except Exception:
+                pass
+
+            # Notificar al cog Rooms
+            try:
+                self.bot.dispatch("room_updated", None)
+            except Exception:
+                pass
+
+            # Mensaje público
+            try:
+                qcount = len(q)
+                await ch.send(f"({member.mention}) Dropped the queue (`{qcount}`)")
+            except Exception:
+                pass
+
+        return await interaction.response.send_message("Removed from queue.", ephemeral=True)
+
 
     @app_commands.command(
         name="stats",
@@ -3762,103 +3903,6 @@ class Matchmaking(commands.Cog):
         board = self._format_cutoffs_board(season_name, data)
         await interaction.response.send_message(board)
 
-    @app_commands.command(
-        name="d", description="Leave queue (only in #join / #jp-join) (or pending room)"
-    )
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    async def leave_queue(self, interaction: discord.Interaction):
-        ch = interaction.channel
-        if (
-            not isinstance(ch, discord.TextChannel)
-            or ch.id not in ALLOWED_JOIN_CHANNELS
-        ):
-            return await interaction.response.send_message(
-                "This command only works on #join / #jp-join.", ephemeral=True
-            )
-
-        member: discord.Member = interaction.user  # type: ignore
-
-        async with self._join_lock:
-            # Si está en una room (PREPARED/STARTED), no puede salir
-            rid = self._find_player_room_id(member)
-            if rid is not None:
-                info = self.rooms.get(rid, {})
-                if info.get("phase") in (
-                    PHASE_FUTURE,
-                    PHASE_PREPARED,
-                    PHASE_STARTED,
-                ) and not info.get("finished", False):
-                    return await interaction.response.send_message(
-                        "❌ You are locked in a room. You can't leave until the room finishes.",
-                        ephemeral=True,
-                    )
-                if info.get("phase") == PHASE_PENDING:
-                    if info.get("join_channel_id") != ch.id:
-                        return
-                    if info.get("finished", False):
-                        return
-
-                    players = [m for m in info.get("players", []) if m and not m.bot]
-                    n = len(players)
-
-                    # si se quedaron sin gente
-                    if n < 5:
-                        await self._remove_member_from_room(interaction.user, rid, info)
-                        # calcular avg mmr para naming (en base al grupo)
-                        if n - 1 == 0:
-                            await self.close_room(
-                                self.bot.get_channel(
-                                    info["join_channel_id"]
-                                ).get_thread(info["thread"]),
-                                delay=0,
-                                delete=True,
-                            )
-                        else:
-                            mmr_map = await self._fetch_mmrs_batch(
-                                [m.id for m in info["players"]]
-                            )
-                            mmr_vals = [
-                                int(mmr_map.get(m.id, 0)) for m in info["players"]
-                            ]
-                            avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
-                            rank = self._rank_label_from_mmr(avg)
-                            thread_name = f"unfilled a{avg} {rank}"
-                            self.bot.dispatch("room_updated", rid)
-                            await self.bot.get_channel(
-                                info["join_channel_id"]
-                            ).get_thread(info["thread"]).edit(name=thread_name)
-                        await ch.send(f"({member.mention}) left the pending room.")
-                        return await interaction.response.send_message(
-                            "Room left.",
-                            ephemeral=True,
-                        )
-                    else:
-                        return await interaction.response.send_message(
-                            "❌ You are locked in a room. You can't leave until the room finishes.",
-                            ephemeral=True,
-                        )
-
-            # Si está en cola de este canal, lo sacamos
-            q = self.queues.get(ch.id, set())
-            if member.id in q:
-                q.discard(member.id)
-                self.queue_join_order.get(ch.id, {}).pop(member.id, None)
-
-                try:
-                    await self._remove_queue_roles([member])
-                except Exception:
-                    pass
-
-                try:
-                    qcount = len(q)
-                    await ch.send(f"({member.mention}) Dropped the queue (`{qcount}`)")
-                except Exception:
-                    pass
-
-                self.bot.dispatch("room_updated", None)
-                return await interaction.response.send_message(
-                    "Removed from queue.", ephemeral=True
-                )
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
@@ -5102,5 +5146,6 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
 
 
