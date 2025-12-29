@@ -1,607 +1,423 @@
-# cogs/rooms.py
-
-import time, json
+# rooms.py
+import os
+import json
 import asyncio
+import datetime as dt
+from zoneinfo import ZoneInfo
+
 import discord
 from discord.ext import commands, tasks
 
-# Mapea cada category_id al canal “rooms” correspondiente
-CATEGORY_TO_ROOM_CHANNEL: dict[int, int] = {
-    1371306302671687710: 1371307831176728706,  # pjsk-queue → rooms pjsk-queue
-    1371951461612912802: 1388515368934309978,  # jp-pjsk    → rooms jp-pjsk
-}
+
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+
+# Si tienes el ID exacto del canal #rooms, ponlo en env:
+#   ROOMS_CHANNEL_ID=123...
+ROOMS_CHANNEL_ID = int(os.getenv("ROOMS_CHANNEL_ID", "0"))
+ROOMS_CHANNEL_NAME = os.getenv("ROOMS_CHANNEL_NAME", "rooms")
+
+LIMA_TZ = ZoneInfo("America/Lima")
 
 ROOM_CAPACITY = 5
 
-# Marcador simple para identificar el “mensaje tablero” del bot
-BOARD_MARKER = "Last Update"
-
-# Fases (para que rooms.py pueda renderizar FUTURE correctamente)
+# Deben matchear matchmaking.py
 PHASE_FUTURE = "FUTURE"
 PHASE_PREPARED = "PREPARED"
 PHASE_STARTED = "STARTED"
+PHASE_PENDING = "PENDING"
 PHASE_FINISHED = "FINISHED"
 
 
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
 class Rooms(commands.Cog):
+    """
+    Mantiene el tablero #rooms (un solo mensaje) mostrando:
+
+    - ROOMS STARTED (con timestamp) + lista de jugadores (ordenados por MMR desc)
+    - ROOMS NO STARTED pero ya lock-in (threads creados en PREP) con su start ts
+    - FUTURE ROOMS (preview desde la queue /c; NO crea threads) con slots vacíos
+
+    Se alimenta del cog Matchmaking:
+      - match_cog.rooms
+      - match_cog.queues
+      - match_cog._get_ordered_queue_members(...)
+      - match_cog._fetch_mmrs_batch(...)
+      - match_cog._is_placement_member(...)
+      - match_cog.START_WINDOWS (si existe)
+    """
+
+    CACHE_PATH = "assets/cached_rooms_board.json"
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self._refresh_lock = asyncio.Lock()
+        self._board_message_id: int | None = None
 
-        # { category_id: discord.Message }
-        self.posted_messages: dict[int, discord.Message] = {}
+        self._load_cache()
 
-        # Evita condiciones de carrera
-        self._update_lock = asyncio.Lock()
+        self.auto_refresh.start()
 
-        # Coalesce: si llegan muchos eventos, hacemos como máximo 1 update extra al final
-        self._update_pending: bool = False
+    # -------------------------
+    # Cache (message id)
+    # -------------------------
+    def _load_cache(self):
+        try:
+            if os.path.isfile(self.CACHE_PATH):
+                with open(self.CACHE_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._board_message_id = _safe_int(data.get("board_message_id"), None)
+        except Exception:
+            self._board_message_id = None
 
-        # Listeners para refrescar al vuelo
-        bot.add_listener(self.on_room_updated, "room_updated")
-        bot.add_listener(self.on_room_finished, "room_finished")
+    def _save_cache(self):
+        try:
+            os.makedirs(os.path.dirname(self.CACHE_PATH), exist_ok=True)
+            with open(self.CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"board_message_id": self._board_message_id}, f)
+        except Exception:
+            pass
 
-        # Loop de respaldo cada 15s
-        self.update_rooms.start()
+    # -------------------------
+    # Helpers
+    # -------------------------
+    def _now_lima(self) -> dt.datetime:
+        return dt.datetime.now(tz=LIMA_TZ)
 
-    def cog_unload(self):
-        self.update_rooms.cancel()
-        self.bot.remove_listener(self.on_room_updated, "room_updated")
-        self.bot.remove_listener(self.on_room_finished, "room_finished")
+    def _get_matchmaking(self):
+        return self.bot.get_cog("Matchmaking")
 
-    @commands.Cog.listener()
-    async def on_ready(self):
-        print("✅ Cog cargado: cogs.rooms")
-
-    @tasks.loop(seconds=15.0)
-    async def update_rooms(self):
-        await self._request_update()
-
-    @update_rooms.before_loop
-    async def before_update(self):
-        await self.bot.wait_until_ready()
-
-    async def on_room_updated(self, room_id: int | None = None):
-        # Se dispara desde Matchmaking tras /start, /join, /d…
-        await self._request_update()
-
-    async def on_room_finished(self, room_id: int):
-        # Tras eliminar una sala vacía
-        await asyncio.sleep(1)
-        await self._request_update()
-
-    async def _request_update(self):
-        """
-        Evita que se encolen muchos updates. Si ya hay uno corriendo, marca pending y sale.
-        El update en curso ejecutará uno extra al finalizar.
-        """
-        if self._update_lock.locked():
-            self._update_pending = True
-            return
-
-        async with self._update_lock:
-            while True:
-                self._update_pending = False
-                await self._do_update_core()
-                if not self._update_pending:
-                    break
-
-    async def _get_text_channel(
-        self,
-        channel_id: int,
-        cache: dict[int, discord.abc.GuildChannel | None] | None = None,
-    ) -> discord.TextChannel | None:
-        """
-        get_channel() depende de caché; fetch_channel() es fallback.
-        Usa cache local por update para no repetir fetches.
-        """
-        if not isinstance(channel_id, int) or channel_id <= 0:
-            return None
-
-        if cache is not None and channel_id in cache:
-            ch = cache[channel_id]
+    async def _resolve_rooms_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        if ROOMS_CHANNEL_ID:
+            ch = guild.get_channel(ROOMS_CHANNEL_ID)
             return ch if isinstance(ch, discord.TextChannel) else None
 
-        ch = self.bot.get_channel(channel_id)
-        if isinstance(ch, discord.TextChannel):
-            if cache is not None:
-                cache[channel_id] = ch
-            return ch
+        # fallback: por nombre
+        for ch in guild.text_channels:
+            if ch.name == ROOMS_CHANNEL_NAME:
+                return ch
+        return None
 
-        try:
-            fetched = await self.bot.fetch_channel(channel_id)
-            if cache is not None:
-                cache[channel_id] = fetched
-            return fetched if isinstance(fetched, discord.TextChannel) else None
-        except Exception:
-            if cache is not None:
-                cache[channel_id] = None
-            return None
-
-    async def _find_last_board_message(
-        self, channel: discord.TextChannel
+    async def _get_or_create_board_message(
+        self, rooms_channel: discord.TextChannel
     ) -> discord.Message | None:
-        """
-        Reutiliza el último mensaje del bot en el canal (para no duplicar mensajes tras reinicios).
-        Requiere permiso de Read Message History.
-        """
-        try:
-            me = channel.guild.me or self.bot.user
-            if me is None:
-                return None
-            async for msg in channel.history(limit=30):
-                if msg.author and msg.author.id == me.id:
-                    # Opcional: filtrar por marcador para evitar editar mensajes del bot no relacionados
-                    if msg.content and BOARD_MARKER in msg.content:
-                        return msg
-            # Si no encontró con marcador, igual intentamos con el último mensaje del bot
-            async for msg in channel.history(limit=30):
-                if msg.author and msg.author.id == me.id:
-                    return msg
-        except Exception:
-            return None
-        return None
-
-    async def _ensure_prev_message(self, cat_id: int, channel: discord.TextChannel):
-        """
-        Si no existe referencia en memoria (reinicio del bot), intenta recuperar un mensaje previo del bot.
-        """
-        if cat_id in self.posted_messages:
-            return
-        prev = await self._find_last_board_message(channel)
-        if prev is not None:
-            self.posted_messages[cat_id] = prev
-
-    async def _get_active_season_id(self, mm) -> int | None:
-        # intenta reutilizar info del cog Matchmaking si la expone
-        sid = getattr(mm, "current_season_id", None)
-        if isinstance(sid, int) and sid > 0:
-            return sid
-
-        # fallback: leer de la BD
-        if getattr(mm, "db_pool", None) is None:
-            return None
-
-        try:
-            async with mm.db_pool.acquire() as con:
-                row = await con.fetchrow(
-                    "SELECT id FROM seasons WHERE active = true ORDER BY startdate DESC LIMIT 1"
-                )
-                return int(row["id"]) if row else None
-        except Exception:
-            return None
-
-    def _coerce_started_ts(self, raw):
-        """Acepta int/float o datetime-like (con .timestamp())."""
-        if isinstance(raw, (int, float)):
-            ts = int(raw)
-            return ts if ts > 0 else None
-        if raw is not None and hasattr(raw, "timestamp"):
+        # Si tenemos ID cacheado, intentamos fetch
+        if self._board_message_id:
             try:
-                ts = int(raw.timestamp())
-                return ts if ts > 0 else None
+                msg = await rooms_channel.fetch_message(self._board_message_id)
+                return msg
             except Exception:
-                return None
-        return None
+                self._board_message_id = None
 
-    async def _fetch_mmrs_batch(
-        self,
-        mm,
-        user_ids: list[int],
-        season_id: int | None,
-        has_pool: bool,
-    ) -> dict[int, int]:
-        """
-        Devuelve {user_id: mmr} usando UNA consulta por lote si hay pool+season.
-        """
-        if not user_ids:
-            return {}
-
-        # Dedup conservando orden
-        user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
-
-        mmr_map: dict[int, int] = {}
+        # Buscar uno existente reciente por “firma” (best effort)
         try:
-            if has_pool and season_id:
-                async with mm.db_pool.acquire() as con:
-                    rows_db = await con.fetch(
-                        """
-                        WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
-                        SELECT u.user_id,
-                               COALESCE(sp.mmr, 0) AS mmr
-                        FROM u
-                        LEFT JOIN seasonplayers sp
-                          ON sp.user_id = u.user_id
-                         AND sp.season_id = $2
-                        """,
-                        user_ids,
-                        season_id,
-                    )
-                mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
-            else:
-                # Fallback: una a una
-                for uid in user_ids:
-                    _mmr, _ = await mm.fetch_player(uid)
-                    mmr_map[int(uid)] = int(_mmr)
+            async for m in rooms_channel.history(limit=25):
+                if m.author == self.bot.user and m.embeds:
+                    emb = m.embeds[0]
+                    if emb.title and "PJSK ROOMS" in emb.title:
+                        self._board_message_id = m.id
+                        self._save_cache()
+                        return m
         except Exception:
-            # Fallback robusto
-            for uid in user_ids:
-                try:
-                    _mmr, _ = await mm.fetch_player(uid)
-                    mmr_map[int(uid)] = int(_mmr)
-                except Exception:
-                    mmr_map[int(uid)] = 0
+            pass
 
-        return mmr_map
-
-    def _user_label(self, guild: discord.Guild, uid: int) -> str:
-        """
-        Mejor esfuerzo: Member -> User cacheado -> mention por ID.
-        Así NO perdemos jugadores aunque no estén en caché.
-        """
-        m = guild.get_member(uid)
-        if m is not None:
-            return m.display_name
-        u = self.bot.get_user(uid)
-        if u is not None:
-            return u.display_name
-        return f"<@{uid}>"
-
-    async def _do_update_core(self):
+        # Crear uno nuevo
         try:
-            # 1) Obtener estado actual de Matchmaking
-            mm = self.bot.get_cog("Matchmaking")
-            if mm is None:
+            msg = await rooms_channel.send(embed=discord.Embed(title="PJSK ROOMS", description="Initializing..."))
+            self._board_message_id = msg.id
+            self._save_cache()
+            return msg
+        except Exception:
+            return None
+
+    def _starts_minutes(self, match_cog) -> list[int]:
+        # match_cog.START_WINDOWS = ((0,4),(20,24),(40,44)) -> base: 0,20,40
+        sw = getattr(match_cog, "START_WINDOWS", ((0, 4), (30, 34)))
+        mins = []
+        for a, _b in sw:
+            mins.append(int(a))
+        mins = sorted(set(mins))
+        return mins if mins else [0, 30]
+
+    def _next_slot_dt(self, now: dt.datetime, match_cog) -> dt.datetime:
+        mins = self._starts_minutes(match_cog)
+        base = now.replace(second=0, microsecond=0)
+        for m in mins:
+            if m > base.minute:
+                return base.replace(minute=m)
+        # siguiente hora, primer minuto base
+        return (base + dt.timedelta(hours=1)).replace(minute=mins[0])
+
+    async def _normalize_room_players(
+        self, guild: discord.Guild, info: dict
+    ) -> list[discord.Member]:
+        """
+        info["players"] puede venir como:
+          - list[discord.Member]
+          - list[int] (si alguien serializa)
+          - list[str] de IDs
+        Normalizamos a list[discord.Member] (sin bots).
+        """
+        raw = info.get("players", []) or []
+        out: list[discord.Member] = []
+        seen: set[int] = set()
+
+        for p in raw:
+            m = None
+            if isinstance(p, discord.Member):
+                m = p
+            elif isinstance(p, int):
+                m = guild.get_member(p)
+            elif isinstance(p, str) and p.isdigit():
+                m = guild.get_member(int(p))
+            elif isinstance(p, dict):
+                pid = p.get("id") or p.get("user_id")
+                if isinstance(pid, int):
+                    m = guild.get_member(pid)
+                elif isinstance(pid, str) and pid.isdigit():
+                    m = guild.get_member(int(pid))
+
+            if m and not m.bot and m.id not in seen:
+                seen.add(m.id)
+                out.append(m)
+
+        return out
+
+    async def _mmr_map_for_members(self, match_cog, members: list[discord.Member]) -> dict[int, int]:
+        # Placement: se mostrará como "Placement" (no depende de MMR)
+        nonp = [m for m in members if not match_cog._is_placement_member(m)]
+        mmr_map = await match_cog._fetch_mmrs_batch([m.id for m in nonp])
+        return {int(k): int(v) for k, v in (mmr_map or {}).items()}
+
+    def _sort_room_members(self, match_cog, members: list[discord.Member], mmr_map: dict[int, int]) -> list[discord.Member]:
+        # No-placement primero por MMR desc, Placement al final (estable por nombre/id)
+        def key(m: discord.Member):
+            if match_cog._is_placement_member(m):
+                return (1, 0, m.id)
+            return (0, -int(mmr_map.get(m.id, 0)), m.id)
+
+        return sorted(members, key=key)
+
+    def _room_status_line(self, rid: int, info: dict) -> str:
+        disp = _safe_int(info.get("display_num"), rid)
+        phase = str(info.get("phase") or "")
+        thread_id = _safe_int(info.get("thread"), 0)
+
+        # STARTED: timestamp obligatorio en la cabecera
+        if phase == PHASE_STARTED or bool(info.get("started", False)):
+            started_at = _safe_int(info.get("started_at"), 0)
+            ts = f"<t:{started_at}:T> (<t:{started_at}:R>)" if started_at else ""
+            return f"ROOM {disp} — STARTED {ts}  ·  <#{thread_id}>" if thread_id else f"ROOM {disp} — STARTED {ts}"
+
+        # FUTURE/PREPARED (lock-in para slot)
+        slot_ts = info.get("slot_start_ts")
+        slot_ts = _safe_int(slot_ts, 0) if slot_ts is not None else 0
+        if phase in (PHASE_FUTURE, PHASE_PREPARED):
+            if slot_ts:
+                return f"ROOM {disp} — LOCKED IN (starts <t:{slot_ts}:T>, <t:{slot_ts}:R>)  ·  <#{thread_id}>" if thread_id else f"ROOM {disp} — LOCKED IN (starts <t:{slot_ts}:T>, <t:{slot_ts}:R>)"
+            return f"ROOM {disp} — LOCKED IN  ·  <#{thread_id}>" if thread_id else f"ROOM {disp} — LOCKED IN"
+
+        if phase == PHASE_PENDING:
+            return f"ROOM {disp} — PENDING  ·  <#{thread_id}>" if thread_id else f"ROOM {disp} — PENDING"
+
+        return f"ROOM {disp} — NOT STARTED  ·  <#{thread_id}>" if thread_id else f"ROOM {disp} — NOT STARTED"
+
+    async def _render_join_section(self, guild: discord.Guild, join_id: int) -> str:
+        match_cog = self._get_matchmaking()
+        if not match_cog:
+            return ""
+
+        join_channel = guild.get_channel(join_id)
+        join_name = f"#{join_channel.name}" if isinstance(join_channel, discord.TextChannel) else f"join:{join_id}"
+
+        # Rooms activos de ese join_channel
+        rooms = []
+        for rid, info in (match_cog.rooms or {}).items():
+            if info.get("finished", False):
+                continue
+            if _safe_int(info.get("join_channel_id"), 0) != int(join_id):
+                continue
+            rooms.append((int(rid), info))
+
+        # Separamos STARTED primero (como tu ejemplo)
+        started_rooms = []
+        other_rooms = []
+        for rid, info in rooms:
+            phase = str(info.get("phase") or "")
+            if phase == PHASE_STARTED or bool(info.get("started", False)):
+                started_rooms.append((rid, info))
+            else:
+                other_rooms.append((rid, info))
+
+        # Orden: por display_num (si existe)
+        def disp_key(item):
+            rid, info = item
+            return (_safe_int(info.get("display_num"), 999999), rid)
+
+        started_rooms.sort(key=disp_key)
+        other_rooms.sort(key=disp_key)
+
+        lines: list[str] = []
+        lines.append(f"**{join_name}**")
+
+        if not started_rooms and not other_rooms:
+            lines.append("_No active rooms._")
+        else:
+            # Render rooms
+            for rid, info in (started_rooms + other_rooms)[:12]:  # safety cap
+                lines.append(self._room_status_line(rid, info))
+
+                members = await self._normalize_room_players(guild, info)
+                mmr_map = await self._mmr_map_for_members(match_cog, members)
+                ordered = self._sort_room_members(match_cog, members, mmr_map)
+
+                # Lista jugadores (ordenados por MMR desc)
+                if ordered:
+                    for idx, m in enumerate(ordered, start=1):
+                        if match_cog._is_placement_member(m):
+                            lines.append(f"{idx}) {m.display_name} — Placement")
+                        else:
+                            lines.append(f"{idx}) {m.display_name} — {int(mmr_map.get(m.id, 0))} MMR")
+                else:
+                    lines.append("_No players._")
+
+                lines.append("")  # blank line entre rooms
+
+            if len(started_rooms) + len(other_rooms) > 12:
+                lines.append(f"_…and {len(started_rooms) + len(other_rooms) - 12} more rooms._")
+                lines.append("")
+
+        # FUTURE ROOMS (desde queue)
+        now = self._now_lima()
+        next_slot = self._next_slot_dt(now, match_cog)
+        next_slot_ts = int(next_slot.timestamp())
+
+        ordered_queue = await match_cog._get_ordered_queue_members(guild, join_id)
+        # chunk de 5 (ROOM_CAPACITY)
+        groups = [ordered_queue[i : i + ROOM_CAPACITY] for i in range(0, len(ordered_queue), ROOM_CAPACITY)]
+
+        lines.append("—" * 32)
+        lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
+
+        if not groups:
+            lines.append("_Queue empty._")
+        else:
+            # MMR map en batch para todos los non-placement del queue
+            all_members = [m for g in groups for m in g]
+            mmr_map_all = await self._mmr_map_for_members(match_cog, all_members)
+
+            for i, g in enumerate(groups[:12], start=1):  # safety cap
+                lines.append(f"ROOM {i}")
+                # ya viene ordenado por MMR desc + placement al final por _get_ordered_queue_members
+                for pos in range(1, ROOM_CAPACITY + 1):
+                    if pos <= len(g):
+                        m = g[pos - 1]
+                        if match_cog._is_placement_member(m):
+                            lines.append(f"{pos}) {m.display_name} — Placement")
+                        else:
+                            lines.append(f"{pos}) {m.display_name} — {int(mmr_map_all.get(m.id, 0))} MMR")
+                    else:
+                        lines.append(f"{pos}) [empty]")
+                lines.append("")
+
+            if len(groups) > 12:
+                lines.append(f"_…and {len(groups) - 12} more future rooms._")
+
+        return "\n".join(lines).rstrip()
+
+    async def _render_board_embed(self, guild: discord.Guild) -> discord.Embed:
+        match_cog = self._get_matchmaking()
+        now = self._now_lima()
+        ts = int(now.timestamp())
+
+        emb = discord.Embed(
+            title="PJSK ROOMS",
+            description=f"Last update: <t:{ts}:T> (<t:{ts}:R>)",
+        )
+
+        if not match_cog:
+            emb.add_field(name="Status", value="Matchmaking cog not loaded.", inline=False)
+            return emb
+
+        # join channels = keys de match_cog.queues (EN/JP)
+        join_ids = list((match_cog.queues or {}).keys())
+        join_ids = sorted(set(int(x) for x in join_ids if int(x) > 0))
+
+        if not join_ids:
+            emb.add_field(name="Status", value="No join channels configured.", inline=False)
+            return emb
+
+        for join_id in join_ids:
+            block = await self._render_join_section(guild, join_id)
+            # Discord embed field value limit ~1024; si te pasas, cortamos.
+            if len(block) > 1024:
+                block = block[:1000] + "\n…(truncated)"
+            emb.add_field(name="\u200b", value=block, inline=False)
+
+        return emb
+
+    # -------------------------
+    # Refresh pipeline
+    # -------------------------
+    async def refresh_board(self):
+        guild = self.bot.get_guild(GUILD_ID)
+        if not guild:
+            return
+
+        rooms_channel = await self._resolve_rooms_channel(guild)
+        if not rooms_channel:
+            return
+
+        async with self._refresh_lock:
+            msg = await self._get_or_create_board_message(rooms_channel)
+            if not msg:
                 return
 
-            all_rooms = getattr(mm, "rooms", {}) or {}
-            queues = getattr(mm, "queues", {}) or {}
+            embed = await self._render_board_embed(guild)
 
-            # 2) Resolver season una sola vez por update
-            season_id = await self._get_active_season_id(mm)
-            has_pool = getattr(mm, "db_pool", None) is not None and bool(season_id)
+            try:
+                await msg.edit(embed=embed, content=None)
+            except Exception:
+                # si falló editar, intentamos crear otro
+                try:
+                    msg2 = await rooms_channel.send(embed=embed)
+                    self._board_message_id = msg2.id
+                    self._save_cache()
+                except Exception:
+                    pass
 
-            # 3) Construir mapping category_id -> join_channel_id a partir de mm.queues
-            #    (distinguimos EN vs JP sin hardcodear JOIN IDs)
-            ch_cache: dict[int, discord.abc.GuildChannel | None] = {}
-            cat_to_join: dict[int, int] = {}
+    # -------------------------
+    # Events
+    # -------------------------
+    @commands.Cog.listener()
+    async def on_room_updated(self, _rid):
+        await self.refresh_board()
 
-            for join_id in list(queues.keys()):
-                ch = await self._get_text_channel(join_id, cache=ch_cache)
-                if ch is None or ch.category is None:
-                    continue
-                cat_id = ch.category.id
-                if cat_id in CATEGORY_TO_ROOM_CHANNEL:
-                    cat_to_join[cat_id] = join_id
+    @commands.Cog.listener()
+    async def on_room_finished(self, _rid):
+        await self.refresh_board()
 
-            # 4) Agrupar rooms por categoría
-            # tuple:
-            # (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
-            grouped: dict[int, list[tuple]] = {}
+    # -------------------------
+    # Periodic refresh (safety)
+    # -------------------------
+    @tasks.loop(seconds=30.0)
+    async def auto_refresh(self):
+        await self.refresh_board()
 
-            for rid, info in all_rooms.items():
-                cat = info.get("category_id")
-                if cat not in CATEGORY_TO_ROOM_CHANNEL:
-                    continue
+    @auto_refresh.before_loop
+    async def _before_auto_refresh(self):
+        await self.bot.wait_until_ready()
 
-                raw_players = info.get("players", []) or []
-                player_ids: list[int] = []
-
-                for p in raw_players:
-                    if isinstance(p, (discord.Member, discord.User)):
-                        player_ids.append(p.id)
-                    elif isinstance(p, int):
-                        player_ids.append(p)
-
-                # dedup conservando orden
-                player_ids = list(dict.fromkeys(player_ids))
-
-                mmr_map: dict[int, int] = {}
-                if player_ids:
-                    mmr_map = await self._fetch_mmrs_batch(
-                        mm, player_ids, season_id, has_pool
-                    )
-
-                pdata_ids: list[tuple[int, int]] = [
-                    (uid, mmr_map.get(uid, 0)) for uid in player_ids
-                ]
-                pdata_ids.sort(key=lambda t: t[1], reverse=True)
-
-                mmr_vals = [mmr for _, mmr in pdata_ids]
-                avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
-
-                # Fase / scheduling
-                phase = info.get("phase")
-                if isinstance(phase, str):
-                    phase = phase.upper()
-                else:
-                    phase = None
-
-                slot_start_ts = self._coerce_started_ts(info.get("slot_start_ts"))
-                songs_posted = bool(info.get("songs_posted", False))
-
-                # STARTED solo si matchmaking lo marcó explícitamente
-                state = info.get("state")  # opcional: "STARTED"
-                started_flag = (
-                    phase == PHASE_STARTED
-                    or bool(info.get("started"))
-                    or (isinstance(state, str) and state.upper() == PHASE_STARTED)
-                )
-
-                started_ts = self._coerce_started_ts(
-                    info.get("started_ts")
-                    or info.get("start_ts")
-                    or info.get("started_at")
-                )
-
-                reached5_ts = self._coerce_started_ts(
-                    info.get("reached5_ts")
-                    or info.get("ready_ts")
-                    or info.get("full_ts")
-                )
-
-                thread_id = info["thread"]
-
-                grouped.setdefault(cat, []).append(
-                    (
-                        rid,
-                        pdata_ids,
-                        avg,
-                        started_flag,
-                        started_ts,
-                        reached5_ts,
-                        thread_id,
-                        phase,
-                        slot_start_ts,
-                        songs_posted,
-                    )
-                )
-
-            # helper: truncar si excede 2000 chars
-            def build_content(lines: list[str], now_ts: int) -> str:
-                footer = f"{BOARD_MARKER} <t:{now_ts}:R>"
-                if not lines or not lines[-1].startswith(BOARD_MARKER):
-                    lines = lines + [footer]
-
-                content = "\n".join(lines)
-                if len(content) <= 1990:
-                    return content
-
-                body = lines[:-1]
-                while body and len("\n".join(body + ["…(truncated)", footer])) > 1990:
-                    body.pop()
-
-                return "\n".join(body + ["…(truncated)", footer])
-
-            # 5) Por cada categoría, editar o enviar mensaje en su canal rooms
-            now_ts = int(time.time())
-
-            for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
-                channel = await self._get_text_channel(room_chan_id, cache=ch_cache)
-                if not isinstance(channel, discord.TextChannel):
-                    continue
-
-                await self._ensure_prev_message(cat_id, channel)
-
-                guild = channel.guild
-                lines: list[str] = []
-
-                # ---- A) Active rooms + Next Slot (waiting) ----
-                rooms_list = grouped.get(cat_id, []) or []
-
-                active_rooms: list[tuple] = []
-                future_rooms: list[tuple] = []
-
-                for t in rooms_list:
-                    # t =
-                    # (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
-                    phase = t[7]
-                    if phase == PHASE_FUTURE and not bool(t[3]):
-                        # FUTURE que aún no ha empezado => “next slot”
-                        future_rooms.append(t)
-                    else:
-                        # STARTED o WAITING/READY del slot actual
-                        active_rooms.append(t)
-
-                # Orden:
-                # - Active: STARTED primero, luego waiting/ready; dentro por avg desc
-                def active_prio(t: tuple) -> int:
-                    started_flag = bool(t[3])
-                    phase = t[7]
-                    if started_flag or phase == PHASE_STARTED:
-                        return 0
-                    return 1
-
-                active_rooms.sort(key=lambda t: (active_prio(t), -int(t[2]), int(t[0])))
-
-                # - Future: por slot_start_ts asc (si existe) y luego avg desc
-                def future_sort_key(t: tuple):
-                    slot_ts = t[8] if isinstance(t[8], int) else 0
-                    # 0 al final si no hay ts
-                    slot_ts = slot_ts if slot_ts > 0 else 10**12
-                    return (slot_ts, -int(t[2]), int(t[0]))
-
-                future_rooms.sort(key=future_sort_key)
-
-                def render_room(
-                    rid: int,
-                    pdata_ids: list[tuple[int, int]],
-                    avg: int,
-                    status: str,
-                    thread_id: int,
-                ):
-                    count = len(pdata_ids)
-                    ref = (
-                        f"<#{thread_id}>"
-                        if isinstance(thread_id, int) and thread_id > 0
-                        else None
-                    )
-
-                    if ref:
-                        lines.append(
-                            f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
-                        )
-                    else:
-                        lines.append(
-                            f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**"
-                        )
-
-                    for uid, mmr in pdata_ids:
-                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
-                    lines.append("")
-
-                if active_rooms:
-                    lines.append("**Active Rooms**")
-                    lines.append("")
-
-                    for (
-                        rid,
-                        pdata_ids,
-                        avg,
-                        started_flag,
-                        started_ts,
-                        reached5_ts,
-                        thread_id,
-                        phase,
-                        slot_start_ts,
-                        songs_posted,
-                    ) in active_rooms:
-                        count = len(pdata_ids)
-
-                        if started_flag or phase == PHASE_STARTED:
-                            status = (
-                                f"[STARTED] <t:{started_ts}:t>"
-                                if started_ts
-                                else "[STARTED]"
-                            )
-                        else:
-                            # “Activas” pero aún sin empezar (slot actual)
-                            if count == ROOM_CAPACITY:
-                                status = (
-                                    f"[READY 5/5] <t:{reached5_ts}:t>"
-                                    if reached5_ts
-                                    else "[READY 5/5]"
-                                )
-                            else:
-                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
-
-                        render_room(rid, pdata_ids, avg, status, thread_id)
-
-                # FUTURE rooms (next slot) SIEMPRE ABAJO de las activas
-                if future_rooms:
-                    if lines and lines[-1].strip() != "":
-                        lines.append("")
-
-                    lines.append("**Next Slot (waiting)**")
-                    lines.append("")
-
-                    for (
-                        rid,
-                        pdata_ids,
-                        avg,
-                        started_flag,
-                        started_ts,
-                        reached5_ts,
-                        thread_id,
-                        phase,
-                        slot_start_ts,
-                        songs_posted,
-                    ) in future_rooms:
-                        count = len(pdata_ids)
-
-                        # Requisito: aunque sea FUTURE, si se está llenando => WAITING (no SCHEDULED)
-                        if slot_start_ts:
-                            status = (
-                                f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> "
-                                f"(<t:{slot_start_ts}:R>)"
-                            )
-                        else:
-                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
-
-                        render_room(rid, pdata_ids, avg, status, thread_id)
-
-                # ---- B) Queue ----
-                join_id = cat_to_join.get(cat_id)
-                queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
-
-                queue_ids: list[int] = []
-                for item in queue_raw or []:
-                    if isinstance(item, int):
-                        queue_ids.append(item)
-                    elif isinstance(item, (discord.Member, discord.User)):
-                        queue_ids.append(item.id)
-
-                queue_ids = list(dict.fromkeys(queue_ids))
-
-                if queue_ids:
-                    mmr_map_q = await self._fetch_mmrs_batch(
-                        mm, queue_ids, season_id, has_pool
-                    )
-
-                    # Separador visual si venimos de rooms activos
-                    if lines and lines[-1].strip() != "":
-                        lines.append("")
-
-                    lines.append("**Queue**")
-
-                    for idx in range(0, len(queue_ids), ROOM_CAPACITY):
-                        grp_ids = queue_ids[idx : idx + ROOM_CAPACITY]
-                        grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
-                        avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
-                        count_q = len(grp_ids)
-
-                        q_status = (
-                            "[READY 5/5]"
-                            if count_q == ROOM_CAPACITY
-                            else f"[WAITING {count_q}/{ROOM_CAPACITY}]"
-                        )
-                        group_n = (idx // ROOM_CAPACITY) + 1
-
-                        lines.append(
-                            f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**"
-                        )
-                        for uid in grp_ids:
-                            lines.append(
-                                f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})"
-                            )
-                        lines.append("")
-                else:
-                    # Si no hay rooms y no hay queue
-                    if not rooms_list:
-                        lines.append("**No active rooms**")
-
-                content = build_content(lines, now_ts)
-
-                prev_msg = self.posted_messages.get(cat_id)
-
-                # Si no existe mensaje previo o el canal cambió, mandamos uno nuevo
-                if prev_msg is None or prev_msg.channel.id != channel.id:
-                    try:
-                        msg = await channel.send(content)
-                        self.posted_messages[cat_id] = msg
-                    except discord.Forbidden:
-                        continue
-                    except discord.HTTPException:
-                        continue
-                    continue
-
-                # Si existe, intentamos editar; si fue borrado, re-crear
-                if prev_msg.content != content:
-                    try:
-                        await prev_msg.edit(content=content)
-                    except (discord.NotFound, discord.HTTPException, discord.Forbidden):
-                        try:
-                            msg = await channel.send(content)
-                            self.posted_messages[cat_id] = msg
-                        except discord.Forbidden:
-                            pass
-                        except discord.HTTPException:
-                            pass
-
-            with open("assets/cached_rooms.json", "w+", encoding="utf-8") as f:
-                json.dump(all_rooms, f)
-
-        except Exception as e:
-            print(f"[Rooms] Error en _do_update: {e}")
+    async def cog_unload(self):
+        try:
+            self.auto_refresh.cancel()
+        except Exception:
+            pass
 
 
 async def setup(bot: commands.Bot):
