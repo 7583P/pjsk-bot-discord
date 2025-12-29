@@ -1145,7 +1145,7 @@ class Matchmaking(commands.Cog):
 
     async def _start_future_rooms_for_slot(self, join_channel_id: int, slot_ts: int):
         """
-        En el minuto exacto del slot (:00/:20/:40):
+        En el minuto exacto del slot (:00/:30):
         - Para rooms FUTURE cuyo slot_start_ts == slot_ts:
             * postea canciones (launch_song_poll)
             * marca STARTED
@@ -5103,3 +5103,4 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
