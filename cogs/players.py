@@ -177,7 +177,7 @@ class PlayersCog(commands.Cog):
             await upsert_player(member.id, name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention}! Excecute `/register <COUNTRY IN 2 LETTERS>` in #set_your_country to see your country in the page"
+                    f"Welcome {member.mention}! Excecute `/set_your_country <COUNTRY IN 2 LETTERS>` in #set_your_country to see your country in the page"
                 )
 
     @commands.Cog.listener()
@@ -432,3 +432,4 @@ class PlayersCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayersCog(bot))
+
