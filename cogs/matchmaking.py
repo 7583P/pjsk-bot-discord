@@ -3728,7 +3728,7 @@ class Matchmaking(commands.Cog):
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),       
-            app_commands.Choice(name="Season 1", value="season 1")
+            app_commands.Choice(name="Season 1", value="season 1"),
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
@@ -3829,7 +3829,7 @@ class Matchmaking(commands.Cog):
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Season 1", value="season 1")
+            app_commands.Choice(name="Season 1", value="season 1"),
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
@@ -3885,7 +3885,7 @@ class Matchmaking(commands.Cog):
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
-            app_commands.Choice(name="Season 1", value="season 1")
+            app_commands.Choice(name="Season 1", value="season 1"),
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha tests season"),
