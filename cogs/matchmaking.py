@@ -3723,11 +3723,12 @@ class Matchmaking(commands.Cog):
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
-        season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season"
+        season="Season: Current, Season 1, Pre Season, Alpha Test Season or Beta Test Season"
     )
     @app_commands.choices(
         season=[
-            app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="Current", value="current"),       
+            app_commands.Choice(name="Season 1", value="season 1")
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
@@ -3823,11 +3824,12 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
         user="Player",
-        season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season",
+        season="Season: Current, Season 1, Pre Season, Alpha Test Season or Beta Test Season"
     )
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="Season 1", value="season 1")
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
@@ -3874,15 +3876,16 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="cutoffs",
-        description="Shows the MMR Cutoff of T10, T20, T30, T40, T50 y T100 for the selected season",
+        description="Shows the MMR Cutoff of T10, T20, T30, T40, T50, T100... T1000 for the selected season",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
-        season="Temporada: Current, Pre Season, Alpha Test Season or Beta Test Season"
+        season="Season: Current, Season 1, Pre Season, Alpha Test Season or Beta Test Season"
     )
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="Season 1", value="season 1")
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha tests season"),
@@ -3901,7 +3904,7 @@ class Matchmaking(commands.Cog):
             )
 
         # calcular cutoffs
-        tiers = (10, 20, 30, 40, 50, 100)
+        tiers = (10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000)
         data = {}
         for n in tiers:
             data[n] = await self._fetch_cutoff(season_id, n)
@@ -3927,11 +3930,12 @@ class Matchmaking(commands.Cog):
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
-        season="Season: Current, Pre Season, Alpha Test Season or Beta Test Season"
+        season="Season: Current, Season 1, Pre Season, Alpha Test Season or Beta Test Season"
     )
     @app_commands.choices(
         season=[
             app_commands.Choice(name="Current", value="current"),
+            app_commands.Choice(name="Season 1", value="season 1")
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
             app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
