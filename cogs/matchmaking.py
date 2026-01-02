@@ -3329,28 +3329,36 @@ class Matchmaking(commands.Cog):
         allowed_diffs = ALLOWED_DIFFS_BY_RANK.get(base_rank, DIFFICULTY_PRIORITY)
 
         # 3) Selección de canciones
-        #    - si la sala es Placement → modo especial 24–28 EXPERT
-        #    - en otro caso → gap base y append también según base_rank (MMR promedio)
         if base_rank == "Placement":
-            # Regla especial de Placement: 1 canción por nivel 24–28, solo EXPERT
             picks = await self._pick_placement_songs_levels_24_to_28(server=server_code)
             low, high = 24, 28
+
+            # ✅ Asegurar exactamente 5 (o lo más cercano posible) sin crashear
+            final_picks = list(picks)
+            if len(final_picks) < 5:
+                extra = await self._get_random_songs(
+                    24, 28, ("expert",),
+                    limit=5 - len(final_picks),
+                    server=server_code,
+                    exclude_titles={t for (t, *_r) in final_picks},
+                )
+                final_picks.extend(extra)
+
+            # Si por algún motivo hay >5, recorta sin ValueError
+            if len(final_picks) > 5:
+                final_picks = secrets.SystemRandom().sample(final_picks, k=5)
+
         else:
-            # a) Rango base SOLO para non-append (según rango por MMR promedio)
-            base_lo, base_hi = low, high  # p.ej. Master ⬆ → 31–35
+            base_lo, base_hi = low, high
             non_append_diffs = tuple(d for d in allowed_diffs if d != "append")
 
-            # b) Rango de append independiente, basado en el mismo rango del room
             append_range = None
             if "append" in allowed_diffs:
-                append_range = APPEND_RANGES.get(base_rank)  # p.ej. Master ⬆ → 29–32
+                append_range = APPEND_RANGES.get(base_rank)
 
-            # c) Pools separados
             pool_non_append: list[tuple[str, int, str, int]] = []
             pool_append: list[tuple[str, int, str, int]] = []
 
-            # Non-append (hard/expert/master) SIEMPRE en su rango base,
-            # pero equilibrado por nivel (intentamos 5 por nivel).
             taken_titles: set[str] = set()
             if non_append_diffs:
                 pool_non_append = await self._build_level_balanced_pool(
@@ -3358,11 +3366,10 @@ class Matchmaking(commands.Cog):
                     base_hi,
                     server=server_code,
                     diffs=non_append_diffs,
-                    per_level=5,  # 5 canciones por nivel → 25 en total si el catálogo lo permite
+                    per_level=5,
                 )
                 taken_titles = {t for (t, *_rest) in pool_non_append}
 
-            # Append SOLO en su rango de append, sin romper la probabilidad de append
             if append_range is not None:
                 alo, ahi = append_range
                 pool_append = await self._get_random_songs(
@@ -3374,60 +3381,64 @@ class Matchmaking(commands.Cog):
                     exclude_titles=taken_titles,
                 )
 
-            # d) Selección final
             prob = get_append_probability_for_rank(base_rank)
-            picks: list[tuple[str, int, str, int]] = []
             used_append = False
+            picks: list[tuple[str, int, str, int]] = []
 
-            # ¿Forzamos al menos 1 append?
             if pool_append and random.random() < prob:
                 used_append = True
                 random.shuffle(pool_append)
                 random.shuffle(pool_non_append)
 
-                append_count = pick_append_count_for_rank(
-                    base_rank, max_available=len(pool_append)
-                )
+                append_count = pick_append_count_for_rank(base_rank, max_available=len(pool_append))
                 append_count = max(1, min(append_count, 5))
 
-                picks = []
                 picks.extend(pool_append[:append_count])
-
                 remaining = 5 - len(picks)
 
-                # completar con non-append primero
                 if remaining > 0 and pool_non_append:
                     picks.extend(pool_non_append[:remaining])
                     remaining = 5 - len(picks)
 
-                # si aún falta, completar con más append
                 if remaining > 0 and len(pool_append) > append_count:
                     picks.extend(pool_append[append_count : append_count + remaining])
 
             else:
-                # Intentar solo non-append en su rango
                 random.shuffle(pool_non_append)
                 picks = pool_non_append[:5]
                 remaining = 5 - len(picks)
 
-                # Si no alcanza y hay append, usar append como fallback
                 if remaining > 0 and pool_append:
                     used_append = True
                     random.shuffle(pool_append)
                     picks.extend(pool_append[:remaining])
 
-            # Máximo 5 canciones
-            final_picks = secrets.SystemRandom().sample(picks, k=5)
+            # ✅ Relleno final si el catálogo no alcanza (evita ValueError)
+            final_picks = list(picks)
+            if len(final_picks) < 5:
+                # fallback: usa allowed_diffs (sin reventar SQL)
+                fb_diffs = tuple(d for d in allowed_diffs if d != "append") or ("expert", "master", "hard", "normal")
+                extra = await self._get_random_songs(
+                    base_lo, base_hi,
+                    fb_diffs,
+                    limit=5 - len(final_picks),
+                    server=server_code,
+                    exclude_titles={t for (t, *_r) in final_picks},
+                )
+                final_picks.extend(extra)
 
-            # e) Decidir qué gap mostrar
+            # Si aún así no llegó a 5, no crashees: manda lo que hay
+            if len(final_picks) > 5:
+                final_picks = secrets.SystemRandom().sample(final_picks, k=5)
+
+            # e) Decidir gap a mostrar
             if used_append and append_range is not None:
                 alo, ahi = append_range
-                # Mostramos la unión de ambos rangos
                 low = min(base_lo, alo)
                 high = max(base_hi, ahi)
             else:
-                # No hay append en la selección → gap SOLO de Master/Master ⬆
                 low, high = base_lo, base_hi
+
 
         # 4) Construir el mensaje
         total_notes = sum(int(n or 0) for *_, n in final_picks)  # suma segura
@@ -5156,6 +5167,7 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
 
 
 
