@@ -764,51 +764,57 @@ class Matchmaking(commands.Cog):
         prep_start = self._in_prep_window(now)  # 55 / 25
         if prep_start is None:
             return
-    
+
         slot_dt = self._slot_start_from_prep_start(now, prep_start)
-    
-        # normalizar a minuto exacto
+
+        # now puede venir con segundos; lo normalizamos para que 14:59:xx -> 1 min left
         now0 = now.replace(second=0, microsecond=0)
         mins_left = int((slot_dt - now0).total_seconds() // 60)
-    
-        # ✅ En vez de spamear 5..1, mandamos SOLO cuando faltan 5 minutos
-        if mins_left != 5:
+
+        # Solo 5..1
+        if mins_left < 1 or mins_left > 5:
             return
-    
+
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
         qlen = len(ordered)
-    
+
         # Need incluso si no hay nadie
         if qlen == 0:
             need = ROOM_CAPACITY
         else:
             rem = qlen % ROOM_CAPACITY
             need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
-    
+
         slot_ts = int(slot_dt.timestamp())
-    
-        # Ping (solo si hay gente, falta completar y estamos en el aviso único)
+
+        # Ping seguro (sin KeyError) — solo si:
+        # - hay gente en cola (qlen > 0)
+        # - el siguiente room NO está lleno todavía (need > 0)
+        # - es el aviso de 5 minutos
         ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(join_id)
-        do_ping = ping_role_id is not None and qlen > 0 and need > 0
+        do_ping = (
+            ping_role_id is not None
+            and mins_left == 5
+            and qlen > 0
+            and need > 0
+        )
         ping_part = f"<@&{ping_role_id}> " if do_ping else ""
-    
+
         # Texto cuando ya está completo
         if need == 0:
             need_txt = "Next room is already full."
         else:
             need_txt = f"Need ({need}) player(s) to fill the next room."
-    
-        # ✅ Formato pedido: TIMESTAMP (relativo) + need X players...
-        # <t:slot_ts:R> mostrará "in 5 minutes" y bajará solo.
+
         try:
             await join_channel.send(
-                f"⏳ <t:{slot_ts}:R> — {ping_part}{need_txt} "
+                f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
+                f"{ping_part}{need_txt} "
                 f"Type `/c` to join the queue or `/d` to drop the queue."
             )
         except Exception:
             pass
-
 
 
     async def _pend_unfilled_queue_on_slot(
