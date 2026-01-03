@@ -43,6 +43,9 @@ STATE_PATH = "assets/rooms_board_state.json"
 # Cache debug serializable (no revienta por objetos discord)
 DEBUG_SNAPSHOT_PATH = "assets/cached_rooms.json"
 
+# TTL de snapshots (fallback) para no acumular basura si nunca se linkean a rooms reales
+ACTIVE_SNAPSHOT_TTL_SECONDS = 2 * 60 * 60  # 2 horas
+
 
 # -----------------------------
 # Helpers de estado persistente
@@ -77,6 +80,13 @@ def _round_up_to_next_slot(now: datetime, interval_minutes: int) -> datetime:
     return base + timedelta(minutes=(interval_minutes - remainder))
 
 
+def _safe_int(x, default: int = 0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
 # -----------------------------
 # Cog
 # -----------------------------
@@ -94,7 +104,7 @@ class Rooms(commands.Cog):
         # Coalesce: si llegan muchos eventos, hacemos como máximo 1 update extra al final
         self._update_pending: bool = False
 
-        # Estado persistente: {str(cat_id): {"channel_id": int, "message_id": int}}
+        # Estado persistente: {str(cat_id): {"channel_id": int, "message_id": int, ...}}
         self._state = _load_state()
 
         # Listeners para refrescar al vuelo
@@ -185,17 +195,14 @@ class Rooms(commands.Cog):
 
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
-                    # Primero intentamos con marker nuevo
                     if msg.content and BOARD_MARKER in msg.content:
                         return msg
 
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
-                    # Compatibilidad con tu marker viejo
                     if msg.content and ("Last Update" in msg.content or "Last update" in msg.content):
                         return msg
 
-            # Último fallback: último mensaje del bot, aunque sea embed (lo vamos a limpiar)
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
                     return msg
@@ -233,7 +240,11 @@ class Rooms(commands.Cog):
         prev = await self._find_last_board_message(channel)
         if prev is not None:
             self.posted_messages[cat_id] = prev
-            self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": prev.id}
+            self._state[str(cat_id)] = {
+                **(self._state.get(str(cat_id)) or {}),
+                "channel_id": channel.id,
+                "message_id": prev.id,
+            }
             _save_state(self._state)
 
     async def _get_active_season_id(self, mm) -> int | None:
@@ -332,6 +343,42 @@ class Rooms(commands.Cog):
             body.pop()
         return "\n".join(body + ["…(truncated)", footer])
 
+    def _queue_groups_sorted_by_mmr(self, queue_ids: list[int], mmr_map: dict[int, int]) -> list[dict]:
+        """
+        REQ 1: Ordena jugadores por MMR desc y, en base a ese orden, arma grupos (rooms) de 5.
+        """
+        # Orden global: MMR desc, tie-break por uid asc para estabilidad
+        ordered = sorted(queue_ids, key=lambda uid: (-_safe_int(mmr_map.get(uid, 0)), _safe_int(uid)))
+        groups: list[dict] = []
+
+        for idx in range(0, len(ordered), ROOM_CAPACITY):
+            grp_ids = ordered[idx: idx + ROOM_CAPACITY]
+            # Asegurar orden dentro del grupo (MMR desc)
+            grp_ids = sorted(grp_ids, key=lambda uid: (-_safe_int(mmr_map.get(uid, 0)), _safe_int(uid)))
+
+            grp_mmrs = [_safe_int(mmr_map.get(uid, 0)) for uid in grp_ids]
+            avg = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
+
+            groups.append(
+                {
+                    "group_n": (idx // ROOM_CAPACITY) + 1,
+                    "player_ids": [int(x) for x in grp_ids],
+                    "mmrs": {str(int(uid)): int(_safe_int(mmr_map.get(uid, 0))) for uid in grp_ids},
+                    "avg": int(avg),
+                    "created_ts": int(time.time()),
+                    "activated_ts": None,
+                    "slot_ts": None,
+                    "linked_room_id": None,
+                }
+            )
+        return groups
+
+    def _normalize_group_player_set(self, g: dict) -> frozenset[int]:
+        try:
+            return frozenset(int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit())
+        except Exception:
+            return frozenset()
+
     async def _do_update_core(self):
         mm = self.bot.get_cog("Matchmaking")
         if mm is None:
@@ -380,6 +427,7 @@ class Rooms(commands.Cog):
 
                 mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool) if player_ids else {}
                 pdata_ids = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
+                # Orden dentro de la room: MMR desc
                 pdata_ids.sort(key=lambda t: t[1], reverse=True)
 
                 mmr_vals = [mmr for _, mmr in pdata_ids]
@@ -405,7 +453,6 @@ class Rooms(commands.Cog):
                     (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
                 )
             except Exception:
-                # No dejes que una sala rota rompa todo el update
                 continue
 
         # Debug snapshot serializable (no rompe update)
@@ -438,7 +485,7 @@ class Rooms(commands.Cog):
         next_slot_dt = _round_up_to_next_slot(now_dt, SLOT_INTERVAL_MINUTES)
         next_slot_ts = int(next_slot_dt.timestamp())
 
-        # IMPORTANTE: procesa cada categoría con try/except para no bloquear JP
+        # Procesa cada categoría con try/except para no bloquear JP
         for cat_id, room_chan_id in CATEGORY_TO_ROOM_CHANNEL.items():
             try:
                 channel = await self._get_text_channel(room_chan_id, cache=ch_cache)
@@ -452,6 +499,71 @@ class Rooms(commands.Cog):
                 join_ch = await self._get_text_channel(join_id, cache=ch_cache) if isinstance(join_id, int) else None
                 join_label = f"#{join_ch.name}" if isinstance(join_ch, discord.TextChannel) else "join"
 
+                # -----------------------------
+                # Estado por categoría (persistente)
+                # -----------------------------
+                cat_key = str(cat_id)
+                cat_state = self._state.get(cat_key) or {}
+                state_dirty = False
+
+                last_next_slot_ts = cat_state.get("last_next_slot_ts")
+                pending_future_groups = cat_state.get("pending_future_groups") or []
+                active_queue_groups = cat_state.get("active_queue_groups") or []
+
+                # Cleanup TTL básico (fallback)
+                cleaned_active = []
+                for g in active_queue_groups:
+                    try:
+                        activated = _safe_int(g.get("activated_ts") or 0)
+                        if activated and (now_ts - activated) > ACTIVE_SNAPSHOT_TTL_SECONDS:
+                            # si ya expiró y no está linkeado a una room viva, se limpia
+                            if not g.get("linked_room_id"):
+                                continue
+                        cleaned_active.append(g)
+                    except Exception:
+                        cleaned_active.append(g)
+                if cleaned_active != active_queue_groups:
+                    active_queue_groups = cleaned_active
+                    state_dirty = True
+
+                # REQ 2: Cuando el "next slot" cambie, lo que estaba en FUTURE se pasa a ACTIVE y NO se elimina.
+                # Detecta rollover de slot:
+                if isinstance(last_next_slot_ts, int) and last_next_slot_ts > 0 and last_next_slot_ts != next_slot_ts:
+                    # Promueve pending_future_groups -> active_queue_groups
+                    promoted: list[dict] = []
+                    for g in (pending_future_groups or []):
+                        try:
+                            g2 = dict(g)
+                            g2["activated_ts"] = now_ts
+                            g2["slot_ts"] = int(last_next_slot_ts)
+                            # No duplicar si ya existe el mismo set
+                            gset = self._normalize_group_player_set(g2)
+                            dup = False
+                            for ex in active_queue_groups:
+                                if self._normalize_group_player_set(ex) == gset and _safe_int(ex.get("slot_ts")) == _safe_int(g2.get("slot_ts")):
+                                    dup = True
+                                    break
+                            if not dup and gset:
+                                promoted.append(g2)
+                        except Exception:
+                            continue
+
+                    if promoted:
+                        active_queue_groups = list(active_queue_groups) + promoted
+                        state_dirty = True
+
+                    # Limpia pending (ya se movió)
+                    pending_future_groups = []
+                    state_dirty = True
+
+                # Actualiza last_next_slot_ts
+                if _safe_int(last_next_slot_ts) != _safe_int(next_slot_ts):
+                    cat_state["last_next_slot_ts"] = int(next_slot_ts)
+                    state_dirty = True
+
+                # -----------------------------
+                # Rooms reales del Matchmaking
+                # -----------------------------
                 rooms_list = grouped.get(cat_id, []) or []
 
                 active_rooms: list[tuple] = []
@@ -479,54 +591,21 @@ class Rooms(commands.Cog):
 
                 future_rooms.sort(key=future_sort_key)
 
-                lines: list[str] = []
-                lines.append("**PJSK ROOMS**")
-                lines.append(f"**{join_label}**")
-                lines.append("")
+                # Map de rooms por set de jugadores (para linkear snapshots y evitar duplicados)
+                room_set_to_rid: dict[frozenset[int], int] = {}
+                room_id_to_phase: dict[int, str | None] = {}
+                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in rooms_list:
+                    try:
+                        pset = frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
+                        if pset:
+                            room_set_to_rid[pset] = int(rid)
+                        room_id_to_phase[int(rid)] = phase
+                    except Exception:
+                        continue
 
-                def render_room(rid: int, pdata_ids: list[tuple[int, int]], avg: int, status: str, thread_id: Optional[int]):
-                    count = len(pdata_ids)
-                    ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else ""
-                    if ref:
-                        lines.append(f"**Room {rid} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
-                    else:
-                        lines.append(f"**Room {rid} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
-                    for uid, mmr in pdata_ids:
-                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
-                    lines.append("")
-
-                if not active_rooms:
-                    lines.append("_No active rooms._")
-                    lines.append("")
-                else:
-                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in active_rooms:
-                        count = len(pdata_ids)
-                        if started_flag or phase == PHASE_STARTED:
-                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
-                        else:
-                            if count == ROOM_CAPACITY:
-                                status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
-                            else:
-                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
-                        render_room(rid, pdata_ids, avg, status, thread_id)
-
-                lines.append("────────────────────────")
-
-                # FUTURE header siempre (como tu screenshot)
-                lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
-
-                # Si hay rooms FUTURE explícitas, muéstralas
-                if future_rooms:
-                    lines.append("")
-                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
-                        count = len(pdata_ids)
-                        if slot_start_ts:
-                            status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
-                        else:
-                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
-                        render_room(rid, pdata_ids, avg, status, thread_id)
-
-                # Queue (derivada del join correspondiente)
+                # -----------------------------
+                # Queue -> FUTURE groups (ordenados por MMR desc)
+                # -----------------------------
                 queue_raw = queues.get(join_id, []) if isinstance(join_id, int) else []
                 queue_ids: list[int] = []
                 for item in (queue_raw or []):
@@ -536,22 +615,200 @@ class Rooms(commands.Cog):
                         queue_ids.append(item.id)
                 queue_ids = list(dict.fromkeys(queue_ids))
 
-                if not queue_ids:
+                pending_groups_now: list[dict] = []
+                if queue_ids:
+                    mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
+                    pending_groups_now = self._queue_groups_sorted_by_mmr(queue_ids, mmr_map_q)
+
+                # Guardar pending_future_groups para el next_slot actual (se promueve en el próximo rollover)
+                # (Esto es lo que se ve en FUTURE ROOMS)
+                cat_state["pending_future_groups"] = pending_groups_now
+                pending_future_groups = pending_groups_now
+                state_dirty = True
+
+                # Persistir el active_queue_groups actualizado también
+                cat_state["active_queue_groups"] = active_queue_groups
+                state_dirty = True
+
+                # Intento de link: si un snapshot coincide con una room real, lo linkeamos.
+                # Además: si ya está linkeado pero ya no existe la room, se limpia (room finished).
+                alive_room_ids = set(int(rid) for rid in (all_rooms.keys() if isinstance(all_rooms, dict) else []) if str(rid).isdigit() or isinstance(rid, int))
+
+                new_active_groups: list[dict] = []
+                for g in active_queue_groups:
+                    try:
+                        pset = self._normalize_group_player_set(g)
+                        linked = g.get("linked_room_id")
+                        if isinstance(linked, int) and linked > 0:
+                            if linked not in alive_room_ids:
+                                # room ya no existe -> limpiar snapshot (ya terminó)
+                                continue
+                            new_active_groups.append(g)
+                            continue
+
+                        # no linkeado: intentar link
+                        if pset in room_set_to_rid:
+                            g2 = dict(g)
+                            g2["linked_room_id"] = int(room_set_to_rid[pset])
+                            new_active_groups.append(g2)
+                            state_dirty = True
+                        else:
+                            new_active_groups.append(g)
+                    except Exception:
+                        new_active_groups.append(g)
+
+                if new_active_groups != active_queue_groups:
+                    active_queue_groups = new_active_groups
+                    cat_state["active_queue_groups"] = active_queue_groups
+                    state_dirty = True
+
+                # Lookup: snapshot por room_id (para REQ 2: no perder lista si el Matchmaking vacía players al pasar a ACTIVE)
+                snapshot_by_room_id: dict[int, dict] = {}
+                for g in active_queue_groups:
+                    rid = g.get("linked_room_id")
+                    if isinstance(rid, int) and rid > 0:
+                        snapshot_by_room_id[rid] = g
+
+                if state_dirty:
+                    self._state[cat_key] = {
+                        **cat_state,
+                        # Mantener si ya existían
+                        "channel_id": (cat_state.get("channel_id") if isinstance(cat_state.get("channel_id"), int) else None),
+                        "message_id": (cat_state.get("message_id") if isinstance(cat_state.get("message_id"), int) else None),
+                    }
+                    _save_state(self._state)
+
+                # -----------------------------
+                # Render
+                # -----------------------------
+                lines: list[str] = []
+                lines.append("**PJSK ROOMS**")
+                lines.append(f"**{join_label}**")
+                lines.append("")
+
+                def render_group_like_room(
+                    title: str,
+                    pdata_ids: list[tuple[int, int]],
+                    avg: int,
+                    status: str,
+                    thread_id: Optional[int] = None,
+                ):
+                    count = len(pdata_ids)
+                    ref = f"<#{thread_id}>" if isinstance(thread_id, int) and thread_id > 0 else ""
+                    if ref:
+                        lines.append(f"**{title} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
+                    else:
+                        lines.append(f"**{title} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
+                    # REQ 1: lista interna siempre MMR desc
+                    pdata_ids_sorted = sorted(pdata_ids, key=lambda t: t[1], reverse=True)
+                    for uid, mmr in pdata_ids_sorted:
+                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
+                    lines.append("")
+
+                # -----------------------------
+                # ACTIVE ROOMS (reales)
+                # -----------------------------
+                if not active_rooms and not active_queue_groups:
+                    lines.append("_No active rooms._")
+                    lines.append("")
+                else:
+                    # Rooms reales
+                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in active_rooms:
+                        # Si la room real no trae players (o viene vacía), usamos snapshot si existe
+                        if (not pdata_ids) and int(rid) in snapshot_by_room_id:
+                            sg = snapshot_by_room_id[int(rid)]
+                            pids = [int(x) for x in (sg.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
+                            mmrs = sg.get("mmrs") or {}
+                            pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
+                            avg = _safe_int(sg.get("avg"), 0)
+
+                        count = len(pdata_ids)
+                        if started_flag or phase == PHASE_STARTED:
+                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
+                        else:
+                            if count == ROOM_CAPACITY:
+                                status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
+                            else:
+                                status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_group_like_room(f"Room {rid}", pdata_ids, int(avg), status, thread_id)
+
+                    # Snapshots activos (venían de FUTURE y ya pasaron a ACTIVE)
+                    # Evitar duplicado si ya existe una room real con el mismo set de jugadores visible
+                    active_room_player_sets = set(
+                        frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
+                        for (_, pdata_ids, _, _, _, _, _, _, _, _) in active_rooms
+                    )
+
+                    # Orden: grupos con mayor avg primero
+                    def _snap_sort(g: dict):
+                        return (-_safe_int(g.get("avg"), 0), _safe_int(g.get("slot_ts") or 0), _safe_int(g.get("group_n"), 0))
+
+                    for g in sorted(active_queue_groups, key=_snap_sort):
+                        pset = self._normalize_group_player_set(g)
+                        if pset and pset in active_room_player_sets:
+                            continue  # ya se muestra en room real
+                        # si está linkeado a room real viva, normalmente se omitirá arriba; pero si la room real está vacía, esta sí sirve.
+                        linked = g.get("linked_room_id")
+                        if isinstance(linked, int) and linked > 0:
+                            # si la room real existe y está en active_rooms, ya está cubierta (arriba)
+                            # si no está, igual mostramos como snapshot activo
+                            pass
+
+                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
+                        mmrs = g.get("mmrs") or {}
+                        pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
+                        avg = _safe_int(g.get("avg"), 0)
+                        count = len(pdata_ids)
+
+                        slot_ts = _safe_int(g.get("slot_ts") or 0)
+                        suffix = f" · <t:{slot_ts}:t>" if slot_ts > 0 else ""
+                        status = "[READY 5/5]" if count == ROOM_CAPACITY else f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_group_like_room(f"Active Group {g.get('group_n', '?')}{suffix}", pdata_ids, avg, status, None)
+
+                lines.append("────────────────────────")
+
+                # -----------------------------
+                # FUTURE ROOMS (next slot ...)
+                #   - aquí se muestran los grupos derivados de queue (ordenados por MMR desc)
+                #   - al pasar el slot, se promueven a ACTIVE y NO se eliminan
+                # -----------------------------
+                lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
+
+                # 1) FUTURE rooms reales (si existen en mm.rooms con phase FUTURE)
+                if future_rooms:
+                    lines.append("")
+                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
+                        count = len(pdata_ids)
+                        if slot_start_ts:
+                            status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
+                        else:
+                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_group_like_room(f"Room {rid}", pdata_ids, int(avg), status, thread_id)
+
+                # 2) Grupos de queue (pending) para el próximo slot (esto es lo que pediste ordenar por MMR y usar para crear rooms)
+                if not pending_future_groups:
                     lines.append("_Queue empty._")
                 else:
-                    mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
+                    # Evitar duplicado si ya hay FUTURE rooms reales con el mismo set
+                    future_room_sets = set(
+                        frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
+                        for (_, pdata_ids, _, _, _, _, _, _, _, _) in future_rooms
+                    )
+
                     lines.append("")
-                    for idx in range(0, len(queue_ids), ROOM_CAPACITY):
-                        grp_ids = queue_ids[idx: idx + ROOM_CAPACITY]
-                        grp_mmrs = [mmr_map_q.get(uid, 0) for uid in grp_ids]
-                        avg_q = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
-                        count_q = len(grp_ids)
-                        q_status = "[READY 5/5]" if count_q == ROOM_CAPACITY else f"[WAITING {count_q}/{ROOM_CAPACITY}]"
-                        group_n = (idx // ROOM_CAPACITY) + 1
-                        lines.append(f"**Queue Group {group_n} · {count_q}/{ROOM_CAPACITY} Players · Average MMR {avg_q} · {q_status}**")
-                        for uid in grp_ids:
-                            lines.append(f"- {self._user_label(guild, uid)} ({mmr_map_q.get(uid, 0)})")
-                        lines.append("")
+                    # Orden: group_n asc (ya viene armado por MMR global desc)
+                    for g in sorted(pending_future_groups, key=lambda x: _safe_int(x.get("group_n"), 0)):
+                        pset = self._normalize_group_player_set(g)
+                        if pset and pset in future_room_sets:
+                            continue
+
+                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
+                        mmrs = g.get("mmrs") or {}
+                        pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
+                        avg = _safe_int(g.get("avg"), 0)
+                        count = len(pdata_ids)
+                        status = "[READY 5/5]" if count == ROOM_CAPACITY else f"[WAITING {count}/{ROOM_CAPACITY}]"
+                        render_group_like_room(f"Queue Group {g.get('group_n', '?')}", pdata_ids, avg, status, None)
 
                 content = self._build_content(lines, now_ts)
 
@@ -564,11 +821,15 @@ class Rooms(commands.Cog):
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                     self.posted_messages[cat_id] = msg
-                    self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": msg.id}
+                    self._state[str(cat_id)] = {
+                        **(self._state.get(str(cat_id)) or {}),
+                        "channel_id": channel.id,
+                        "message_id": msg.id,
+                    }
                     _save_state(self._state)
                     continue
 
-                # Edit seguro: LIMPIA embeds (esto arregla tu caso donde quedó el embed “PJSK ROOMS” mezclado)
+                # Edit seguro: LIMPIA embeds
                 if prev_msg.content != content:
                     try:
                         await prev_msg.edit(
@@ -582,7 +843,11 @@ class Rooms(commands.Cog):
                             allowed_mentions=discord.AllowedMentions.none(),
                         )
                         self.posted_messages[cat_id] = msg
-                        self._state[str(cat_id)] = {"channel_id": channel.id, "message_id": msg.id}
+                        self._state[str(cat_id)] = {
+                            **(self._state.get(str(cat_id)) or {}),
+                            "channel_id": channel.id,
+                            "message_id": msg.id,
+                        }
                         _save_state(self._state)
 
             except Exception as e:
