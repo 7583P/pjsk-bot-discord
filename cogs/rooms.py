@@ -1,5 +1,4 @@
 # cogs/rooms.py
-
 from __future__ import annotations
 
 import asyncio
@@ -193,16 +192,19 @@ class Rooms(commands.Cog):
             if me is None:
                 return None
 
+            # 1) Marcador fuerte
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
                     if msg.content and BOARD_MARKER in msg.content:
                         return msg
 
+            # 2) Fallback por label (case-insensitive)
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
-                    if msg.content and ("Last Update" in msg.content or "Last update" in msg.content):
+                    if msg.content and ("last update" in msg.content.lower()):
                         return msg
 
+            # 3) Último del bot
             async for msg in channel.history(limit=50):
                 if msg.author and msg.author.id == me.id:
                     return msg
@@ -283,20 +285,32 @@ class Rooms(commands.Cog):
         season_id: int | None,
         has_pool: bool,
     ) -> dict[int, int]:
+        """
+        Obtiene MMR de forma consistente con Matchmaking:
+        - Si hay DB + season_id: intenta seasonplayers.
+          Si NO existe fila seasonplayers para un usuario, hace fallback a mm.fetch_player(uid),
+          evitando que "faltantes" aparezcan como 0 y rompan el orden.
+        - Si no hay DB/season: usa mm.fetch_player(uid).
+        """
         if not user_ids:
             return {}
 
-        # Dedup
+        # Dedup preservando orden
         user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
 
         mmr_map: dict[int, int] = {}
-        try:
-            if has_pool and season_id:
+
+        # Path DB (batch)
+        if has_pool and season_id and getattr(mm, "db_pool", None) is not None:
+            try:
                 async with mm.db_pool.acquire() as con:
                     rows_db = await con.fetch(
                         """
                         WITH u AS (SELECT unnest($1::bigint[]) AS user_id)
-                        SELECT u.user_id, COALESCE(sp.mmr, 0) AS mmr
+                        SELECT
+                          u.user_id,
+                          sp.mmr AS mmr,
+                          (sp.user_id IS NOT NULL) AS has_row
                         FROM u
                         LEFT JOIN seasonplayers sp
                           ON sp.user_id = u.user_id AND sp.season_id = $2
@@ -304,18 +318,46 @@ class Rooms(commands.Cog):
                         user_ids,
                         season_id,
                     )
-                    mmr_map = {int(r["user_id"]): int(r["mmr"]) for r in rows_db}
-            else:
+
+                missing: list[int] = []
+                for r in rows_db:
+                    uid = int(r["user_id"])
+                    if bool(r["has_row"]):
+                        mmr_map[uid] = int(r["mmr"] or 0)
+                    else:
+                        missing.append(uid)
+
+                # Fallback a Matchmaking para los que no tienen fila en seasonplayers
+                if missing and hasattr(mm, "fetch_player"):
+                    for uid in missing:
+                        try:
+                            _mmr, _ = await mm.fetch_player(uid)
+                            mmr_map[int(uid)] = int(_mmr)
+                        except Exception:
+                            mmr_map[int(uid)] = 0
+                else:
+                    for uid in missing:
+                        mmr_map[int(uid)] = 0
+
+                # Asegurar que todos existan
                 for uid in user_ids:
+                    mmr_map.setdefault(int(uid), 0)
+
+                return mmr_map
+            except Exception:
+                # Si falla DB, caemos a fetch_player por usuario
+                pass
+
+        # Path fallback (per-user)
+        for uid in user_ids:
+            try:
+                if hasattr(mm, "fetch_player"):
                     _mmr, _ = await mm.fetch_player(uid)
                     mmr_map[int(uid)] = int(_mmr)
-        except Exception:
-            for uid in user_ids:
-                try:
-                    _mmr, _ = await mm.fetch_player(uid)
-                    mmr_map[int(uid)] = int(_mmr)
-                except Exception:
+                else:
                     mmr_map[int(uid)] = 0
+            except Exception:
+                mmr_map[int(uid)] = 0
 
         return mmr_map
 
@@ -345,16 +387,35 @@ class Rooms(commands.Cog):
 
     def _queue_groups_sorted_by_mmr(self, queue_ids: list[int], mmr_map: dict[int, int]) -> list[dict]:
         """
-        REQ 1: Ordena jugadores por MMR desc y, en base a ese orden, arma grupos (rooms) de 5.
+        Crea grupos (rooms) de 5 basados en MMR desc (global), con desempate estable
+        por orden en la queue (para que coincida con la creación en matchmaking cuando hay empates).
         """
-        # Orden global: MMR desc, tie-break por uid asc para estabilidad
-        ordered = sorted(queue_ids, key=lambda uid: (-_safe_int(mmr_map.get(uid, 0)), _safe_int(uid)))
-        groups: list[dict] = []
+        # Dedup preservando el orden de llegada en la queue
+        queue_ids = list(dict.fromkeys(int(x) for x in queue_ids if isinstance(x, int)))
 
+        # Posición en queue para tie-break (más antiguo = menor índice = más prioridad)
+        pos = {uid: i for i, uid in enumerate(queue_ids)}
+
+        ordered = sorted(
+            queue_ids,
+            key=lambda uid: (
+                -_safe_int(mmr_map.get(uid, 0)),
+                _safe_int(pos.get(uid, 10**9)),
+                _safe_int(uid),  # determinismo final
+            ),
+        )
+
+        groups: list[dict] = []
         for idx in range(0, len(ordered), ROOM_CAPACITY):
             grp_ids = ordered[idx: idx + ROOM_CAPACITY]
-            # Asegurar orden dentro del grupo (MMR desc)
-            grp_ids = sorted(grp_ids, key=lambda uid: (-_safe_int(mmr_map.get(uid, 0)), _safe_int(uid)))
+            grp_ids = sorted(
+                grp_ids,
+                key=lambda uid: (
+                    -_safe_int(mmr_map.get(uid, 0)),
+                    _safe_int(pos.get(uid, 10**9)),
+                    _safe_int(uid),
+                ),
+            )
 
             grp_mmrs = [_safe_int(mmr_map.get(uid, 0)) for uid in grp_ids]
             avg = (sum(grp_mmrs) // len(grp_mmrs)) if grp_mmrs else 0
@@ -375,7 +436,11 @@ class Rooms(commands.Cog):
 
     def _normalize_group_player_set(self, g: dict) -> frozenset[int]:
         try:
-            return frozenset(int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit())
+            return frozenset(
+                int(x)
+                for x in (g.get("player_ids") or [])
+                if isinstance(x, int) or (isinstance(x, str) and x.isdigit())
+            )
         except Exception:
             return frozenset()
 
@@ -409,6 +474,9 @@ class Rooms(commands.Cog):
         grouped: dict[int, list[tuple]] = {}
         for rid, info in (all_rooms.items() if isinstance(all_rooms, dict) else []):
             try:
+                if not isinstance(info, dict):
+                    continue
+
                 cat = info.get("category_id")
                 if cat not in CATEGORY_TO_ROOM_CHANNEL:
                     continue
@@ -423,12 +491,12 @@ class Rooms(commands.Cog):
                     elif isinstance(p, dict) and isinstance(p.get("id"), int):
                         player_ids.append(int(p["id"]))
 
+                # Dedup estable
                 player_ids = list(dict.fromkeys(player_ids))
 
                 mmr_map = await self._fetch_mmrs_batch(mm, player_ids, season_id, has_pool) if player_ids else {}
                 pdata_ids = [(uid, mmr_map.get(uid, 0)) for uid in player_ids]
-                # Orden dentro de la room: MMR desc
-                pdata_ids.sort(key=lambda t: t[1], reverse=True)
+                pdata_ids.sort(key=lambda t: t[1], reverse=True)  # MMR desc
 
                 mmr_vals = [mmr for _, mmr in pdata_ids]
                 avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
@@ -450,7 +518,18 @@ class Rooms(commands.Cog):
 
                 thread_id = info.get("thread")  # puede ser None
                 grouped.setdefault(cat, []).append(
-                    (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+                    (
+                        int(rid),
+                        pdata_ids,
+                        int(avg),
+                        bool(started_flag),
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                    )
                 )
             except Exception:
                 continue
@@ -472,7 +551,10 @@ class Rooms(commands.Cog):
                     }
                     for rid, info in (all_rooms.items() if isinstance(all_rooms, dict) else [])
                 },
-                "queues": {str(k): list(v) if isinstance(v, list) else [] for k, v in (queues.items() if isinstance(queues, dict) else [])},
+                "queues": {
+                    str(k): list(v) if isinstance(v, list) else []
+                    for k, v in (queues.items() if isinstance(queues, dict) else [])
+                },
                 "cat_to_join": {str(k): v for k, v in cat_to_join.items()},
             }
             with open(DEBUG_SNAPSHOT_PATH, "w", encoding="utf-8") as f:
@@ -526,21 +608,27 @@ class Rooms(commands.Cog):
                     active_queue_groups = cleaned_active
                     state_dirty = True
 
-                # REQ 2: Cuando el "next slot" cambie, lo que estaba en FUTURE se pasa a ACTIVE y NO se elimina.
-                # Detecta rollover de slot:
-                if isinstance(last_next_slot_ts, int) and last_next_slot_ts > 0 and last_next_slot_ts != next_slot_ts:
-                    # Promueve pending_future_groups -> active_queue_groups
+                # Cuando el "next slot" cambie, lo que estaba en FUTURE se pasa a ACTIVE y NO se elimina.
+                if (
+                    isinstance(last_next_slot_ts, int)
+                    and last_next_slot_ts > 0
+                    and last_next_slot_ts != next_slot_ts
+                ):
                     promoted: list[dict] = []
                     for g in (pending_future_groups or []):
                         try:
                             g2 = dict(g)
                             g2["activated_ts"] = now_ts
                             g2["slot_ts"] = int(last_next_slot_ts)
-                            # No duplicar si ya existe el mismo set
+
+                            # No duplicar si ya existe el mismo set en el mismo slot
                             gset = self._normalize_group_player_set(g2)
                             dup = False
                             for ex in active_queue_groups:
-                                if self._normalize_group_player_set(ex) == gset and _safe_int(ex.get("slot_ts")) == _safe_int(g2.get("slot_ts")):
+                                if (
+                                    self._normalize_group_player_set(ex) == gset
+                                    and _safe_int(ex.get("slot_ts")) == _safe_int(g2.get("slot_ts"))
+                                ):
                                     dup = True
                                     break
                             if not dup and gset:
@@ -552,7 +640,6 @@ class Rooms(commands.Cog):
                         active_queue_groups = list(active_queue_groups) + promoted
                         state_dirty = True
 
-                    # Limpia pending (ya se movió)
                     pending_future_groups = []
                     state_dirty = True
 
@@ -582,24 +669,20 @@ class Rooms(commands.Cog):
                     phase = t[7]
                     return 0 if (started_flag or phase == PHASE_STARTED) else 1
 
+                # Active: started primero, luego avg desc
                 active_rooms.sort(key=lambda t: (active_prio(t), -int(t[2]), int(t[0])))
 
-                def future_sort_key(t: tuple):
-                    slot_ts = t[8] if isinstance(t[8], int) else 0
-                    slot_ts = slot_ts if slot_ts > 0 else 10**12
-                    return (slot_ts, -int(t[2]), int(t[0]))
-
-                future_rooms.sort(key=future_sort_key)
+                # Future (para dedup/link): dejamos orden auxiliar; el render lo hará con sort por avg desc
+                # (Si quieres slot como criterio fuerte, cambia el render más abajo)
+                # future_rooms.sort(...)  # no necesario aquí
 
                 # Map de rooms por set de jugadores (para linkear snapshots y evitar duplicados)
                 room_set_to_rid: dict[frozenset[int], int] = {}
-                room_id_to_phase: dict[int, str | None] = {}
                 for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in rooms_list:
                     try:
                         pset = frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
                         if pset:
                             room_set_to_rid[pset] = int(rid)
-                        room_id_to_phase[int(rid)] = phase
                     except Exception:
                         continue
 
@@ -620,8 +703,7 @@ class Rooms(commands.Cog):
                     mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
                     pending_groups_now = self._queue_groups_sorted_by_mmr(queue_ids, mmr_map_q)
 
-                # Guardar pending_future_groups para el next_slot actual (se promueve en el próximo rollover)
-                # (Esto es lo que se ve en FUTURE ROOMS)
+                # Guardar pending_future_groups para el next_slot actual
                 cat_state["pending_future_groups"] = pending_groups_now
                 pending_future_groups = pending_groups_now
                 state_dirty = True
@@ -631,23 +713,29 @@ class Rooms(commands.Cog):
                 state_dirty = True
 
                 # Intento de link: si un snapshot coincide con una room real, lo linkeamos.
-                # Además: si ya está linkeado pero ya no existe la room, se limpia (room finished).
-                alive_room_ids = set(int(rid) for rid in (all_rooms.keys() if isinstance(all_rooms, dict) else []) if str(rid).isdigit() or isinstance(rid, int))
+                alive_room_ids: set[int] = set()
+                if isinstance(all_rooms, dict):
+                    for k in all_rooms.keys():
+                        try:
+                            alive_room_ids.add(int(k))
+                        except Exception:
+                            continue
 
                 new_active_groups: list[dict] = []
                 for g in active_queue_groups:
                     try:
                         pset = self._normalize_group_player_set(g)
                         linked = g.get("linked_room_id")
+
                         if isinstance(linked, int) and linked > 0:
                             if linked not in alive_room_ids:
-                                # room ya no existe -> limpiar snapshot (ya terminó)
+                                # room ya no existe -> limpiar snapshot
                                 continue
                             new_active_groups.append(g)
                             continue
 
                         # no linkeado: intentar link
-                        if pset in room_set_to_rid:
+                        if pset and pset in room_set_to_rid:
                             g2 = dict(g)
                             g2["linked_room_id"] = int(room_set_to_rid[pset])
                             new_active_groups.append(g2)
@@ -662,7 +750,7 @@ class Rooms(commands.Cog):
                     cat_state["active_queue_groups"] = active_queue_groups
                     state_dirty = True
 
-                # Lookup: snapshot por room_id (para REQ 2: no perder lista si el Matchmaking vacía players al pasar a ACTIVE)
+                # snapshot por room_id (para no perder players si Matchmaking vacía players al pasar a ACTIVE)
                 snapshot_by_room_id: dict[int, dict] = {}
                 for g in active_queue_groups:
                     rid = g.get("linked_room_id")
@@ -672,7 +760,6 @@ class Rooms(commands.Cog):
                 if state_dirty:
                     self._state[cat_key] = {
                         **cat_state,
-                        # Mantener si ya existían
                         "channel_id": (cat_state.get("channel_id") if isinstance(cat_state.get("channel_id"), int) else None),
                         "message_id": (cat_state.get("message_id") if isinstance(cat_state.get("message_id"), int) else None),
                     }
@@ -699,14 +786,15 @@ class Rooms(commands.Cog):
                         lines.append(f"**{title} · {ref} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
                     else:
                         lines.append(f"**{title} · {count}/{ROOM_CAPACITY} Players · Average MMR {avg} · {status}**")
-                    # REQ 1: lista interna siempre MMR desc
+
+                    # Lista interna siempre MMR desc
                     pdata_ids_sorted = sorted(pdata_ids, key=lambda t: t[1], reverse=True)
                     for uid, mmr in pdata_ids_sorted:
                         lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
                     lines.append("")
 
                 # -----------------------------
-                # ACTIVE ROOMS (reales)
+                # ACTIVE ROOMS (reales + snapshots activos)
                 # -----------------------------
                 if not active_rooms and not active_queue_groups:
                     lines.append("_No active rooms._")
@@ -717,7 +805,7 @@ class Rooms(commands.Cog):
                         # Si la room real no trae players (o viene vacía), usamos snapshot si existe
                         if (not pdata_ids) and int(rid) in snapshot_by_room_id:
                             sg = snapshot_by_room_id[int(rid)]
-                            pids = [int(x) for x in (sg.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
+                            pids = [int(x) for x in (sg.get("player_ids") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
                             mmrs = sg.get("mmrs") or {}
                             pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
                             avg = _safe_int(sg.get("avg"), 0)
@@ -730,31 +818,25 @@ class Rooms(commands.Cog):
                                 status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
                             else:
                                 status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+
                         render_group_like_room(f"Room {rid}", pdata_ids, int(avg), status, thread_id)
 
                     # Snapshots activos (venían de FUTURE y ya pasaron a ACTIVE)
-                    # Evitar duplicado si ya existe una room real con el mismo set de jugadores visible
                     active_room_player_sets = set(
                         frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
                         for (_, pdata_ids, _, _, _, _, _, _, _, _) in active_rooms
                     )
 
-                    # Orden: grupos con mayor avg primero
                     def _snap_sort(g: dict):
+                        # avg desc, slot asc (solo informativo), group asc
                         return (-_safe_int(g.get("avg"), 0), _safe_int(g.get("slot_ts") or 0), _safe_int(g.get("group_n"), 0))
 
                     for g in sorted(active_queue_groups, key=_snap_sort):
                         pset = self._normalize_group_player_set(g)
                         if pset and pset in active_room_player_sets:
-                            continue  # ya se muestra en room real
-                        # si está linkeado a room real viva, normalmente se omitirá arriba; pero si la room real está vacía, esta sí sirve.
-                        linked = g.get("linked_room_id")
-                        if isinstance(linked, int) and linked > 0:
-                            # si la room real existe y está en active_rooms, ya está cubierta (arriba)
-                            # si no está, igual mostramos como snapshot activo
-                            pass
+                            continue
 
-                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
+                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
                         mmrs = g.get("mmrs") or {}
                         pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
                         avg = _safe_int(g.get("avg"), 0)
@@ -768,47 +850,71 @@ class Rooms(commands.Cog):
                 lines.append("────────────────────────")
 
                 # -----------------------------
-                # FUTURE ROOMS (next slot ...)
-                #   - aquí se muestran los grupos derivados de queue (ordenados por MMR desc)
-                #   - al pasar el slot, se promueven a ACTIVE y NO se eliminan
+                # FUTURE ROOMS (ordenado por Average MMR desc)
+                #   - incluye FUTURE rooms reales + queue groups
+                #   - se ordena estrictamente por avg desc para alinear con la lógica de creación por MMR
                 # -----------------------------
                 lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
 
-                # 1) FUTURE rooms reales (si existen en mm.rooms con phase FUTURE)
-                if future_rooms:
-                    lines.append("")
-                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
-                        count = len(pdata_ids)
-                        if slot_start_ts:
-                            status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
-                        else:
-                            status = f"[WAITING {count}/{ROOM_CAPACITY}]"
-                        render_group_like_room(f"Room {rid}", pdata_ids, int(avg), status, thread_id)
+                # Dedup sets: si hay FUTURE room real con el mismo set, omitimos el queue group duplicado
+                future_room_sets = set(
+                    frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
+                    for (_, pdata_ids, _, _, _, _, _, _, _, _) in future_rooms
+                )
 
-                # 2) Grupos de queue (pending) para el próximo slot (esto es lo que pediste ordenar por MMR y usar para crear rooms)
-                if not pending_future_groups:
-                    lines.append("_Queue empty._")
-                else:
-                    # Evitar duplicado si ya hay FUTURE rooms reales con el mismo set
-                    future_room_sets = set(
-                        frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
-                        for (_, pdata_ids, _, _, _, _, _, _, _, _) in future_rooms
+                future_items: list[dict] = []
+
+                # 1) FUTURE rooms reales
+                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
+                    count = len(pdata_ids)
+                    if slot_start_ts:
+                        status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
+                    else:
+                        status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+
+                    future_items.append(
+                        {
+                            "type_prio": 0,  # rooms reales primero si empate
+                            "avg": int(avg),
+                            "title": f"Room {rid}",
+                            "pdata_ids": pdata_ids,
+                            "status": status,
+                            "thread_id": thread_id,
+                        }
                     )
 
-                    lines.append("")
-                    # Orden: group_n asc (ya viene armado por MMR global desc)
-                    for g in sorted(pending_future_groups, key=lambda x: _safe_int(x.get("group_n"), 0)):
-                        pset = self._normalize_group_player_set(g)
-                        if pset and pset in future_room_sets:
-                            continue
+                # 2) Queue groups (pending)
+                for g in (pending_future_groups or []):
+                    pset = self._normalize_group_player_set(g)
+                    if pset and pset in future_room_sets:
+                        continue
 
-                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
-                        mmrs = g.get("mmrs") or {}
-                        pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
-                        avg = _safe_int(g.get("avg"), 0)
-                        count = len(pdata_ids)
-                        status = "[READY 5/5]" if count == ROOM_CAPACITY else f"[WAITING {count}/{ROOM_CAPACITY}]"
-                        render_group_like_room(f"Queue Group {g.get('group_n', '?')}", pdata_ids, avg, status, None)
+                    pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+                    mmrs = g.get("mmrs") or {}
+                    pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
+                    avg = _safe_int(g.get("avg"), 0)
+                    count = len(pdata_ids)
+                    status = "[READY 5/5]" if count == ROOM_CAPACITY else f"[WAITING {count}/{ROOM_CAPACITY}]"
+
+                    future_items.append(
+                        {
+                            "type_prio": 1,
+                            "avg": int(avg),
+                            "title": f"Queue Group {g.get('group_n', '?')}",
+                            "pdata_ids": pdata_ids,
+                            "status": status,
+                            "thread_id": None,
+                        }
+                    )
+
+                if not future_items:
+                    lines.append("_Queue empty._")
+                else:
+                    lines.append("")
+                    # Orden estricto: avg desc, luego rooms reales antes que queue, luego título para estabilidad
+                    future_items.sort(key=lambda x: (-_safe_int(x["avg"]), _safe_int(x["type_prio"]), str(x["title"])))
+                    for it in future_items:
+                        render_group_like_room(it["title"], it["pdata_ids"], int(it["avg"]), it["status"], it["thread_id"])
 
                 content = self._build_content(lines, now_ts)
 
