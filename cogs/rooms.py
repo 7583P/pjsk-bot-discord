@@ -87,6 +87,41 @@ def _safe_int(x, default: int = 0) -> int:
         return default
 
 
+def _coerce_int_or_none(x) -> int | None:
+    try:
+        if x is None:
+            return None
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, int):
+            return x if x > 0 else None
+        if isinstance(x, float):
+            v = int(x)
+            return v if v > 0 else None
+        if isinstance(x, str):
+            s = x.strip()
+            if s.isdigit():
+                v = int(s)
+                return v if v > 0 else None
+            # intentar extraer dígitos (p.ej. "r1")
+            digits = "".join(ch for ch in s if ch.isdigit())
+            if digits:
+                v = int(digits)
+                return v if v > 0 else None
+        return None
+    except Exception:
+        return None
+
+
+def _room_sort_id(rid) -> int:
+    """
+    Soporta rid tipo int, "1", "r1", etc.
+    Devuelve un entero para sorting estable.
+    """
+    v = _coerce_int_or_none(rid)
+    return v if v is not None else 0
+
+
 def _extract_uid(item) -> int | None:
     """
     Extrae user_id desde distintas formas:
@@ -238,6 +273,43 @@ class Rooms(commands.Cog):
                 cache[channel_id] = None
             return None
 
+    async def _infer_category_id_from_thread(
+        self,
+        thread_id: int | None,
+        cache: dict[int, discord.abc.GuildChannel | None] | None = None,
+    ) -> int | None:
+        """
+        Si Matchmaking no guarda category_id o lo guarda raro, inferimos:
+          Thread -> parent channel -> parent.category.id
+        """
+        if not isinstance(thread_id, int) or thread_id <= 0:
+            return None
+
+        # cache de canales (incluye threads) por id
+        if cache is not None and thread_id in cache:
+            ch = cache[thread_id]
+        else:
+            ch = self.bot.get_channel(thread_id)
+            if ch is None:
+                try:
+                    ch = await self.bot.fetch_channel(thread_id)
+                except Exception:
+                    ch = None
+            if cache is not None:
+                cache[thread_id] = ch
+
+        # discord.Thread tiene .parent
+        if isinstance(ch, discord.Thread):
+            parent = ch.parent
+            if parent and parent.category:
+                return parent.category.id
+
+        # Algunos bots guardan "thread" como el parent channel directamente
+        if isinstance(ch, discord.TextChannel) and ch.category:
+            return ch.category.id
+
+        return None
+
     async def _find_last_board_message(self, channel: discord.TextChannel) -> discord.Message | None:
         """
         Reutiliza el último mensaje tablero del bot en el canal (para no duplicar mensajes tras reinicios).
@@ -329,6 +401,11 @@ class Rooms(commands.Cog):
                 return ts if ts > 0 else None
             except Exception:
                 return None
+        if isinstance(raw, str):
+            s = raw.strip()
+            if s.isdigit():
+                ts = int(s)
+                return ts if ts > 0 else None
         return None
 
     async def _fetch_mmrs_batch(
@@ -421,6 +498,30 @@ class Rooms(commands.Cog):
             )
         return groups
 
+    def _is_songs_posted(self, info: dict) -> bool:
+        """
+        Tu definición de STARTED:
+        Sala iniciada = songs desplegadas.
+        Soporta distintas claves y señales.
+        """
+        try:
+            if bool(info.get("songs_posted", False)):
+                return True
+            if bool(info.get("songsPosted", False)):
+                return True
+            # si hay lista/estructura de songs no vacía
+            for k in ("songs", "song_ids", "songIds", "current_songs", "currentSongs"):
+                v = info.get(k)
+                if isinstance(v, (list, tuple, set, dict)) and len(v) > 0:
+                    return True
+            # si existe id del mensaje de songs
+            for k in ("songs_message_id", "songsMessageId"):
+                if _coerce_int_or_none(info.get(k)) is not None:
+                    return True
+        except Exception:
+            return False
+        return False
+
     async def _do_update_core(self):
         mm = self.bot.get_cog("Matchmaking")
         if mm is None:
@@ -451,8 +552,19 @@ class Rooms(commands.Cog):
                 if not isinstance(info, dict):
                     continue
 
-                cat = info.get("category_id")
-                if cat not in CATEGORY_TO_ROOM_CHANNEL:
+                # thread id (puede ayudar a inferir category)
+                thread_id = _coerce_int_or_none(info.get("thread") or info.get("thread_id") or info.get("threadId"))
+
+                # category id (robusto)
+                cat_raw = info.get("category_id", None)
+                if cat_raw is None:
+                    cat_raw = info.get("category") or info.get("cat_id") or info.get("catId")
+                cat_id = _coerce_int_or_none(cat_raw)
+
+                if cat_id is None:
+                    cat_id = await self._infer_category_id_from_thread(thread_id, cache=ch_cache)
+
+                if cat_id not in CATEGORY_TO_ROOM_CHANNEL:
                     continue
 
                 raw_players = info.get("players", []) or []
@@ -474,22 +586,62 @@ class Rooms(commands.Cog):
                 phase = info.get("phase")
                 phase = phase.upper() if isinstance(phase, str) else None
 
-                slot_start_ts = self._coerce_ts(info.get("slot_start_ts"))
-                songs_posted = bool(info.get("songs_posted", False))
+                slot_start_ts = self._coerce_ts(info.get("slot_start_ts") or info.get("slot_ts") or info.get("slotStartTs"))
+
+                songs_posted = self._is_songs_posted(info)
+                songs_posted_ts = self._coerce_ts(
+                    info.get("songs_posted_ts")
+                    or info.get("songs_ts")
+                    or info.get("songs_posted_at")
+                    or info.get("songsPostedTs")
+                )
 
                 state = info.get("state")
-                started_flag = (
-                    phase == PHASE_STARTED
-                    or bool(info.get("started"))
-                    or (isinstance(state, str) and state.upper() == PHASE_STARTED)
+                state_up = state.upper() if isinstance(state, str) else None
+
+                started_ts = self._coerce_ts(
+                    info.get("started_ts")
+                    or info.get("start_ts")
+                    or info.get("started_at")
+                    or info.get("startedAt")
                 )
-                started_ts = self._coerce_ts(info.get("started_ts") or info.get("start_ts") or info.get("started_at"))
+                # si tu inicio real es "songs posted", usa ese ts si no hay otro
+                if started_ts is None and songs_posted_ts is not None:
+                    started_ts = songs_posted_ts
+
                 reached5_ts = self._coerce_ts(info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts"))
 
-                thread_id = info.get("thread")
+                # STARTED robusto: (tu definición) songs_posted manda
+                started_flag = (
+                    songs_posted
+                    or phase == PHASE_STARTED
+                    or bool(info.get("started"))
+                    or (state_up == PHASE_STARTED)
+                    or (started_ts is not None)
+                )
 
-                grouped.setdefault(cat, []).append(
-                    (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
+                # FINISHED robusto (si existe)
+                finished_flag = (
+                    phase == PHASE_FINISHED
+                    or bool(info.get("finished"))
+                    or (state_up == PHASE_FINISHED)
+                    or bool(info.get("ended"))
+                )
+
+                grouped.setdefault(cat_id, []).append(
+                    (
+                        rid,
+                        pdata_ids,
+                        int(avg),
+                        bool(started_flag),
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        bool(songs_posted),
+                        bool(finished_flag),
+                    )
                 )
             except Exception:
                 continue
@@ -500,9 +652,12 @@ class Rooms(commands.Cog):
             snap = {
                 "rooms": {
                     str(rid): {
-                        "category_id": (info.get("category_id") if isinstance(info, dict) else None),
+                        "raw_category_id": (info.get("category_id") if isinstance(info, dict) else None),
                         "thread": (info.get("thread") if isinstance(info, dict) else None),
                         "phase": (info.get("phase") if isinstance(info, dict) else None),
+                        "state": (info.get("state") if isinstance(info, dict) else None),
+                        "started": (info.get("started") if isinstance(info, dict) else None),
+                        "songs_posted": (info.get("songs_posted") if isinstance(info, dict) else None),
                         "players": [
                             _extract_uid(p)
                             for p in ((info.get("players") or []) if isinstance(info, dict) else [])
@@ -542,36 +697,72 @@ class Rooms(commands.Cog):
 
                 rooms_list = grouped.get(cat_id, []) or []
 
-                # ACTIVE = rooms reales que NO son FUTURE y NO están FINISHED
+                # ACTIVE = rooms reales que NO son FUTURE(no-started) y NO están FINISHED
                 active_rooms: list[tuple] = []
                 future_rooms_real: list[tuple] = []
 
                 for t in rooms_list:
-                    phase = t[7]
-                    started_flag = bool(t[3])
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                        finished_flag,
+                    ) = t
 
-                    if phase == PHASE_FINISHED:
+                    if finished_flag:
                         continue
 
-                    if phase == PHASE_FUTURE and not started_flag:
+                    # FUTURE real: solo si explícitamente FUTURE y todavía NO started (según tu definición)
+                    if phase == PHASE_FUTURE and not started_flag and not songs_posted:
                         future_rooms_real.append(t)
                     else:
                         active_rooms.append(t)
 
-                # Orden ACTIVE: STARTED primero, luego por avg desc, rid asc
+                # Orden ACTIVE: STARTED primero, luego READY(5/5) si no started, luego por avg desc, rid
                 def _active_sort_key(t: tuple):
-                    rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted = t
-                    started_prio = 0 if (started_flag or phase == PHASE_STARTED) else 1
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                        finished_flag,
+                    ) = t
+                    started_prio = 0 if (started_flag or songs_posted or phase == PHASE_STARTED) else 1
                     ready_prio = 0 if (len(pdata_ids) == ROOM_CAPACITY and started_prio == 1) else 1
-                    return (started_prio, ready_prio, -int(avg), _safe_int(rid, 0))
+                    return (started_prio, ready_prio, -int(avg), _room_sort_id(rid))
 
                 active_rooms.sort(key=_active_sort_key)
 
                 # FUTURE reales: slot asc, avg desc
                 def _future_real_sort_key(t: tuple):
-                    rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted = t
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                        finished_flag,
+                    ) = t
                     slot_ts = slot_start_ts if isinstance(slot_start_ts, int) and slot_start_ts > 0 else 10**12
-                    return (slot_ts, -int(avg), _safe_int(rid, 0))
+                    return (slot_ts, -int(avg), _room_sort_id(rid))
 
                 future_rooms_real.sort(key=_future_real_sort_key)
 
@@ -630,10 +821,26 @@ class Rooms(commands.Cog):
                     lines.append("_No active rooms._")
                     lines.append("")
                 else:
-                    for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in active_rooms:
+                    for t in active_rooms:
+                        (
+                            rid,
+                            pdata_ids,
+                            avg,
+                            started_flag,
+                            started_ts,
+                            reached5_ts,
+                            thread_id,
+                            phase,
+                            slot_start_ts,
+                            songs_posted,
+                            finished_flag,
+                        ) = t
                         count = len(pdata_ids)
-                        if started_flag or phase == PHASE_STARTED:
-                            status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
+
+                        # STARTED (tu definición): songs_posted => STARTED aunque phase diga FUTURE/PREPARED
+                        if songs_posted or started_flag or phase == PHASE_STARTED:
+                            ts = started_ts or slot_start_ts
+                            status = f"[STARTED] <t:{ts}:t>" if ts else "[STARTED]"
                         else:
                             if count == ROOM_CAPACITY:
                                 status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
@@ -675,7 +882,21 @@ class Rooms(commands.Cog):
                     )
 
                 # 2) future rooms reales (si tu matchmaking crea rooms con phase=FUTURE)
-                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms_real:
+                for t in future_rooms_real:
+                    (
+                        rid,
+                        pdata_ids,
+                        avg,
+                        started_flag,
+                        started_ts,
+                        reached5_ts,
+                        thread_id,
+                        phase,
+                        slot_start_ts,
+                        songs_posted,
+                        finished_flag,
+                    ) = t
+
                     count = len(pdata_ids)
                     if slot_start_ts:
                         status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
@@ -689,7 +910,7 @@ class Rooms(commands.Cog):
                             "kind": "room",
                             "slot_ts": _safe_int(slot_ts_for_sort, next_slot_ts),
                             "avg": int(avg),
-                            "tie": _safe_int(rid, 0),
+                            "tie": _room_sort_id(rid),
                             "title": f"Room {rid}",
                             "pdata_ids": pdata_ids,
                             "status": status,
