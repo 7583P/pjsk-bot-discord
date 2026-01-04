@@ -31,7 +31,7 @@ SHOW_EMPTY_SLOTS = False
 HUMAN_LAST_UPDATE_LABEL = "Last update"
 BOARD_MARKER = "[PJSK_ROOMS_BOARD]"  # marcador único para localizar el mensaje correcto
 
-# Fases (para renderizar FUTURE correctamente)
+# Fases (para FUTURE/STARTED si vienen del matchmaking)
 PHASE_FUTURE = "FUTURE"
 PHASE_PREPARED = "PREPARED"
 PHASE_STARTED = "STARTED"
@@ -45,9 +45,6 @@ STATE_PATH = "assets/rooms_board_state.json"
 
 # Cache debug serializable
 DEBUG_SNAPSHOT_PATH = "assets/cached_rooms.json"
-
-# TTL de snapshots (fallback) para no acumular basura si nunca se linkean a rooms reales
-ACTIVE_SNAPSHOT_TTL_SECONDS = 2 * 60 * 60  # 2 horas
 
 
 # -----------------------------
@@ -118,7 +115,6 @@ def _extract_uid(item) -> int | None:
                 if isinstance(v, str) and v.strip().isdigit():
                     return int(v.strip())
 
-        # objetos cualquiera con .id / .user_id / .discord_id
         for attr in ("id", "user_id", "discord_id"):
             if hasattr(item, attr):
                 v = getattr(item, attr, None)
@@ -140,7 +136,6 @@ def _debug_serialize_queue(q) -> list:
             if uid is not None:
                 out.append(uid)
             else:
-                # deja pista para debug (tipo)
                 out.append(f"<unparsed:{type(it).__name__}>")
     except Exception:
         pass
@@ -164,7 +159,7 @@ class Rooms(commands.Cog):
         # Coalesce: si llegan muchos eventos, hacemos como máximo 1 update extra al final
         self._update_pending: bool = False
 
-        # Estado persistente: {str(cat_id): {"channel_id": int, "message_id": int, ...}}
+        # Estado persistente: {str(cat_id): {"channel_id": int, "message_id": int}}
         self._state = _load_state()
 
         # Listeners para refrescar al vuelo
@@ -254,13 +249,13 @@ class Rooms(commands.Cog):
                 return None
 
             async for msg in channel.history(limit=50):
-                if msg.author and msg.author.id == me.id:
-                    if msg.content and BOARD_MARKER in msg.content:
+                if msg.author and msg.author.id == me.id and msg.content:
+                    if BOARD_MARKER in msg.content:
                         return msg
 
             async for msg in channel.history(limit=50):
-                if msg.author and msg.author.id == me.id:
-                    if msg.content and ("Last Update" in msg.content or "Last update" in msg.content):
+                if msg.author and msg.author.id == me.id and msg.content:
+                    if ("Last Update" in msg.content) or ("Last update" in msg.content):
                         return msg
 
             async for msg in channel.history(limit=50):
@@ -346,7 +341,6 @@ class Rooms(commands.Cog):
         if not user_ids:
             return {}
 
-        # Dedup
         user_ids = list(dict.fromkeys(int(x) for x in user_ids if isinstance(x, int)))
 
         mmr_map: dict[int, int] = {}
@@ -423,19 +417,9 @@ class Rooms(commands.Cog):
                     "player_ids": [int(x) for x in grp_ids],
                     "mmrs": {str(int(uid)): int(_safe_int(mmr_map.get(uid, 0))) for uid in grp_ids},
                     "avg": int(avg),
-                    "created_ts": int(time.time()),
-                    "activated_ts": None,
-                    "slot_ts": None,
-                    "linked_room_id": None,
                 }
             )
         return groups
-
-    def _normalize_group_player_set(self, g: dict) -> frozenset[int]:
-        try:
-            return frozenset(int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit())
-        except Exception:
-            return frozenset()
 
     async def _do_update_core(self):
         mm = self.bot.get_cog("Matchmaking")
@@ -503,6 +487,7 @@ class Rooms(commands.Cog):
                 reached5_ts = self._coerce_ts(info.get("reached5_ts") or info.get("ready_ts") or info.get("full_ts"))
 
                 thread_id = info.get("thread")
+
                 grouped.setdefault(cat, []).append(
                     (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted)
                 )
@@ -555,104 +540,40 @@ class Rooms(commands.Cog):
                 join_ch = await self._get_text_channel(join_id, cache=ch_cache) if isinstance(join_id, int) else None
                 join_label = f"#{join_ch.name}" if isinstance(join_ch, discord.TextChannel) else "join"
 
-                # -----------------------------
-                # Estado por categoría (persistente)
-                # -----------------------------
-                cat_key = str(cat_id)
-                cat_state = self._state.get(cat_key) or {}
-                state_dirty = False
-
-                last_next_slot_ts = cat_state.get("last_next_slot_ts")
-                pending_future_groups = cat_state.get("pending_future_groups") or []
-                active_queue_groups = cat_state.get("active_queue_groups") or []
-
-                # Cleanup TTL básico (fallback)
-                cleaned_active = []
-                for g in active_queue_groups:
-                    try:
-                        activated = _safe_int(g.get("activated_ts") or 0)
-                        if activated and (now_ts - activated) > ACTIVE_SNAPSHOT_TTL_SECONDS:
-                            if not g.get("linked_room_id"):
-                                continue
-                        cleaned_active.append(g)
-                    except Exception:
-                        cleaned_active.append(g)
-                if cleaned_active != active_queue_groups:
-                    active_queue_groups = cleaned_active
-                    state_dirty = True
-
-                # REQ: Cuando el "next slot" cambie, lo que estaba en FUTURE se pasa a ACTIVE y NO se elimina.
-                if isinstance(last_next_slot_ts, int) and last_next_slot_ts > 0 and last_next_slot_ts != next_slot_ts:
-                    promoted: list[dict] = []
-                    for g in (pending_future_groups or []):
-                        try:
-                            g2 = dict(g)
-                            g2["activated_ts"] = now_ts
-                            g2["slot_ts"] = int(last_next_slot_ts)
-
-                            gset = self._normalize_group_player_set(g2)
-                            dup = False
-                            for ex in active_queue_groups:
-                                if self._normalize_group_player_set(ex) == gset and _safe_int(ex.get("slot_ts")) == _safe_int(g2.get("slot_ts")):
-                                    dup = True
-                                    break
-                            if not dup and gset:
-                                promoted.append(g2)
-                        except Exception:
-                            continue
-
-                    if promoted:
-                        active_queue_groups = list(active_queue_groups) + promoted
-                        state_dirty = True
-
-                    pending_future_groups = []
-                    state_dirty = True
-
-                # Actualiza last_next_slot_ts
-                if _safe_int(last_next_slot_ts) != _safe_int(next_slot_ts):
-                    cat_state["last_next_slot_ts"] = int(next_slot_ts)
-                    state_dirty = True
-
-                # -----------------------------
-                # Rooms reales del Matchmaking
-                # -----------------------------
                 rooms_list = grouped.get(cat_id, []) or []
 
+                # ACTIVE = rooms reales que NO son FUTURE y NO están FINISHED
                 active_rooms: list[tuple] = []
-                future_rooms: list[tuple] = []
+                future_rooms_real: list[tuple] = []
 
                 for t in rooms_list:
                     phase = t[7]
                     started_flag = bool(t[3])
+
+                    if phase == PHASE_FINISHED:
+                        continue
+
                     if phase == PHASE_FUTURE and not started_flag:
-                        future_rooms.append(t)
+                        future_rooms_real.append(t)
                     else:
                         active_rooms.append(t)
 
-                def active_prio(t: tuple) -> int:
-                    started_flag = bool(t[3])
-                    phase = t[7]
-                    return 0 if (started_flag or phase == PHASE_STARTED) else 1
+                # Orden ACTIVE: STARTED primero, luego por avg desc, rid asc
+                def _active_sort_key(t: tuple):
+                    rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted = t
+                    started_prio = 0 if (started_flag or phase == PHASE_STARTED) else 1
+                    ready_prio = 0 if (len(pdata_ids) == ROOM_CAPACITY and started_prio == 1) else 1
+                    return (started_prio, ready_prio, -int(avg), _safe_int(rid, 0))
 
-                active_rooms.sort(key=lambda t: (active_prio(t), -int(t[2]), int(t[0])))
+                active_rooms.sort(key=_active_sort_key)
 
                 # FUTURE reales: slot asc, avg desc
-                def future_sort_key(t: tuple):
-                    slot_ts = t[8] if isinstance(t[8], int) else 0
-                    slot_ts = slot_ts if slot_ts > 0 else 10**12
-                    return (slot_ts, -int(t[2]), int(t[0]))
+                def _future_real_sort_key(t: tuple):
+                    rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted = t
+                    slot_ts = slot_start_ts if isinstance(slot_start_ts, int) and slot_start_ts > 0 else 10**12
+                    return (slot_ts, -int(avg), _safe_int(rid, 0))
 
-                future_rooms.sort(key=future_sort_key)
-
-                # Map de rooms por set de jugadores (para linkear snapshots y evitar duplicados)
-                room_set_to_rid: dict[frozenset[int], int] = {}
-                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in rooms_list:
-                    try:
-                        pset = frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
-                        if pset:
-                            room_set_to_rid[pset] = int(rid)
-                    except Exception:
-                        continue
+                future_rooms_real.sort(key=_future_real_sort_key)
 
                 # -----------------------------
                 # Queue -> FUTURE groups (ordenados por MMR desc)
@@ -669,60 +590,6 @@ class Rooms(commands.Cog):
                 if queue_ids:
                     mmr_map_q = await self._fetch_mmrs_batch(mm, queue_ids, season_id, has_pool)
                     pending_groups_now = self._queue_groups_sorted_by_mmr(queue_ids, mmr_map_q)
-
-                # Guardar pending_future_groups para el next_slot actual
-                cat_state["pending_future_groups"] = pending_groups_now
-                pending_future_groups = pending_groups_now
-                state_dirty = True
-
-                cat_state["active_queue_groups"] = active_queue_groups
-                state_dirty = True
-
-                # Intento de link: snapshot <-> room real
-                alive_room_ids = set(
-                    int(rid) for rid in (all_rooms.keys() if isinstance(all_rooms, dict) else [])
-                    if isinstance(rid, int) or (isinstance(rid, str) and rid.isdigit())
-                )
-
-                new_active_groups: list[dict] = []
-                for g in active_queue_groups:
-                    try:
-                        pset = self._normalize_group_player_set(g)
-                        linked = g.get("linked_room_id")
-                        if isinstance(linked, int) and linked > 0:
-                            if linked not in alive_room_ids:
-                                continue
-                            new_active_groups.append(g)
-                            continue
-
-                        if pset in room_set_to_rid:
-                            g2 = dict(g)
-                            g2["linked_room_id"] = int(room_set_to_rid[pset])
-                            new_active_groups.append(g2)
-                            state_dirty = True
-                        else:
-                            new_active_groups.append(g)
-                    except Exception:
-                        new_active_groups.append(g)
-
-                if new_active_groups != active_queue_groups:
-                    active_queue_groups = new_active_groups
-                    cat_state["active_queue_groups"] = active_queue_groups
-                    state_dirty = True
-
-                snapshot_by_room_id: dict[int, dict] = {}
-                for g in active_queue_groups:
-                    rid = g.get("linked_room_id")
-                    if isinstance(rid, int) and rid > 0:
-                        snapshot_by_room_id[rid] = g
-
-                if state_dirty:
-                    self._state[cat_key] = {
-                        **cat_state,
-                        "channel_id": (cat_state.get("channel_id") if isinstance(cat_state.get("channel_id"), int) else None),
-                        "message_id": (cat_state.get("message_id") if isinstance(cat_state.get("message_id"), int) else None),
-                    }
-                    _save_state(self._state)
 
                 # -----------------------------
                 # Render
@@ -757,20 +624,13 @@ class Rooms(commands.Cog):
                     lines.append("")
 
                 # -----------------------------
-                # ACTIVE ROOMS (reales + snapshots)
+                # ACTIVE ROOMS (solo rooms reales)
                 # -----------------------------
-                if not active_rooms and not active_queue_groups:
+                if not active_rooms:
                     lines.append("_No active rooms._")
                     lines.append("")
                 else:
                     for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in active_rooms:
-                        if (not pdata_ids) and int(rid) in snapshot_by_room_id:
-                            sg = snapshot_by_room_id[int(rid)]
-                            pids = [int(x) for x in (sg.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
-                            mmrs = sg.get("mmrs") or {}
-                            pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
-                            avg = _safe_int(sg.get("avg"), 0)
-
                         count = len(pdata_ids)
                         if started_flag or phase == PHASE_STARTED:
                             status = f"[STARTED] <t:{started_ts}:t>" if started_ts else "[STARTED]"
@@ -779,31 +639,8 @@ class Rooms(commands.Cog):
                                 status = f"[READY 5/5] <t:{reached5_ts}:t>" if reached5_ts else "[READY 5/5]"
                             else:
                                 status = f"[WAITING {count}/{ROOM_CAPACITY}]"
+
                         render_group_like_room(f"Room {rid}", pdata_ids, int(avg), status, thread_id)
-
-                    active_room_player_sets = set(
-                        frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
-                        for (_, pdata_ids, _, _, _, _, _, _, _, _) in active_rooms
-                    )
-
-                    def _snap_sort(g: dict):
-                        return (-_safe_int(g.get("avg"), 0), _safe_int(g.get("slot_ts") or 0), _safe_int(g.get("group_n"), 0))
-
-                    for g in sorted(active_queue_groups, key=_snap_sort):
-                        pset = self._normalize_group_player_set(g)
-                        if pset and pset in active_room_player_sets:
-                            continue
-
-                        pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
-                        mmrs = g.get("mmrs") or {}
-                        pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
-                        avg = _safe_int(g.get("avg"), 0)
-                        count = len(pdata_ids)
-
-                        slot_ts = _safe_int(g.get("slot_ts") or 0)
-                        suffix = f" · <t:{slot_ts}:t>" if slot_ts > 0 else ""
-                        status = "[READY 5/5]" if count == ROOM_CAPACITY else f"[WAITING {count}/{ROOM_CAPACITY}]"
-                        render_group_like_room(f"Active Group {g.get('group_n', '?')}{suffix}", pdata_ids, avg, status, None)
 
                 lines.append("────────────────────────")
 
@@ -813,21 +650,10 @@ class Rooms(commands.Cog):
                 # -----------------------------
                 lines.append(f"**FUTURE ROOMS** (next slot <t:{next_slot_ts}:T>, <t:{next_slot_ts}:R>)")
 
-                # Evitar duplicado entre FUTURE reales y grupos de queue
-                future_room_sets = set(
-                    frozenset(int(uid) for uid, _ in (pdata_ids or []) if isinstance(uid, int))
-                    for (_, pdata_ids, _, _, _, _, _, _, _, _) in future_rooms
-                )
-
-                # Lista unificada de entradas future
                 future_entries: list[dict] = []
 
-                # 1) grupos de queue (son “lo que matchmaking usaría”)
-                for g in (pending_future_groups or []):
-                    pset = self._normalize_group_player_set(g)
-                    if pset and pset in future_room_sets:
-                        continue
-
+                # 1) grupos de queue (lo que matchmaking usaría en el next slot)
+                for g in (pending_groups_now or []):
                     pids = [int(x) for x in (g.get("player_ids") or []) if isinstance(x, int) or str(x).isdigit()]
                     mmrs = g.get("mmrs") or {}
                     pdata_ids = [(uid, _safe_int(mmrs.get(str(uid), 0))) for uid in pids]
@@ -838,7 +664,7 @@ class Rooms(commands.Cog):
                     future_entries.append(
                         {
                             "kind": "queue",
-                            "slot_ts": next_slot_ts,  # next slot
+                            "slot_ts": next_slot_ts,
                             "avg": avg,
                             "tie": _safe_int(g.get("group_n"), 0),
                             "title": f"Queue Group {g.get('group_n', '?')}",
@@ -848,8 +674,8 @@ class Rooms(commands.Cog):
                         }
                     )
 
-                # 2) future rooms reales
-                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms:
+                # 2) future rooms reales (si tu matchmaking crea rooms con phase=FUTURE)
+                for (rid, pdata_ids, avg, started_flag, started_ts, reached5_ts, thread_id, phase, slot_start_ts, songs_posted) in future_rooms_real:
                     count = len(pdata_ids)
                     if slot_start_ts:
                         status = f"[WAITING {count}/{ROOM_CAPACITY}] · songs at <t:{slot_start_ts}:t> (<t:{slot_start_ts}:R>)"
@@ -875,10 +701,16 @@ class Rooms(commands.Cog):
                     lines.append("_Queue empty._")
                 else:
                     lines.append("")
+
                     # Orden: slot asc, avg desc, queue antes que room si empate, tie asc
                     def _future_sort(e: dict):
                         kind_prio = 0 if e.get("kind") == "queue" else 1
-                        return (_safe_int(e.get("slot_ts"), 10**12), -_safe_int(e.get("avg"), 0), kind_prio, _safe_int(e.get("tie"), 0))
+                        return (
+                            _safe_int(e.get("slot_ts"), 10**12),
+                            -_safe_int(e.get("avg"), 0),
+                            kind_prio,
+                            _safe_int(e.get("tie"), 0),
+                        )
 
                     for e in sorted(future_entries, key=_future_sort):
                         render_group_like_room(
@@ -936,4 +768,3 @@ class Rooms(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Rooms(bot))
-
