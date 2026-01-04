@@ -3899,7 +3899,7 @@ class Matchmaking(commands.Cog):
             app_commands.Choice(name="Season 1", value="season 1"),
             app_commands.Choice(name="Pre Season", value="pre season"),
             app_commands.Choice(name="Beta Test Season", value="beta test season"),
-            app_commands.Choice(name="Alpha Test Season", value="alpha tests season"),
+            app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
         ]
     )
     async def cutoffs(
@@ -4310,6 +4310,34 @@ class Matchmaking(commands.Cog):
         if other >= 2001:
             return 5, "Iron"
 
+    async def _get_thread_obj(self, info: dict) -> discord.Thread | None:
+        """
+        Devuelve el objeto discord.Thread de un room_info.
+        - Primero intenta get_thread() desde el parent (cache).
+        - Si no está en cache, hace fetch_channel(thread_id).
+        """
+        try:
+            parent_id = int(info.get("join_channel_id") or 0)
+            thread_id = int(info.get("thread") or 0)
+            if parent_id <= 0 or thread_id <= 0:
+                return None
+
+            parent = self.bot.get_channel(parent_id)
+            if isinstance(parent, discord.TextChannel):
+                th = parent.get_thread(thread_id)
+                if isinstance(th, discord.Thread):
+                    return th
+
+            # fallback: fetch por ID del thread
+            try:
+                fetched = await self.bot.fetch_channel(thread_id)
+                return fetched if isinstance(fetched, discord.Thread) else None
+            except Exception:
+                return None
+        except Exception:
+            return None
+
+    
     async def _resolve_channel(
         self, channel_id: int, *, fallback: discord.abc.Messageable
     ) -> discord.abc.Messageable:
