@@ -2505,7 +2505,7 @@ class Matchmaking(commands.Cog):
         rem = len(ordered) % ROOM_CAPACITY
         return 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
-    @tasks.loop(seconds=5.0)
+    @tasks.loop(seconds=1.0)
     async def room_slot_scheduler(self):
         guild = self.bot.get_guild(GUILD_ID)
         if not guild:
@@ -2520,20 +2520,22 @@ class Matchmaking(commands.Cog):
 
             async with self._join_lock:
                 # ---------- PREP (ventana :x5..:x9) ----------
-                # ---------- PREP (ventana :x5..:x9) ----------
                 prep_start = self._in_prep_window(now)
                 if prep_start is not None:
+                    # ✅ NUEVO: intentar preparar rooms en cada tick (cada 1s)
+                    # Esto evita que quien entra en :x9:50 se quede en future queue.
+                    await self._prepare_rooms_for_join_channel(guild, join_channel)
+
+                    # ✅ Mantener anuncios 1 vez por minuto (anti-spam)
                     minute_key = (now.year, now.month, now.day, now.hour, now.minute)
                     if self._prep_last_minute.get(join_id) != minute_key:
                         self._prep_last_minute[join_id] = minute_key
 
-                        # 1) crear threads para grupos completos y postear canciones
-                        await self._prepare_rooms_for_join_channel(guild, join_channel)
-
-                        # 3) NUEVO: countdown + timestamp al slot
                         await self._announce_queue_countdown_prep_minute(
                             guild, join_channel, now
                         )
+
+                     
 
                 # ---------- START (ventana :x0..:x4) ----------
                 start_base = self._in_start_window(now)
@@ -5080,6 +5082,7 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
 
 
 
