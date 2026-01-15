@@ -255,6 +255,14 @@ async def startup():
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
+
+        -- NUEVO: meta para evitar scrape innecesario (revid de List_of_cards)
+        CREATE TABLE IF NOT EXISTS public.sekaicards_meta(
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS public.player_pfps(
           user_id    {uid_type_sql} PRIMARY KEY,
           url        TEXT NOT NULL,
@@ -1317,7 +1325,13 @@ _cards_cache: Dict[str, object] = {
     "items": [],
     "ts": datetime.fromtimestamp(0, tz=timezone.utc),
 }
+
+# Frescura / fallback (BD + cache). Esto NO define cada cuánto chequeamos.
 CARDS_TTL = timedelta(hours=6)
+
+# NUEVO: frecuencia de chequeo (barato por revid). Ajusta a 2-10 min según carga tolerada.
+CARDS_POLL = timedelta(minutes=5)
+
 _cards_lock = asyncio.Lock()
 
 # --------- AUTO REFRESH (background poller) ----------
@@ -1325,45 +1339,26 @@ _cards_stop = asyncio.Event()
 _cards_task: Optional[asyncio.Task] = None
 
 
-async def _refresh_cards_once() -> None:
-    """
-    Refresca cartas si la BD no está fresca.
-    Actualiza BD + cache en memoria.
-    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
-    """
-    if not db_pool:
-        return
-
-    async with _cards_lock:
-        try:
-            async with db_pool.acquire() as conn:
-                if await _cards_db_is_fresh(conn):
-                    return
-
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                return
-
-            async with db_pool.acquire() as conn:
-                await _cards_db_upsert_many(conn, items)
-
-            _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.now(timezone.utc)
-            print(f"✅ Cards refreshed (auto): {len(items)}")
-        except Exception:
-            traceback.print_exc()
+# =================== Meta (BD): sekaicards_meta ===================
+async def _meta_get(conn: asyncpg.Connection, key: str) -> Optional[str]:
+    row = await conn.fetchrow(
+        "SELECT value FROM public.sekaicards_meta WHERE key=$1 LIMIT 1", key
+    )
+    return row["value"] if row else None
 
 
-async def _refresh_cards_forever() -> None:
-    await asyncio.sleep(3)
-    while not _cards_stop.is_set():
-        await _refresh_cards_once()
-        try:
-            await asyncio.wait_for(
-                _cards_stop.wait(), timeout=CARDS_TTL.total_seconds()
-            )
-        except asyncio.TimeoutError:
-            pass
+async def _meta_set(conn: asyncpg.Connection, key: str, value: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO public.sekaicards_meta(key, value, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (key) DO UPDATE
+          SET value = EXCLUDED.value,
+              updated_at = now()
+        """,
+        key,
+        value,
+    )
 
 
 async def _sleep_jitter(a=0.15, b=0.5):
@@ -1389,6 +1384,37 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
                 raise
             await asyncio.sleep(0.8 + attempt * 0.5)
     return {}
+
+
+async def _get_list_of_cards_revid() -> Optional[int]:
+    """
+    Chequeo barato: devuelve el revid actual de List_of_cards.
+    Si falla, devuelve None (y el refresher cae al comportamiento TTL).
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            data = await _get_json(
+                client,
+                SEKAIPEDIA_API,
+                {
+                    "action": "query",
+                    "prop": "revisions",
+                    "rvprop": "ids",
+                    "titles": "List_of_cards",
+                    "format": "json",
+                    "formatversion": 2,
+                },
+            )
+        pages = (data.get("query") or {}).get("pages") or []
+        if not pages:
+            return None
+        revs = pages[0].get("revisions") or []
+        if not revs:
+            return None
+        rv = revs[0].get("revid")
+        return int(rv) if rv is not None else None
+    except Exception:
+        return None
 
 
 def _abs_sekaipedia(u: str) -> str:
@@ -1793,7 +1819,70 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     return _parse_cards_from_wikitext(wikitext)
 
 
+# =================== AUTO REFRESH (actualizado) ===================
+async def _refresh_cards_once() -> None:
+    """
+    Refresca cartas cuando corresponde:
+      - Chequea revid de List_of_cards (barato).
+      - Si no cambió y BD está fresca => no hace nada.
+      - Si cambió => scrape + upsert.
+      - Si revid falla (None) => se comporta como antes: solo refresca si BD NO está fresca.
+    """
+    if not db_pool:
+        return
+
+    async with _cards_lock:
+        try:
+            current_revid = await _get_list_of_cards_revid()
+
+            async with db_pool.acquire() as conn:
+                db_fresh = await _cards_db_is_fresh(conn)
+                stored_revid = await _meta_get(conn, "list_of_cards_revid")
+
+            # Si no podemos obtener revid, no spameamos: solo refrescamos si el TTL venció.
+            if current_revid is None:
+                if db_fresh:
+                    return
+            else:
+                # Si no cambió y BD está fresca, no hacemos nada.
+                if stored_revid is not None and str(current_revid) == str(stored_revid) and db_fresh:
+                    return
+
+            items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                return
+
+            async with db_pool.acquire() as conn:
+                await _cards_db_upsert_many(conn, items)
+                if current_revid is not None:
+                    await _meta_set(conn, "list_of_cards_revid", str(current_revid))
+
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = datetime.now(timezone.utc)
+            print(f"✅ Cards refreshed (auto): {len(items)} revid={current_revid}")
+
+        except Exception:
+            traceback.print_exc()
+
+
+async def _refresh_cards_forever() -> None:
+    await asyncio.sleep(3)
+    while not _cards_stop.is_set():
+        await _refresh_cards_once()
+        try:
+            await asyncio.wait_for(
+                _cards_stop.wait(), timeout=CARDS_POLL.total_seconds()
+            )
+        except asyncio.TimeoutError:
+            pass
+
+
 # =================== API: /auth02/cards (con persistencia + force refresh) ===================
+def _cards_json(items: List[Dict]) -> JSONResponse:
+    # Evita caché agresivo de navegador/CDN para que el usuario vea cambios al instante.
+    return JSONResponse(items, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/auth02/cards")
 async def auth02_cards(
     request: Request,
@@ -1818,12 +1907,12 @@ async def auth02_cards(
         async with db_pool.acquire() as conn:
             try:
                 if await _cards_db_is_fresh(conn):
-                    return await _cards_db_all(conn)
+                    return _cards_json(await _cards_db_all(conn))
             except Exception:
                 traceback.print_exc()
 
     if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-        return _cards_cache["items"]
+        return _cards_json(_cards_cache["items"])  # type: ignore[arg-type]
 
     async with _cards_lock:
         now = datetime.now(timezone.utc)
@@ -1832,12 +1921,12 @@ async def auth02_cards(
             async with db_pool.acquire() as conn:
                 try:
                     if await _cards_db_is_fresh(conn):
-                        return await _cards_db_all(conn)
+                        return _cards_json(await _cards_db_all(conn))
                 except Exception:
                     traceback.print_exc()
 
         if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-            return _cards_cache["items"]
+            return _cards_json(_cards_cache["items"])  # type: ignore[arg-type]
 
         try:
             items = await _scrape_cards_from_sekaipedia()
@@ -1846,7 +1935,7 @@ async def auth02_cards(
                     async with db_pool.acquire() as conn:
                         existing = await _cards_db_all(conn)
                         if existing:
-                            return existing
+                            return _cards_json(existing)
                 raise HTTPException(
                     status_code=503, detail="Upstream unavailable or parse error"
                 )
@@ -1857,8 +1946,16 @@ async def auth02_cards(
             if db_pool:
                 async with db_pool.acquire() as conn:
                     await _cards_db_upsert_many(conn, items)
+                    # Si podemos, actualizamos meta con revid actual para alinear refresher.
+                    try:
+                        rv = await _get_list_of_cards_revid()
+                        if rv is not None:
+                            await _meta_set(conn, "list_of_cards_revid", str(rv))
+                    except Exception:
+                        pass
 
-            return items
+            return _cards_json(items)
+
         except HTTPException:
             raise
         except Exception as e:
@@ -1867,7 +1964,7 @@ async def auth02_cards(
                 async with db_pool.acquire() as conn:
                     existing = await _cards_db_all(conn)
                     if existing:
-                        return existing
+                        return _cards_json(existing)
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
 
