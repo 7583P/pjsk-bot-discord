@@ -5,6 +5,7 @@ import traceback
 import asyncio
 import random
 import unicodedata
+import html as _html
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse, unquote, quote
@@ -35,7 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # ===================== FastAPI =====================
 app = FastAPI()
 
-_allowed_origins: List[str] = []
+_allowed_origins = []
 for o in [FRONT_URL, CORS_ORIGIN]:
     if o and o not in _allowed_origins:
         _allowed_origins.append(o)
@@ -71,11 +72,15 @@ def _rget(rec: Any, key: str, default=None):
         return default
 
 
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 # =========================== DB & Schema Flags ===========================
 db_pool: Optional[asyncpg.pool.Pool] = None
 
 HAS_DISCORD_ID_COL: bool = False
-PLAYERS_HAS_IN_GUILD: bool = False
+PLAYERS_HAS_IN_GUILD: bool = False  # <--- NUEVO
 
 SEASONS_HAS_ACTIVE: bool = False
 SEASONS_HAS_NAME: bool = False
@@ -104,7 +109,7 @@ async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
-        """,
+    """,
         table,
         column,
     )
@@ -118,7 +123,7 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
         LIMIT 1
-        """,
+    """,
         table,
         column,
     )
@@ -177,7 +182,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
                   )
             ORDER BY column_name
             LIMIT 1
-            """
+        """
         )
         RESULTS_TEXT_COL = row["column_name"] if row else None
 
@@ -230,7 +235,7 @@ async def startup():
         min_size=1,
         max_size=10,
         timeout=10.0,
-        command_timeout=30.0,
+        command_timeout=60.0,  # subido por payloads grandes
     )
     print("✅ DB pool initialized")
 
@@ -255,6 +260,12 @@ async def startup():
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
+        CREATE TABLE IF NOT EXISTS public.sekaicards_meta(
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         CREATE TABLE IF NOT EXISTS public.player_pfps(
           user_id    {uid_type_sql} PRIMARY KEY,
           url        TEXT NOT NULL,
@@ -280,13 +291,6 @@ async def startup():
         );
         CREATE INDEX IF NOT EXISTS idx_match_songs_result_id
           ON public.match_songs(result_id);
-
-        -- tabla meta para versionado (revid) de List_of_cards
-        CREATE TABLE IF NOT EXISTS public.sekaicards_meta(
-          key        TEXT PRIMARY KEY,
-          value      TEXT NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
         """
         )
 
@@ -340,7 +344,7 @@ async def _pick_effective_season(
             """
             SELECT id FROM public.seasons
             WHERE active = TRUE ORDER BY id DESC LIMIT 1
-            """
+        """
         )
         if row and row["id"]:
             return int(row["id"])
@@ -400,7 +404,7 @@ STATE_TTL = timedelta(minutes=10)
 
 
 def _cleanup_state_store():
-    now = datetime.now(timezone.utc)
+    now = _now_utc()
     expired = [k for k, exp in STATE_STORE.items() if exp < now]
     for k in expired:
         STATE_STORE.pop(k, None)
@@ -482,7 +486,7 @@ async def health():
 async def auth02_start():
     _cleanup_state_store()
     state = secrets.token_urlsafe(24)
-    STATE_STORE[state] = datetime.now(timezone.utc) + STATE_TTL
+    STATE_STORE[state] = _now_utc() + STATE_TTL
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -501,7 +505,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     _cleanup_state_store()
     exp = STATE_STORE.pop(state or "", None)
-    if not exp or datetime.now(timezone.utc) > exp:
+    if not exp or _now_utc() > exp:
         raise HTTPException(400, "Invalid or expired state")
 
     async with httpx.AsyncClient() as client:
@@ -635,7 +639,7 @@ async def set_pfp(request: Request):
                     ON CONFLICT (user_id) DO UPDATE
                       SET url = EXCLUDED.url,
                           updated_at = now()
-                    """,
+                """,
                     _uid_for_sql(user_id),
                     url,
                 )
@@ -715,7 +719,7 @@ async def get_players(
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
-                """
+            """
             rows = await conn.fetch(q, picked, limit, offset)
 
             # Contar partidas, peakMmr y W-L / MMR last 10 desde match_history
@@ -739,7 +743,7 @@ async def get_players(
                             WHERE season_id = $1
                               AND user_id::text = ANY($2::text[])
                             GROUP BY user_id
-                            """,
+                        """,
                             picked,
                             uid_strs,
                         )
@@ -776,7 +780,7 @@ async def get_players(
                                 COALESCE(SUM(mmr_delta) FILTER (WHERE rn <= 10), 0) AS last10_mmr_delta
                             FROM ranked
                             GROUP BY user_id
-                            """,
+                        """,
                             picked,
                             uid_strs,
                         )
@@ -998,8 +1002,8 @@ async def get_matches(
             except HTTPException:
                 return []
 
-        where_clauses: List[str] = []
-        params: List[Any] = []
+        where_clauses = []
+        params: List = []
 
         if picked_season is not None:
             where_clauses.append(f"season_id = ${len(params) + 1}")
@@ -1026,7 +1030,7 @@ async def get_matches(
             GROUP BY result_id
             ORDER BY first_played_at ASC, result_id ASC
             LIMIT ${limit_idx} OFFSET ${offset_idx}
-            """
+        """
 
         res_rows = await conn.fetch(sql_results, *params)
         if not res_rows:
@@ -1291,6 +1295,18 @@ async def get_match_songs(result_id: int):
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API = "https://sekaipedia.org/w/api.php"
 
+# Ajustables por ENV (para “que se actualice conforme salen”)
+# - REV_CHECK: cada cuánto verifico si la página cambió (barato)
+# - POLL: cada cuánto corre el background (normalmente igual a REV_CHECK)
+# - FULL_TTL: aunque no cambie, cada cuánto fuerzo un refresco completo (safety)
+CARDS_REV_CHECK_MIN = int(os.getenv("CARDS_REV_CHECK_MIN", "10"))
+CARDS_POLL_MIN = int(os.getenv("CARDS_POLL_MIN", str(CARDS_REV_CHECK_MIN)))
+CARDS_FULL_TTL_HOURS = int(os.getenv("CARDS_FULL_TTL_HOURS", "24"))
+
+CARDS_REV_CHECK_TTL = timedelta(minutes=max(1, CARDS_REV_CHECK_MIN))
+CARDS_POLL_TTL = timedelta(minutes=max(1, CARDS_POLL_MIN))
+CARDS_FULL_TTL = timedelta(hours=max(1, CARDS_FULL_TTL_HOURS))
+
 _UA_POOL = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
@@ -1323,9 +1339,8 @@ def _mk_headers(referer: Optional[str] = None) -> Dict[str, str]:
 _cards_cache: Dict[str, object] = {
     "items": [],
     "ts": datetime.fromtimestamp(0, tz=timezone.utc),
+    "rev_id": None,
 }
-CARDS_TTL = timedelta(hours=6)          # frescura de datos
-CARDS_POLL = timedelta(minutes=5)       # frecuencia de chequeo (revid)
 _cards_lock = asyncio.Lock()
 
 # --------- AUTO REFRESH (background poller) ----------
@@ -1338,23 +1353,27 @@ async def _sleep_jitter(a=0.15, b=0.5):
 
 
 async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             headers = _mk_headers(SEKAIPEDIA_LIST)
             params2 = dict(params)
             params2.setdefault("origin", "*")
             r = await client.get(
-                url, params=params2, headers=headers, follow_redirects=True, timeout=30
+                url,
+                params=params2,
+                headers=headers,
+                follow_redirects=True,
+                timeout=60,
             )
             if r.status_code in (403, 429):
-                await asyncio.sleep(1.2 + attempt * 0.6)
+                await asyncio.sleep(1.5 + attempt * 0.7)
                 continue
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == 4:
+            if attempt == 5:
                 raise
-            await asyncio.sleep(0.8 + attempt * 0.5)
+            await asyncio.sleep(1.0 + attempt * 0.6)
     return {}
 
 
@@ -1368,14 +1387,59 @@ def _abs_sekaipedia(u: str) -> str:
     return u
 
 
-# =================== Persistencia: helpers BD (cartas / variantes / meta) ===================
+# =================== Persistencia: helpers BD (cartas / meta / variantes) ===================
+async def _meta_get(conn: asyncpg.Connection, key: str) -> Optional[str]:
+    row = await conn.fetchrow(
+        "SELECT value FROM public.sekaicards_meta WHERE key=$1", key
+    )
+    return row["value"] if row else None
+
+
+async def _meta_set(conn: asyncpg.Connection, key: str, value: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO public.sekaicards_meta(key, value, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (key) DO UPDATE
+          SET value = EXCLUDED.value,
+              updated_at = now()
+        """,
+        key,
+        value,
+    )
+
+
+def _dt_to_iso(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.isoformat()
+
+
+def _iso_to_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        # Python 3.11+ ok con Z si no, normalizamos
+        ss = s.replace("Z", "+00:00")
+        return datetime.fromisoformat(ss)
+    except Exception:
+        return None
+
+
+async def _cards_db_count(conn: asyncpg.Connection) -> int:
+    row = await conn.fetchrow("SELECT COUNT(*) AS c FROM public.sekaicards")
+    return int(row["c"] or 0) if row else 0
+
+
 async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
     rows = await conn.fetch(
         """
         SELECT page_id AS id, name, href, thumb
         FROM public.sekaicards
         ORDER BY page_id DESC
-        """
+    """
     )
     return [
         {"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]}
@@ -1395,16 +1459,9 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
               href = EXCLUDED.href,
               thumb = EXCLUDED.thumb,
               updated_at = now()
-        """,
+    """,
         [(int(i["id"]), i["name"], i["href"], i.get("thumb")) for i in items],
     )
-
-
-async def _cards_db_is_fresh(conn: asyncpg.Connection) -> bool:
-    row = await conn.fetchrow("SELECT max(updated_at) AS ts FROM public.sekaicards")
-    if not row or not row["ts"]:
-        return False
-    return (datetime.now(timezone.utc) - row["ts"]) < CARDS_TTL
 
 
 async def _variants_db_get(
@@ -1416,7 +1473,7 @@ async def _variants_db_get(
         FROM public.sekaicard_variants
         WHERE page_id=$1
         ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
-        """,
+    """,
         page_id,
     )
     variants = [{"label": r["label"], "url": r["url"]} for r in rows]
@@ -1436,33 +1493,325 @@ async def _variants_db_save(
         """
         INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
         VALUES ($1, $2, $3, now())
-        """,
+    """,
         [(page_id, v["label"], v["url"]) for v in variants],
     )
 
 
-async def _meta_get(conn: asyncpg.Connection, key: str) -> Optional[str]:
-    row = await conn.fetchrow(
-        "SELECT value FROM public.sekaicards_meta WHERE key=$1 LIMIT 1", key
-    )
-    return row["value"] if row else None
+# =================== Revisión de List_of_cards (invalida cache) ===================
+async def _sekaipedia_list_revision() -> Tuple[Optional[str], Optional[datetime]]:
+    """
+    Devuelve (rev_id, rev_timestamp) de la página List_of_cards.
+    Esto es MUY barato vs bajar todo el HTML.
+    """
+    async with httpx.AsyncClient() as client:
+        data = await _get_json(
+            client,
+            SEKAIPEDIA_API,
+            {
+                "action": "query",
+                "prop": "revisions",
+                "rvprop": "ids|timestamp",
+                "rvslots": "main",
+                "titles": "List_of_cards",
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+
+    rev_id = None
+    rev_ts = None
+    try:
+        pages = (data.get("query") or {}).get("pages") or []
+        if pages and (pages[0].get("revisions") or []):
+            r0 = pages[0]["revisions"][0]
+            rev_id = str(r0.get("revid") or "")
+            ts = r0.get("timestamp") or ""
+            rev_ts = _iso_to_dt(ts)
+    except Exception:
+        rev_id, rev_ts = None, None
+
+    return (rev_id or None), rev_ts
 
 
-async def _meta_set(conn: asyncpg.Connection, key: str, value: str) -> None:
-    await conn.execute(
-        """
-        INSERT INTO public.sekaicards_meta(key, value, updated_at)
-        VALUES ($1, $2, now())
-        ON CONFLICT (key) DO UPDATE
-          SET value = EXCLUDED.value,
-              updated_at = now()
-        """,
-        key,
-        value,
-    )
+async def _cards_needs_refresh(conn: asyncpg.Connection, force: bool) -> Tuple[bool, str]:
+    """
+    Decide si hay que refrescar:
+    - force => sí
+    - si DB vacía => sí
+    - si no he verificado la revisión recientemente => check revision:
+        - si cambió => sí
+        - si no cambió => NO (solo actualiza verified_at)
+    - safety: si last_full_fetch demasiado viejo => sí
+    """
+    if force:
+        return True, "force"
+
+    count = await _cards_db_count(conn)
+    if count <= 0:
+        return True, "empty"
+
+    now = _now_utc()
+
+    last_verified_at = _iso_to_dt(await _meta_get(conn, "cards_verified_at"))
+    last_full_fetch_at = _iso_to_dt(await _meta_get(conn, "cards_fetched_at"))
+    stored_rev_id = await _meta_get(conn, "list_rev_id")
+
+    # Safety: refresco completo cada X horas aunque la rev no cambie (poco probable)
+    if last_full_fetch_at and (now - last_full_fetch_at) > CARDS_FULL_TTL:
+        return True, "full-ttl"
+
+    # Si verifiqué hace poco, confío en estado actual
+    if last_verified_at and (now - last_verified_at) < CARDS_REV_CHECK_TTL:
+        return False, "recently-verified"
+
+    # Check revision remoto
+    remote_rev_id, remote_rev_ts = await _sekaipedia_list_revision()
+    if remote_rev_id and stored_rev_id and remote_rev_id == stored_rev_id:
+        # Misma revisión: marco verified_at y salgo
+        await _meta_set(conn, "cards_verified_at", _dt_to_iso(now))
+        if remote_rev_ts:
+            await _meta_set(conn, "list_rev_ts", _dt_to_iso(remote_rev_ts))
+        return False, "rev-same"
+
+    # Si no tengo stored_rev_id (instalación vieja), igual fuerzo para alinearlo
+    return True, "rev-changed"
 
 
-# =================== Scraping helpers ===================
+# =================== Scraping (HTML renderizado) ===================
+def _strip_tags(s: str) -> str:
+    s = re.sub(r"<script.*?>.*?</script>", "", s, flags=re.S | re.I)
+    s = re.sub(r"<style.*?>.*?</style>", "", s, flags=re.S | re.I)
+    s = re.sub(r"<.*?>", "", s, flags=re.S)
+    s = _html.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+_TABLE_RE = re.compile(
+    r"<table[^>]*class=[\"'][^\"']*wikitable[^\"']*[\"'][^>]*>(.*?)</table>",
+    re.S | re.I,
+)
+_TR_RE = re.compile(r"<tr[^>]*>(.*?)</tr>", re.S | re.I)
+_TD_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S | re.I)
+_A_RE = re.compile(
+    r"<a[^>]+href=[\"'](?P<href>/wiki/[^\"'#?]+)[\"'][^>]*>(?P<txt>.*?)</a>",
+    re.S | re.I,
+)
+_IMG_RE = re.compile(
+    r"<img[^>]+(?:data-src|src)=[\"'](?P<src>[^\"']+)[\"']",
+    re.I,
+)
+
+
+def _dedup_cards(items: List[Dict]) -> List[Dict]:
+    seen = set()
+    out = []
+    for it in items:
+        cid = str(it.get("id") or "")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        out.append(it)
+    try:
+        out.sort(key=lambda x: int(str(x["id"])))
+    except Exception:
+        pass
+    return out
+
+
+def _parse_cards_from_html(html_text: str) -> List[Dict]:
+    items: List[Dict] = []
+    if not html_text:
+        return items
+
+    tables = _TABLE_RE.findall(html_text)
+    if not tables:
+        # fallback: si no detecta wikitable, intenta sobre todo el HTML
+        tables = [html_text]
+
+    for t in tables:
+        for tr in _TR_RE.findall(t):
+            cells = _TD_RE.findall(tr)
+            if len(cells) < 2:
+                continue
+
+            # ID: primer número en la celda 1
+            id_txt = _strip_tags(cells[0])
+            m_id = re.search(r"\b(\d{1,6})\b", id_txt)
+            if not m_id:
+                continue
+            card_id = m_id.group(1)
+
+            # Nombre/href: primer <a href="/wiki/...">
+            a = _A_RE.search(cells[1]) or _A_RE.search(tr)
+            if a:
+                href_rel = a.group("href")
+                display_name = _strip_tags(a.group("txt")) or _strip_tags(cells[1])
+                href = _abs_sekaipedia(href_rel)
+            else:
+                display_name = _strip_tags(cells[1])
+                page_title = display_name.replace(" ", "_")
+                href = f"https://sekaipedia.org/wiki/{page_title}"
+                display_name = display_name or page_title.replace("_", " ")
+
+            # Thumb: primer <img ... src=...>
+            img = _IMG_RE.search(tr)
+            thumb = _abs_sekaipedia(img.group("src")) if img else None
+
+            items.append(
+                {"id": card_id, "name": display_name, "href": href, "thumb": thumb}
+            )
+
+    return _dedup_cards(items)
+
+
+async def _scrape_cards_from_sekaipedia() -> List[Dict]:
+    """
+    Lee el HTML renderizado (action=parse&prop=text) para capturar transclusiones.
+    Es el método que mejor refleja “lo que ves” en la página.
+    """
+    async with httpx.AsyncClient() as client:
+        data = await _get_json(
+            client,
+            SEKAIPEDIA_API,
+            {
+                "action": "parse",
+                "page": "List_of_cards",
+                "prop": "text",
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+
+    html_text = ""
+    try:
+        parse = (data or {}).get("parse") or {}
+        txt = parse.get("text")
+        # formatversion=2 suele devolver string; algunas instalaciones devuelven dict con "*"
+        if isinstance(txt, dict):
+            html_text = txt.get("*") or ""
+        else:
+            html_text = txt or ""
+    except Exception:
+        html_text = ""
+
+    items = _parse_cards_from_html(html_text)
+    return items
+
+
+# =================== Refresh orchestration ===================
+async def _refresh_cards_once(force: bool = False) -> None:
+    """
+    Refresca cartas si detecta cambios en la revisión (o force).
+    Actualiza BD + cache en memoria.
+    Protegido por _cards_lock.
+    """
+    if not db_pool:
+        return
+
+    async with _cards_lock:
+        try:
+            async with db_pool.acquire() as conn:
+                do_refresh, reason = await _cards_needs_refresh(conn, force=force)
+                if not do_refresh:
+                    # opcional: hidratar cache en memoria si está vacío
+                    if not _cards_cache["items"]:
+                        _cards_cache["items"] = await _cards_db_all(conn)
+                        _cards_cache["ts"] = _now_utc()
+                    return
+
+            # Obtener revision actual (para guardarla si el scrape sale bien)
+            remote_rev_id, remote_rev_ts = await _sekaipedia_list_revision()
+
+            items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                print("⚠️ Cards scrape returned 0 items; keeping existing DB")
+                return
+
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    await _cards_db_upsert_many(conn, items)
+                    await _meta_set(conn, "cards_fetched_at", _dt_to_iso(_now_utc()))
+                    await _meta_set(conn, "cards_verified_at", _dt_to_iso(_now_utc()))
+                    if remote_rev_id:
+                        await _meta_set(conn, "list_rev_id", remote_rev_id)
+                    if remote_rev_ts:
+                        await _meta_set(conn, "list_rev_ts", _dt_to_iso(remote_rev_ts))
+
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = _now_utc()
+            _cards_cache["rev_id"] = remote_rev_id
+
+            print(f"✅ Cards refreshed ({reason}): {len(items)}")
+        except Exception:
+            traceback.print_exc()
+
+
+async def _refresh_cards_forever() -> None:
+    # pequeña espera inicial
+    await asyncio.sleep(3)
+    while not _cards_stop.is_set():
+        await _refresh_cards_once(force=False)
+        try:
+            await asyncio.wait_for(_cards_stop.wait(), timeout=CARDS_POLL_TTL.total_seconds())
+        except asyncio.TimeoutError:
+            pass
+
+
+# =================== API: /auth02/cards ===================
+@app.get("/auth02/cards")
+async def auth02_cards(
+    request: Request,
+    force: int = Query(0, description="1 = fuerza refresh inmediato (requiere sesión)"),
+):
+    """
+    Devuelve lista de cartas de Sekaipedia (persistente en BD + cache).
+
+    - Usa DB/cache si revisión no cambió.
+    - Cada CARDS_REV_CHECK_MIN hace un check de revisión (barato).
+    - Si force=1, hace refresh completo inmediato (requiere sesión).
+    """
+    force = bool(force)
+    if force:
+        sid = request.cookies.get(COOKIE_NAME)
+        if not sid or sid not in SESSIONS:
+            raise HTTPException(status_code=401, detail="no-session")
+
+    # Para evitar caches de navegador/CDN sobre este endpoint:
+    no_cache_headers = {
+        "Cache-Control": "no-store, max-age=0",
+        "Pragma": "no-cache",
+    }
+
+    if not db_pool:
+        return JSONResponse([], headers=no_cache_headers)
+
+    # Si force => refresco completo (con lock dentro)
+    if force:
+        await _refresh_cards_once(force=True)
+        async with db_pool.acquire() as conn:
+            data = await _cards_db_all(conn)
+        return JSONResponse(data, headers=no_cache_headers)
+
+    # Camino normal: intenta servir DB si sigue vigente; si no, refresh selectivo
+    async with db_pool.acquire() as conn:
+        try:
+            do_refresh, _reason = await _cards_needs_refresh(conn, force=False)
+        except Exception:
+            do_refresh = True
+
+    if do_refresh:
+        await _refresh_cards_once(force=False)
+
+    # Preferir DB como fuente de verdad (cache en memoria es opcional)
+    async with db_pool.acquire() as conn:
+        data = await _cards_db_all(conn)
+
+    return JSONResponse(data, headers=no_cache_headers)
+
+
+# =================== API: /auth02/card-variants ===================
 _BAD_KEYWORDS = [
     "banner",
     "sprite",
@@ -1603,367 +1952,6 @@ async def _scrape_card_variants(href: str) -> Dict:
     }
 
 
-def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
-    safe_name = quote(filename)
-    return f"https://sekaipedia.org/wiki/Special:FilePath/{safe_name}?width={width}"
-
-
-# =================== Parser robusto del wikitext de List_of_cards ===================
-def _strip_wiki_markup(s: str) -> str:
-    s = re.sub(r"\{\{.*?\}\}", "", s, flags=re.S)  # templates
-    s = re.sub(r"<.*?>", "", s, flags=re.S)  # html
-    return s.strip()
-
-
-def _cells_from_row(row: str) -> List[str]:
-    """
-    Soporta:
-      | 1292 || [[Page|Name]] || ...
-    y también:
-      | 1292
-      | [[Page|Name]]
-      | ...
-    """
-    cells: List[str] = []
-    for ln in row.splitlines():
-        s = ln.lstrip()
-        if not s.startswith("|"):
-            continue
-        s = s[1:].strip()
-        parts = [p.strip() for p in s.split("||")]
-        for p in parts:
-            if p != "":
-                cells.append(p)
-    return cells
-
-
-def _extract_wikitable_blocks(wikitext: str) -> List[str]:
-    # Dejado por compatibilidad, aunque el parseo real ya no depende de esto.
-    return re.findall(r"\{\|.*?\n\|\}", wikitext, flags=re.S)
-
-
-def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
-    """
-    Parseo tolerante por filas: recorre todos los bloques separados por '\n|-'
-    y extrae filas que parezcan filas de tabla de cartas:
-
-      - Primera celda con un ID numérico.
-      - Algún [[Page|Name]] en la misma fila o cerca.
-      - Primer File:... para thumb (si existe).
-
-    Esto evita depender demasiado de los límites exactos de las wikitables.
-    """
-    if not wikitext:
-        return []
-
-    text = (
-        wikitext.replace("\r\n", "\n")
-        .replace("\r", "\n")
-        .replace("\u00a0", " ")
-    )
-
-    items: List[Dict] = []
-
-    # Cada bloque suele ser una fila de tabla o algo cercano
-    rows = re.split(r"\n\|-\s*", text)
-    for row in rows:
-        # Atajo: si no hay ningún '|' de datos, saltamos rápido
-        if "|" not in row:
-            continue
-
-        cells = _cells_from_row(row)
-        if not cells:
-            continue
-
-        # 1) ID
-        id_cell = _strip_wiki_markup(cells[0])
-        m_id = re.search(r"\b(\d{1,6})\b", id_cell)
-        if not m_id:
-            m_id = re.search(r"\b(\d{1,6})\b", row)
-        if not m_id:
-            continue
-        card_id = m_id.group(1)
-
-        # 2) Nombre + href
-        name_cell = cells[1] if len(cells) >= 2 else row
-        m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
-        if not m_name:
-            m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", row)
-        if m_name:
-            page_title = m_name.group(1).strip()
-            display_name = (m_name.group(2) or page_title).strip()
-        else:
-            display_name = _strip_wiki_markup(name_cell)
-            page_title = display_name.replace(" ", "_")
-
-        href = f"https://sekaipedia.org/wiki/{page_title.replace(' ', '_')}"
-
-        # 3) imagen (thumb) – primer File:... encontrado en el bloque
-        m_file = re.search(r"\[\[\s*File:([^|\]]+)", row, flags=re.I)
-        thumb_url = (
-            _build_thumb_from_filename(m_file.group(1), width=256)
-            if m_file
-            else None
-        )
-
-        items.append(
-            {"id": card_id, "name": display_name, "href": href, "thumb": thumb_url}
-        )
-
-    # Deduplicar por id y ordenar
-    seen = set()
-    out: List[Dict] = []
-    for it in items:
-        cid = str(it.get("id") or "").strip()
-        if not cid or not re.fullmatch(r"\d+", cid):
-            continue
-        if cid in seen:
-            continue
-        seen.add(cid)
-        out.append(it)
-
-    try:
-        out.sort(key=lambda x: int(str(x["id"])))
-    except Exception:
-        pass
-
-    return out
-
-
-# ---------- Scraper real: página única List_of_cards (sin límites) ----------
-async def _scrape_cards_from_sekaipedia() -> List[Dict]:
-    """
-    Lee el wikitext de "List_of_cards" y lo parsea.
-    Usa action=query+revisions (más estable para payloads grandes),
-    y fallback a action=parse si no viene content.
-    """
-    async with httpx.AsyncClient() as client:
-        # 1) Preferido: revisions content
-        data = await _get_json(
-            client,
-            SEKAIPEDIA_API,
-            {
-                "action": "query",
-                "prop": "revisions",
-                "rvprop": "content",
-                "rvslots": "main",
-                "titles": "List_of_cards",
-                "format": "json",
-                "formatversion": 2,
-            },
-        )
-
-        wikitext = ""
-        try:
-            pages = (data.get("query") or {}).get("pages") or []
-            if pages and (pages[0].get("revisions") or []):
-                rev0 = pages[0]["revisions"][0]
-                slots = rev0.get("slots") or {}
-                main = slots.get("main") or {}
-                wikitext = main.get("content") or ""
-        except Exception:
-            wikitext = ""
-
-        # 2) Fallback: action=parse
-        if not wikitext:
-            data2 = await _get_json(
-                client,
-                SEKAIPEDIA_API,
-                {
-                    "action": "parse",
-                    "page": "List_of_cards",
-                    "prop": "wikitext",
-                    "format": "json",
-                    "formatversion": 2,
-                },
-            )
-            parse = (data2 or {}).get("parse") or {}
-            wikitext = parse.get("wikitext") or ""
-
-    if not wikitext:
-        return []
-
-    return _parse_cards_from_wikitext(wikitext)
-
-
-# ---------- Helper: revid actual de List_of_cards ----------
-async def _get_list_of_cards_revid() -> Optional[int]:
-    async with httpx.AsyncClient() as client:
-        data = await _get_json(
-            client,
-            SEKAIPEDIA_API,
-            {
-                "action": "query",
-                "prop": "revisions",
-                "rvprop": "ids",
-                "titles": "List_of_cards",
-                "format": "json",
-                "formatversion": 2,
-            },
-        )
-    try:
-        pages = (data.get("query") or {}).get("pages") or []
-        revs = pages[0].get("revisions") or []
-        return int(revs[0].get("revid")) if revs else None
-    except Exception:
-        return None
-
-
-# ---------- AUTO REFRESH (background) con revid ----------
-async def _refresh_cards_once() -> None:
-    """
-    Refresca cartas si:
-      - el revid de List_of_cards cambió, o
-      - aún no tenemos revid almacenado,
-      Y en ambos casos actualiza BD + cache.
-
-    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
-    """
-    if not db_pool:
-        return
-
-    async with _cards_lock:
-        try:
-            current_revid = await _get_list_of_cards_revid()
-
-            async with db_pool.acquire() as conn:
-                stored_revid = await _meta_get(conn, "list_of_cards_revid")
-
-                if (
-                    current_revid is not None
-                    and stored_revid is not None
-                    and str(current_revid) == str(stored_revid)
-                    and await _cards_db_is_fresh(conn)
-                ):
-                    # Nada que hacer: misma revisión y datos frescos
-                    return
-
-            # O bien cambió el revid, o no tenemos meta: scrapeamos
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                return
-
-            async with db_pool.acquire() as conn:
-                await _cards_db_upsert_many(conn, items)
-                if current_revid is not None:
-                    await _meta_set(conn, "list_of_cards_revid", str(current_revid))
-
-            _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.now(timezone.utc)
-            print(
-                f"✅ Cards refreshed (auto): {len(items)}"
-                f" (revid={current_revid})"
-            )
-        except Exception:
-            traceback.print_exc()
-
-
-async def _refresh_cards_forever() -> None:
-    await asyncio.sleep(3)
-    while not _cards_stop.is_set():
-        await _refresh_cards_once()
-        try:
-            await asyncio.wait_for(
-                _cards_stop.wait(), timeout=CARDS_POLL.total_seconds()
-            )
-        except asyncio.TimeoutError:
-            pass
-
-
-def _cards_response(items: List[Dict]) -> JSONResponse:
-    # Evitar cache agresivo del navegador / CDN
-    return JSONResponse(items, headers={"Cache-Control": "no-store"})
-
-
-# =================== API: /auth02/cards (con persistencia + force refresh) ===================
-@app.get("/auth02/cards")
-async def auth02_cards(
-    request: Request,
-    force: int = Query(0, description="1 = fuerza refresh inmediato (requiere sesión)"),
-):
-    """
-    Devuelve lista de cartas de Sekaipedia (persistente en BD + cache).
-
-    - Por defecto, usa BD/cache si está fresco.
-    - Si force=1, ignora freshness y fuerza scrape + upsert.
-      Protegido por sesión (cookie sid) para evitar abuso.
-    """
-    force = bool(force)
-    if force:
-        sid = request.cookies.get(COOKIE_NAME)
-        if not sid or sid not in SESSIONS:
-            raise HTTPException(status_code=401, detail="no-session")
-
-    now = datetime.now(timezone.utc)
-
-    if not force and db_pool:
-        async with db_pool.acquire() as conn:
-            try:
-                if await _cards_db_is_fresh(conn):
-                    items = await _cards_db_all(conn)
-                    return _cards_response(items)
-            except Exception:
-                traceback.print_exc()
-
-    if (
-        not force
-        and _cards_cache["items"]
-        and now - _cards_cache["ts"] < CARDS_TTL
-    ):
-        return _cards_response(_cards_cache["items"])  # type: ignore[arg-type]
-
-    async with _cards_lock:
-        now = datetime.now(timezone.utc)
-
-        if not force and db_pool:
-            async with db_pool.acquire() as conn:
-                try:
-                    if await _cards_db_is_fresh(conn):
-                        items = await _cards_db_all(conn)
-                        return _cards_response(items)
-                except Exception:
-                    traceback.print_exc()
-
-        if (
-            not force
-            and _cards_cache["items"]
-            and now - _cards_cache["ts"] < CARDS_TTL
-        ):
-            return _cards_response(_cards_cache["items"])  # type: ignore[arg-type]
-
-        try:
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                if db_pool:
-                    async with db_pool.acquire() as conn:
-                        existing = await _cards_db_all(conn)
-                        if existing:
-                            return _cards_response(existing)
-                raise HTTPException(
-                    status_code=503, detail="Upstream unavailable or parse error"
-                )
-
-            _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.now(timezone.utc)
-
-            if db_pool:
-                async with db_pool.acquire() as conn:
-                    await _cards_db_upsert_many(conn, items)
-
-            return _cards_response(items)
-        except HTTPException:
-            raise
-        except Exception as e:
-            traceback.print_exc()
-            if db_pool:
-                async with db_pool.acquire() as conn:
-                    existing = await _cards_db_all(conn)
-                    if existing:
-                        return _cards_response(existing)
-            raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
-
-
-# =================== API: /auth02/card-variants ===================
 @app.get("/auth02/card-variants")
 async def get_card_variants(
     href: str = Query(..., description="URL absoluta de la Card:")
@@ -1982,7 +1970,8 @@ async def get_card_variants(
                 thumb_url = row["thumb"]
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
-                if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
+                # reusar TTL FULL como TTL de variantes (ok)
+                if variants and ts and (_now_utc() - ts) < CARDS_FULL_TTL:
                     return {"name": page_title, "variants": variants}
 
     data = {"name": page_title, "variants": []}
@@ -2013,3 +2002,4 @@ async def get_card_variants(
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
