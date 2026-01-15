@@ -35,7 +35,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # ===================== FastAPI =====================
 app = FastAPI()
 
-_allowed_origins = []
+_allowed_origins: List[str] = []
 for o in [FRONT_URL, CORS_ORIGIN]:
     if o and o not in _allowed_origins:
         _allowed_origins.append(o)
@@ -75,7 +75,7 @@ def _rget(rec: Any, key: str, default=None):
 db_pool: Optional[asyncpg.pool.Pool] = None
 
 HAS_DISCORD_ID_COL: bool = False
-PLAYERS_HAS_IN_GUILD: bool = False  # <--- NUEVO
+PLAYERS_HAS_IN_GUILD: bool = False
 
 SEASONS_HAS_ACTIVE: bool = False
 SEASONS_HAS_NAME: bool = False
@@ -104,7 +104,7 @@ async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
         SELECT 1
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
-    """,
+        """,
         table,
         column,
     )
@@ -118,7 +118,7 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
         FROM information_schema.columns
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2
         LIMIT 1
-    """,
+        """,
         table,
         column,
     )
@@ -177,7 +177,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
                   )
             ORDER BY column_name
             LIMIT 1
-        """
+            """
         )
         RESULTS_TEXT_COL = row["column_name"] if row else None
 
@@ -255,14 +255,6 @@ async def startup():
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
           PRIMARY KEY (page_id, label)
         );
-
-        -- NUEVO: meta para evitar scrape innecesario (revid de List_of_cards)
-        CREATE TABLE IF NOT EXISTS public.sekaicards_meta(
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-
         CREATE TABLE IF NOT EXISTS public.player_pfps(
           user_id    {uid_type_sql} PRIMARY KEY,
           url        TEXT NOT NULL,
@@ -288,6 +280,13 @@ async def startup():
         );
         CREATE INDEX IF NOT EXISTS idx_match_songs_result_id
           ON public.match_songs(result_id);
+
+        -- tabla meta para versionado (revid) de List_of_cards
+        CREATE TABLE IF NOT EXISTS public.sekaicards_meta(
+          key        TEXT PRIMARY KEY,
+          value      TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         """
         )
 
@@ -341,7 +340,7 @@ async def _pick_effective_season(
             """
             SELECT id FROM public.seasons
             WHERE active = TRUE ORDER BY id DESC LIMIT 1
-        """
+            """
         )
         if row and row["id"]:
             return int(row["id"])
@@ -636,7 +635,7 @@ async def set_pfp(request: Request):
                     ON CONFLICT (user_id) DO UPDATE
                       SET url = EXCLUDED.url,
                           updated_at = now()
-                """,
+                    """,
                     _uid_for_sql(user_id),
                     url,
                 )
@@ -716,7 +715,7 @@ async def get_players(
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
-            """
+                """
             rows = await conn.fetch(q, picked, limit, offset)
 
             # Contar partidas, peakMmr y W-L / MMR last 10 desde match_history
@@ -740,7 +739,7 @@ async def get_players(
                             WHERE season_id = $1
                               AND user_id::text = ANY($2::text[])
                             GROUP BY user_id
-                        """,
+                            """,
                             picked,
                             uid_strs,
                         )
@@ -777,7 +776,7 @@ async def get_players(
                                 COALESCE(SUM(mmr_delta) FILTER (WHERE rn <= 10), 0) AS last10_mmr_delta
                             FROM ranked
                             GROUP BY user_id
-                        """,
+                            """,
                             picked,
                             uid_strs,
                         )
@@ -999,8 +998,8 @@ async def get_matches(
             except HTTPException:
                 return []
 
-        where_clauses = []
-        params: List = []
+        where_clauses: List[str] = []
+        params: List[Any] = []
 
         if picked_season is not None:
             where_clauses.append(f"season_id = ${len(params) + 1}")
@@ -1027,7 +1026,7 @@ async def get_matches(
             GROUP BY result_id
             ORDER BY first_played_at ASC, result_id ASC
             LIMIT ${limit_idx} OFFSET ${offset_idx}
-        """
+            """
 
         res_rows = await conn.fetch(sql_results, *params)
         if not res_rows:
@@ -1325,40 +1324,13 @@ _cards_cache: Dict[str, object] = {
     "items": [],
     "ts": datetime.fromtimestamp(0, tz=timezone.utc),
 }
-
-# Frescura / fallback (BD + cache). Esto NO define cada cuánto chequeamos.
-CARDS_TTL = timedelta(hours=6)
-
-# NUEVO: frecuencia de chequeo (barato por revid). Ajusta a 2-10 min según carga tolerada.
-CARDS_POLL = timedelta(minutes=5)
-
+CARDS_TTL = timedelta(hours=6)          # frescura de datos
+CARDS_POLL = timedelta(minutes=5)       # frecuencia de chequeo (revid)
 _cards_lock = asyncio.Lock()
 
 # --------- AUTO REFRESH (background poller) ----------
 _cards_stop = asyncio.Event()
 _cards_task: Optional[asyncio.Task] = None
-
-
-# =================== Meta (BD): sekaicards_meta ===================
-async def _meta_get(conn: asyncpg.Connection, key: str) -> Optional[str]:
-    row = await conn.fetchrow(
-        "SELECT value FROM public.sekaicards_meta WHERE key=$1 LIMIT 1", key
-    )
-    return row["value"] if row else None
-
-
-async def _meta_set(conn: asyncpg.Connection, key: str, value: str) -> None:
-    await conn.execute(
-        """
-        INSERT INTO public.sekaicards_meta(key, value, updated_at)
-        VALUES ($1, $2, now())
-        ON CONFLICT (key) DO UPDATE
-          SET value = EXCLUDED.value,
-              updated_at = now()
-        """,
-        key,
-        value,
-    )
 
 
 async def _sleep_jitter(a=0.15, b=0.5):
@@ -1386,37 +1358,6 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: Dict) -> Dict:
     return {}
 
 
-async def _get_list_of_cards_revid() -> Optional[int]:
-    """
-    Chequeo barato: devuelve el revid actual de List_of_cards.
-    Si falla, devuelve None (y el refresher cae al comportamiento TTL).
-    """
-    try:
-        async with httpx.AsyncClient() as client:
-            data = await _get_json(
-                client,
-                SEKAIPEDIA_API,
-                {
-                    "action": "query",
-                    "prop": "revisions",
-                    "rvprop": "ids",
-                    "titles": "List_of_cards",
-                    "format": "json",
-                    "formatversion": 2,
-                },
-            )
-        pages = (data.get("query") or {}).get("pages") or []
-        if not pages:
-            return None
-        revs = pages[0].get("revisions") or []
-        if not revs:
-            return None
-        rv = revs[0].get("revid")
-        return int(rv) if rv is not None else None
-    except Exception:
-        return None
-
-
 def _abs_sekaipedia(u: str) -> str:
     if not u:
         return ""
@@ -1427,14 +1368,14 @@ def _abs_sekaipedia(u: str) -> str:
     return u
 
 
-# =================== Persistencia: helpers BD (cartas / variantes) ===================
+# =================== Persistencia: helpers BD (cartas / variantes / meta) ===================
 async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
     rows = await conn.fetch(
         """
         SELECT page_id AS id, name, href, thumb
         FROM public.sekaicards
         ORDER BY page_id DESC
-    """
+        """
     )
     return [
         {"id": str(r["id"]), "name": r["name"], "href": r["href"], "thumb": r["thumb"]}
@@ -1454,7 +1395,7 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
               href = EXCLUDED.href,
               thumb = EXCLUDED.thumb,
               updated_at = now()
-    """,
+        """,
         [(int(i["id"]), i["name"], i["href"], i.get("thumb")) for i in items],
     )
 
@@ -1475,7 +1416,7 @@ async def _variants_db_get(
         FROM public.sekaicard_variants
         WHERE page_id=$1
         ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
-    """,
+        """,
         page_id,
     )
     variants = [{"label": r["label"], "url": r["url"]} for r in rows]
@@ -1495,8 +1436,29 @@ async def _variants_db_save(
         """
         INSERT INTO public.sekaicard_variants(page_id, label, url, updated_at)
         VALUES ($1, $2, $3, now())
-    """,
+        """,
         [(page_id, v["label"], v["url"]) for v in variants],
+    )
+
+
+async def _meta_get(conn: asyncpg.Connection, key: str) -> Optional[str]:
+    row = await conn.fetchrow(
+        "SELECT value FROM public.sekaicards_meta WHERE key=$1 LIMIT 1", key
+    )
+    return row["value"] if row else None
+
+
+async def _meta_set(conn: asyncpg.Connection, key: str, value: str) -> None:
+    await conn.execute(
+        """
+        INSERT INTO public.sekaicards_meta(key, value, updated_at)
+        VALUES ($1, $2, now())
+        ON CONFLICT (key) DO UPDATE
+          SET value = EXCLUDED.value,
+              updated_at = now()
+        """,
+        key,
+        value,
     )
 
 
@@ -1646,7 +1608,7 @@ def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
     return f"https://sekaipedia.org/wiki/Special:FilePath/{safe_name}?width={width}"
 
 
-# =================== NUEVO: Parser robusto del wikitext de List_of_cards ===================
+# =================== Parser robusto del wikitext de List_of_cards ===================
 def _strip_wiki_markup(s: str) -> str:
     s = re.sub(r"\{\{.*?\}\}", "", s, flags=re.S)  # templates
     s = re.sub(r"<.*?>", "", s, flags=re.S)  # html
@@ -1676,80 +1638,85 @@ def _cells_from_row(row: str) -> List[str]:
 
 
 def _extract_wikitable_blocks(wikitext: str) -> List[str]:
-    # Captura todas las wikitables completas: {| ... |}
+    # Dejado por compatibilidad, aunque el parseo real ya no depende de esto.
     return re.findall(r"\{\|.*?\n\|\}", wikitext, flags=re.S)
 
 
 def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
     """
-    Parseo tolerante: recorre todas las wikitables, extrae filas con:
-      - id numérico en la primera celda
-      - link [[...]] en la segunda celda (o en alguna celda cercana)
-      - primer File:... para thumb (si existe)
+    Parseo tolerante por filas: recorre todos los bloques separados por '\n|-'
+    y extrae filas que parezcan filas de tabla de cartas:
+
+      - Primera celda con un ID numérico.
+      - Algún [[Page|Name]] en la misma fila o cerca.
+      - Primer File:... para thumb (si existe).
+
+    Esto evita depender demasiado de los límites exactos de las wikitables.
     """
+    if not wikitext:
+        return []
+
+    text = (
+        wikitext.replace("\r\n", "\n")
+        .replace("\r", "\n")
+        .replace("\u00a0", " ")
+    )
+
     items: List[Dict] = []
 
-    tables = _extract_wikitable_blocks(wikitext)
-    if not tables:
-        # fallback: intentar split simple si no matchea
-        tables = re.split(r"\n\|\}", wikitext)
-
-    for table in tables:
-        # saltamos tablas irrelevantes si definitivamente no tienen IDs numéricos
-        if not re.search(r"\b\d{1,6}\b", table):
+    # Cada bloque suele ser una fila de tabla o algo cercano
+    rows = re.split(r"\n\|-\s*", text)
+    for row in rows:
+        # Atajo: si no hay ningún '|' de datos, saltamos rápido
+        if "|" not in row:
             continue
 
-        rows = re.split(r"\n\|-+", table)
-        for row in rows:
-            # ignorar headers
-            if row.strip().startswith("!"):
-                continue
-            if "! " in row:
-                continue
+        cells = _cells_from_row(row)
+        if not cells:
+            continue
 
-            cells = _cells_from_row(row)
-            if not cells:
-                continue
+        # 1) ID
+        id_cell = _strip_wiki_markup(cells[0])
+        m_id = re.search(r"\b(\d{1,6})\b", id_cell)
+        if not m_id:
+            m_id = re.search(r"\b(\d{1,6})\b", row)
+        if not m_id:
+            continue
+        card_id = m_id.group(1)
 
-            # 1) ID (buscar en la primera celda, y si falla, en toda la fila)
-            id_cell = _strip_wiki_markup(cells[0])
-            m_id = re.search(r"\b(\d{1,6})\b", id_cell)
-            if not m_id:
-                m_id = re.search(r"\b(\d{1,6})\b", row)
-            if not m_id:
-                continue
-            card_id = m_id.group(1)
+        # 2) Nombre + href
+        name_cell = cells[1] if len(cells) >= 2 else row
+        m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
+        if not m_name:
+            m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", row)
+        if m_name:
+            page_title = m_name.group(1).strip()
+            display_name = (m_name.group(2) or page_title).strip()
+        else:
+            display_name = _strip_wiki_markup(name_cell)
+            page_title = display_name.replace(" ", "_")
 
-            # 2) Nombre + href: preferimos celda 2 si existe; si no, buscamos primer [[...]]
-            name_cell = cells[1] if len(cells) >= 2 else row
-            m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
-            if not m_name:
-                m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", row)
-            if m_name:
-                page_title = m_name.group(1).strip()
-                display_name = (m_name.group(2) or page_title).strip()
-            else:
-                display_name = _strip_wiki_markup(name_cell)
-                page_title = display_name.replace(" ", "_")
+        href = f"https://sekaipedia.org/wiki/{page_title.replace(' ', '_')}"
 
-            href = f"https://sekaipedia.org/wiki/{page_title.replace(' ', '_')}"
+        # 3) imagen (thumb) – primer File:... encontrado en el bloque
+        m_file = re.search(r"\[\[\s*File:([^|\]]+)", row, flags=re.I)
+        thumb_url = (
+            _build_thumb_from_filename(m_file.group(1), width=256)
+            if m_file
+            else None
+        )
 
-            # 3) imagen (thumb)
-            m_file = re.search(r"\[\[\s*File:([^|\]]+)", row, flags=re.I)
-            thumb_url = (
-                _build_thumb_from_filename(m_file.group(1), width=256)
-                if m_file
-                else None
-            )
+        items.append(
+            {"id": card_id, "name": display_name, "href": href, "thumb": thumb_url}
+        )
 
-            items.append(
-                {"id": card_id, "name": display_name, "href": href, "thumb": thumb_url}
-            )
-
+    # Deduplicar por id y ordenar
     seen = set()
     out: List[Dict] = []
     for it in items:
-        cid = str(it.get("id"))
+        cid = str(it.get("id") or "").strip()
+        if not cid or not re.fullmatch(r"\d+", cid):
+            continue
         if cid in seen:
             continue
         seen.add(cid)
@@ -1771,7 +1738,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     y fallback a action=parse si no viene content.
     """
     async with httpx.AsyncClient() as client:
-        # 1) Preferido: revisions content (menos propenso a truncar)
+        # 1) Preferido: revisions content
         data = await _get_json(
             client,
             SEKAIPEDIA_API,
@@ -1819,14 +1786,38 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     return _parse_cards_from_wikitext(wikitext)
 
 
-# =================== AUTO REFRESH (actualizado) ===================
+# ---------- Helper: revid actual de List_of_cards ----------
+async def _get_list_of_cards_revid() -> Optional[int]:
+    async with httpx.AsyncClient() as client:
+        data = await _get_json(
+            client,
+            SEKAIPEDIA_API,
+            {
+                "action": "query",
+                "prop": "revisions",
+                "rvprop": "ids",
+                "titles": "List_of_cards",
+                "format": "json",
+                "formatversion": 2,
+            },
+        )
+    try:
+        pages = (data.get("query") or {}).get("pages") or []
+        revs = pages[0].get("revisions") or []
+        return int(revs[0].get("revid")) if revs else None
+    except Exception:
+        return None
+
+
+# ---------- AUTO REFRESH (background) con revid ----------
 async def _refresh_cards_once() -> None:
     """
-    Refresca cartas cuando corresponde:
-      - Chequea revid de List_of_cards (barato).
-      - Si no cambió y BD está fresca => no hace nada.
-      - Si cambió => scrape + upsert.
-      - Si revid falla (None) => se comporta como antes: solo refresca si BD NO está fresca.
+    Refresca cartas si:
+      - el revid de List_of_cards cambió, o
+      - aún no tenemos revid almacenado,
+      Y en ambos casos actualiza BD + cache.
+
+    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
     """
     if not db_pool:
         return
@@ -1836,18 +1827,18 @@ async def _refresh_cards_once() -> None:
             current_revid = await _get_list_of_cards_revid()
 
             async with db_pool.acquire() as conn:
-                db_fresh = await _cards_db_is_fresh(conn)
                 stored_revid = await _meta_get(conn, "list_of_cards_revid")
 
-            # Si no podemos obtener revid, no spameamos: solo refrescamos si el TTL venció.
-            if current_revid is None:
-                if db_fresh:
-                    return
-            else:
-                # Si no cambió y BD está fresca, no hacemos nada.
-                if stored_revid is not None and str(current_revid) == str(stored_revid) and db_fresh:
+                if (
+                    current_revid is not None
+                    and stored_revid is not None
+                    and str(current_revid) == str(stored_revid)
+                    and await _cards_db_is_fresh(conn)
+                ):
+                    # Nada que hacer: misma revisión y datos frescos
                     return
 
+            # O bien cambió el revid, o no tenemos meta: scrapeamos
             items = await _scrape_cards_from_sekaipedia()
             if not items:
                 return
@@ -1859,8 +1850,10 @@ async def _refresh_cards_once() -> None:
 
             _cards_cache["items"] = items
             _cards_cache["ts"] = datetime.now(timezone.utc)
-            print(f"✅ Cards refreshed (auto): {len(items)} revid={current_revid}")
-
+            print(
+                f"✅ Cards refreshed (auto): {len(items)}"
+                f" (revid={current_revid})"
+            )
         except Exception:
             traceback.print_exc()
 
@@ -1877,12 +1870,12 @@ async def _refresh_cards_forever() -> None:
             pass
 
 
-# =================== API: /auth02/cards (con persistencia + force refresh) ===================
-def _cards_json(items: List[Dict]) -> JSONResponse:
-    # Evita caché agresivo de navegador/CDN para que el usuario vea cambios al instante.
+def _cards_response(items: List[Dict]) -> JSONResponse:
+    # Evitar cache agresivo del navegador / CDN
     return JSONResponse(items, headers={"Cache-Control": "no-store"})
 
 
+# =================== API: /auth02/cards (con persistencia + force refresh) ===================
 @app.get("/auth02/cards")
 async def auth02_cards(
     request: Request,
@@ -1907,12 +1900,17 @@ async def auth02_cards(
         async with db_pool.acquire() as conn:
             try:
                 if await _cards_db_is_fresh(conn):
-                    return _cards_json(await _cards_db_all(conn))
+                    items = await _cards_db_all(conn)
+                    return _cards_response(items)
             except Exception:
                 traceback.print_exc()
 
-    if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-        return _cards_json(_cards_cache["items"])  # type: ignore[arg-type]
+    if (
+        not force
+        and _cards_cache["items"]
+        and now - _cards_cache["ts"] < CARDS_TTL
+    ):
+        return _cards_response(_cards_cache["items"])  # type: ignore[arg-type]
 
     async with _cards_lock:
         now = datetime.now(timezone.utc)
@@ -1921,12 +1919,17 @@ async def auth02_cards(
             async with db_pool.acquire() as conn:
                 try:
                     if await _cards_db_is_fresh(conn):
-                        return _cards_json(await _cards_db_all(conn))
+                        items = await _cards_db_all(conn)
+                        return _cards_response(items)
                 except Exception:
                     traceback.print_exc()
 
-        if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
-            return _cards_json(_cards_cache["items"])  # type: ignore[arg-type]
+        if (
+            not force
+            and _cards_cache["items"]
+            and now - _cards_cache["ts"] < CARDS_TTL
+        ):
+            return _cards_response(_cards_cache["items"])  # type: ignore[arg-type]
 
         try:
             items = await _scrape_cards_from_sekaipedia()
@@ -1935,7 +1938,7 @@ async def auth02_cards(
                     async with db_pool.acquire() as conn:
                         existing = await _cards_db_all(conn)
                         if existing:
-                            return _cards_json(existing)
+                            return _cards_response(existing)
                 raise HTTPException(
                     status_code=503, detail="Upstream unavailable or parse error"
                 )
@@ -1946,16 +1949,8 @@ async def auth02_cards(
             if db_pool:
                 async with db_pool.acquire() as conn:
                     await _cards_db_upsert_many(conn, items)
-                    # Si podemos, actualizamos meta con revid actual para alinear refresher.
-                    try:
-                        rv = await _get_list_of_cards_revid()
-                        if rv is not None:
-                            await _meta_set(conn, "list_of_cards_revid", str(rv))
-                    except Exception:
-                        pass
 
-            return _cards_json(items)
-
+            return _cards_response(items)
         except HTTPException:
             raise
         except Exception as e:
@@ -1964,7 +1959,7 @@ async def auth02_cards(
                 async with db_pool.acquire() as conn:
                     existing = await _cards_db_all(conn)
                     if existing:
-                        return _cards_json(existing)
+                        return _cards_response(existing)
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
 
