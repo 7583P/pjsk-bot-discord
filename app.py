@@ -1291,6 +1291,7 @@ async def get_match_songs(result_id: int):
     ]
 
 
+
 # =================== Sekaipedia: anti-bot friendly ===================
 SEKAIPEDIA_LIST = "https://sekaipedia.org/wiki/List_of_cards"
 SEKAIPEDIA_API = "https://sekaipedia.org/w/api.php"
@@ -1302,6 +1303,9 @@ SEKAIPEDIA_API = "https://sekaipedia.org/w/api.php"
 CARDS_REV_CHECK_MIN = int(os.getenv("CARDS_REV_CHECK_MIN", "10"))
 CARDS_POLL_MIN = int(os.getenv("CARDS_POLL_MIN", str(CARDS_REV_CHECK_MIN)))
 CARDS_FULL_TTL_HOURS = int(os.getenv("CARDS_FULL_TTL_HOURS", "24"))
+
+# Ancho de imagen (thumb) al pedir a la API (PFPS suelen ir bien con 512–1024)
+CARD_IMG_WIDTH = int(os.getenv("CARD_IMG_WIDTH", "512"))
 
 CARDS_REV_CHECK_TTL = timedelta(minutes=max(1, CARDS_REV_CHECK_MIN))
 CARDS_POLL_TTL = timedelta(minutes=max(1, CARDS_POLL_MIN))
@@ -1463,7 +1467,7 @@ async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> 
     )
 
 
-# ✅ UPDATED: orden Thumb -> Untrained -> Trained
+# ✅ Orden Thumb -> Untrained -> Trained
 async def _variants_db_get(
     conn: asyncpg.Connection, page_id: int
 ) -> Tuple[List[Dict], Optional[datetime]]:
@@ -1761,13 +1765,16 @@ async def _refresh_cards_forever() -> None:
 # =================== API: /auth02/cards ===================
 async def _cards_meta_payload(conn: asyncpg.Connection) -> Dict[str, Any]:
     count = await _cards_db_count(conn)
+    list_rev_ts = await _meta_get(conn, "list_rev_ts")
     return {
         "ok": True,
         "revId": await _meta_get(conn, "list_rev_id"),
+        # compat: algunos frontends usan revTs
+        "revTs": list_rev_ts,
+        "listRevTs": list_rev_ts,
         "count": count,
         "verifiedAt": await _meta_get(conn, "cards_verified_at"),
         "fetchedAt": await _meta_get(conn, "cards_fetched_at"),
-        "listRevTs": await _meta_get(conn, "list_rev_ts"),
         "serverTs": _dt_to_iso(_now_utc()),
         "source": "db",
     }
@@ -1792,7 +1799,7 @@ async def auth02_cards(
 
     if not db_pool:
         if meta:
-            return JSONResponse({"ok": False, "revId": None, "count": 0}, headers=no_cache_headers)
+            return JSONResponse({"ok": False, "revId": None, "revTs": None, "count": 0}, headers=no_cache_headers)
         return JSONResponse([], headers=no_cache_headers)
 
     if meta:
@@ -1852,36 +1859,35 @@ _BAD_KEYWORDS = [
     "joke",
 ]
 
+# patrones más robustos (los nombres de archivo varían mucho)
+_TRAINED_RE = re.compile(r"(trained|after[_\- ]?training|idolized|evolv(ed|e)|aftertrain)", re.I)
+_UNTRAINED_RE = re.compile(r"(untrained|before[_\- ]?training|base|normal|default|beforetrain)", re.I)
+
 
 def _filename_from_url(u: str) -> str:
     try:
-        return urlparse(u).path.rsplit("/", 1)[-1].lower()
+        path = urlparse(u).path
+        return path.rsplit("/", 1)[-1].lower()
     except Exception:
-        return u.lower()
+        return (u or "").lower()
 
 
 def _is_trained(fn: str) -> bool:
-    s = fn.lower()
-    return ("trained" in s) or ("after training" in s) or ("idolized" in s)
+    return bool(_TRAINED_RE.search(fn or ""))
 
 
 def _is_untrained(fn: str) -> bool:
-    s = fn.lower()
-    return (
-        ("untrained" in s)
-        or ("before training" in s)
-        or ("base" in s)
-        or ("normal" in s)
-    )
+    return bool(_UNTRAINED_RE.search(fn or ""))
 
 
 def _looks_card_image(fn: str) -> bool:
-    if any(bad in fn for bad in _BAD_KEYWORDS):
+    s = (fn or "").lower()
+    if any(bad in s for bad in _BAD_KEYWORDS):
         return False
-    return fn.endswith((".png", ".jpg", ".jpeg", ".webp"))
+    return s.endswith((".png", ".jpg", ".jpeg", ".webp"))
 
 
-def _prefer_square(links: List[str]) -> List[str]:
+def _prefer_unique(links: List[str]) -> List[str]:
     seen, out = set(), []
     for u in links:
         if u and u not in seen:
@@ -1900,8 +1906,13 @@ def _page_title_from_href(href: str) -> str:
 
 
 async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
+    """
+    1) listamos "images" del page (File:...)
+    2) resolvemos urls con imageinfo y un thumb (iiurlwidth configurable)
+    """
     if not page_title:
         return []
+
     data1 = await _get_json(
         client,
         SEKAIPEDIA_API,
@@ -1920,8 +1931,10 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
             t = it.get("title", "")
             if t.startswith("File:"):
                 file_titles.append(t)
+
     if not file_titles:
         return []
+
     urls: List[str] = []
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i : i + 50]
@@ -1933,21 +1946,25 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
                 "titles": "|".join(chunk),
                 "prop": "imageinfo",
                 "iiprop": "url|size|mime",
-                "iiurlwidth": "512",
+                "iiurlwidth": str(max(256, min(2048, CARD_IMG_WIDTH))),
                 "format": "json",
             },
         )
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
             for ii in finfo.get("imageinfo") or []:
+                # preferimos thumb para peso, pero si no, url original
                 url = ii.get("thumburl") or ii.get("url")
                 if url:
                     urls.append(_abs_sekaipedia(url))
         await _sleep_jitter(0.2, 0.5)
-    return _prefer_square(urls)
+
+    return _prefer_unique(urls)
 
 
-# ✅ UPDATED: devuelve Untrained + Trained (si existen)
 async def _scrape_card_variants(href: str) -> Dict:
+    """
+    Devuelve (Untrained + Trained) según el naming de archivos en la wiki.
+    """
     page_title = _page_title_from_href(href)
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
@@ -1967,6 +1984,7 @@ async def _scrape_card_variants(href: str) -> Dict:
         else:
             other_links.append(u)
 
+    # elección principal
     untrained_url = untrained_links[0] if untrained_links else None
     trained_url = trained_links[0] if trained_links else None
 
@@ -1975,6 +1993,7 @@ async def _scrape_card_variants(href: str) -> Dict:
         untrained_url = other_links[0]
     if not trained_url and len(other_links) >= 2:
         trained_url = other_links[1]
+
     if trained_url == untrained_url:
         trained_url = None
 
@@ -1987,10 +2006,10 @@ async def _scrape_card_variants(href: str) -> Dict:
     return {"name": page_title, "variants": variants}
 
 
-@app.get("/auth02/card-variants")
-async def get_card_variants(
-    href: str = Query(..., description="URL absoluta de la Card:")
-) -> Dict:
+async def _get_card_variants_for_href(href: str) -> Dict[str, Any]:
+    """
+    Misma lógica que el endpoint, pero reusable (por ejemplo en batch).
+    """
     page_title = _page_title_from_href(href)
 
     page_id: Optional[int] = None
@@ -2035,7 +2054,7 @@ async def get_card_variants(
     # Thumb primero
     add("Thumb", thumb_url)
 
-    # luego Untrained/Trained (normalizando etiquetas por si vienen raras)
+    # luego Untrained/Trained
     for v in scraped_variants:
         lab = (v.get("label") or "").strip()
         url = v.get("url")
@@ -2054,6 +2073,38 @@ async def get_card_variants(
         traceback.print_exc()
 
     return {"name": page_title, "variants": final}
+
+
+@app.get("/auth02/card-variants")
+async def get_card_variants(
+    href: str = Query(..., description="URL absoluta de la Card:")
+) -> Dict:
+    return await _get_card_variants_for_href(href)
+
+
+# (Opcional) Batch: útil si quieres cargar variantes de varias cartas sin N requests.
+class CardVariantsBatchIn(BaseModel):
+    hrefs: List[str]
+
+
+@app.post("/auth02/card-variants/batch")
+async def get_card_variants_batch(body: CardVariantsBatchIn) -> Dict[str, Any]:
+    hrefs = [h for h in (body.hrefs or []) if isinstance(h, str) and h.strip()]
+    hrefs = hrefs[:200]  # límite razonable
+
+    sem = asyncio.Semaphore(6)
+
+    async def one(h: str):
+        async with sem:
+            try:
+                return h, await _get_card_variants_for_href(h)
+            except Exception:
+                traceback.print_exc()
+                return h, {"name": _page_title_from_href(h), "variants": []}
+
+    pairs = await asyncio.gather(*[one(h) for h in hrefs])
+    return {"ok": True, "items": {k: v for (k, v) in pairs}}
+
 
 
 # =================== Static ===================
