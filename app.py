@@ -5,6 +5,7 @@ import traceback
 import asyncio
 import random
 import unicodedata
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional, Tuple, Any
 from urllib.parse import urlparse, unquote, quote
@@ -19,6 +20,13 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel  # para el modelo de canciones
 
 load_dotenv()
+
+# ========================= LOGGING =========================
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s :: %(message)s",
+)
+logger = logging.getLogger("app")
 
 # ========================= ENV =========================
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
@@ -181,21 +189,22 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         )
         RESULTS_TEXT_COL = row["column_name"] if row else None
 
-        print(
-            "🔎 Schema:"
-            f" players.discord_id={HAS_DISCORD_ID_COL}"
-            f" players.in_guild={PLAYERS_HAS_IN_GUILD}"
-            f" | seasons.active={SEASONS_HAS_ACTIVE}"
-            f" name={SEASONS_HAS_NAME}"
-            f" starts_at={SEASONS_HAS_STARTS_AT}"
-            f" ends_at={SEASONS_HAS_ENDS_AT}"
-            f" | seasonplayers.wins={SP_HAS_WINS}"
-            f" losses={SP_HAS_LOSSES}"
-            f" games_played={SP_HAS_GAMES_PLAYED}"
-            f" | matches_table={HAS_MATCHES_TABLE}"
-            f" matchplayers_table={HAS_MATCHPLAYERS_TABLE}"
-            f" | user_id_type={USER_ID_SQLTYPE}"
-            f" | results_text_col={RESULTS_TEXT_COL}"
+        logger.info(
+            "🔎 Schema: players.discord_id=%s players.in_guild=%s | seasons.active=%s name=%s starts_at=%s ends_at=%s | "
+            "seasonplayers.wins=%s losses=%s games_played=%s | matches_table=%s matchplayers_table=%s | user_id_type=%s | results_text_col=%s",
+            HAS_DISCORD_ID_COL,
+            PLAYERS_HAS_IN_GUILD,
+            SEASONS_HAS_ACTIVE,
+            SEASONS_HAS_NAME,
+            SEASONS_HAS_STARTS_AT,
+            SEASONS_HAS_ENDS_AT,
+            SP_HAS_WINS,
+            SP_HAS_LOSSES,
+            SP_HAS_GAMES_PLAYED,
+            HAS_MATCHES_TABLE,
+            HAS_MATCHPLAYERS_TABLE,
+            USER_ID_SQLTYPE,
+            RESULTS_TEXT_COL,
         )
     except Exception:
         traceback.print_exc()
@@ -212,7 +221,7 @@ async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
     try:
         HAS_MATCHES_TABLE = await _has_col(conn, "match_history", "season_id")
         if HAS_MATCHES_TABLE:
-            print("✅ match_history detected at runtime")
+            logger.info("✅ match_history detected at runtime")
     except Exception:
         traceback.print_exc()
 
@@ -222,7 +231,7 @@ async def startup():
     global db_pool, _cards_task, _cards_stop
 
     if not DATABASE_URL:
-        print("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
+        logger.warning("⚠️ DATABASE_URL is empty. /api endpoints will raise 500")
         return
 
     db_pool = await asyncpg.create_pool(
@@ -232,7 +241,7 @@ async def startup():
         timeout=10.0,
         command_timeout=30.0,
     )
-    print("✅ DB pool initialized")
+    logger.info("✅ DB pool initialized")
 
     async with db_pool.acquire() as conn:
         await _detect_schema(conn)
@@ -306,7 +315,7 @@ async def shutdown():
 
     if db_pool:
         await db_pool.close()
-        print("🛑 DB pool closed")
+        logger.info("🛑 DB pool closed")
 
 
 # ======================= Helpers: Seasons =======================
@@ -522,7 +531,7 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
         if user_res.status_code != 200:
             raise HTTPException(400, f"Discord user fetch failed: {user_res.text}")
         user = user_res.json()
-        print("OAuth OK user:", user.get("id"), user.get("username"))
+        logger.info("OAuth OK user: %s %s", user.get("id"), user.get("username"))
 
     sid = secrets.token_hex(24)
     SESSIONS[sid] = {"id": str(user.get("id")), "username": user.get("username")}
@@ -1324,46 +1333,8 @@ _cards_lock = asyncio.Lock()
 _cards_stop = asyncio.Event()
 _cards_task: Optional[asyncio.Task] = None
 
-
-async def _refresh_cards_once() -> None:
-    """
-    Refresca cartas si la BD no está fresca.
-    Actualiza BD + cache en memoria.
-    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
-    """
-    if not db_pool:
-        return
-
-    async with _cards_lock:
-        try:
-            async with db_pool.acquire() as conn:
-                if await _cards_db_is_fresh(conn):
-                    return
-
-            items = await _scrape_cards_from_sekaipedia()
-            if not items:
-                return
-
-            async with db_pool.acquire() as conn:
-                await _cards_db_upsert_many(conn, items)
-
-            _cards_cache["items"] = items
-            _cards_cache["ts"] = datetime.now(timezone.utc)
-            print(f"✅ Cards refreshed (auto): {len(items)}")
-        except Exception:
-            traceback.print_exc()
-
-
-async def _refresh_cards_forever() -> None:
-    await asyncio.sleep(3)
-    while not _cards_stop.is_set():
-        await _refresh_cards_once()
-        try:
-            await asyncio.wait_for(
-                _cards_stop.wait(), timeout=CARDS_TTL.total_seconds()
-            )
-        except asyncio.TimeoutError:
-            pass
+# Heurística de "incompleto": si baja de 90% del conteo previo, asumimos truncado/fallo upstream.
+CARDS_INCOMPLETE_RATIO = float(os.getenv("CARDS_INCOMPLETE_RATIO", "0.90"))
 
 
 async def _sleep_jitter(a=0.15, b=0.5):
@@ -1416,6 +1387,11 @@ async def _cards_db_all(conn: asyncpg.Connection) -> List[Dict]:
     ]
 
 
+async def _cards_db_count(conn: asyncpg.Connection) -> int:
+    row = await conn.fetchrow("SELECT COUNT(*) AS n FROM public.sekaicards")
+    return int(row["n"] or 0)
+
+
 async def _cards_db_upsert_many(conn: asyncpg.Connection, items: List[Dict]) -> None:
     if not items:
         return
@@ -1448,7 +1424,13 @@ async def _variants_db_get(
         SELECT label, url, updated_at
         FROM public.sekaicard_variants
         WHERE page_id=$1
-        ORDER BY CASE label WHEN 'Thumb' THEN 0 WHEN 'Trained' THEN 1 ELSE 2 END, label
+        ORDER BY
+          CASE
+            WHEN label = 'Untrained' THEN 0
+            WHEN label = 'Trained'   THEN 1
+            ELSE 2
+          END,
+          label
     """,
         page_id,
     )
@@ -1594,25 +1576,51 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
 
 
 async def _scrape_card_variants(href: str) -> Dict:
+    """
+    Devuelve variantes separadas:
+      - Untrained
+      - Trained
+    Nota: el "thumb" de la lista se usa como fallback de Untrained en el endpoint (si no se detecta untrained).
+    """
     page_title = _page_title_from_href(href)
-    async with httpx.AsyncClient() as client:
-        urls = await _fetch_page_images(client, page_title)
-    clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
-    trained_links: List[str] = []
-    untrained_links: List[str] = []
-    for u in clean_urls:
-        fn = _filename_from_url(u)
-        if _is_trained(fn):
-            trained_links.append(u)
-        elif _is_untrained(fn):
-            untrained_links.append(u)
-    trained_url = trained_links[0] if trained_links else None
-    return {
-        "name": page_title,
-        "variants": (
-            [] + ([{"label": "Trained", "url": trained_url}] if trained_url else [])
-        ),
-    }
+    stage = "start"
+    try:
+        stage = "fetch_images"
+        async with httpx.AsyncClient() as client:
+            urls = await _fetch_page_images(client, page_title)
+
+        stage = "filter_images"
+        clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
+
+        trained_links: List[str] = []
+        untrained_links: List[str] = []
+        for u in clean_urls:
+            fn = _filename_from_url(u)
+            if _is_trained(fn):
+                trained_links.append(u)
+            elif _is_untrained(fn):
+                untrained_links.append(u)
+
+        trained_url = trained_links[0] if trained_links else None
+        untrained_url = untrained_links[0] if untrained_links else None
+
+        if not urls:
+            logger.error("[variants] no images found via MediaWiki images for page=%s href=%s", page_title, href)
+        if urls and not clean_urls:
+            logger.error("[variants] images found but none passed filter for page=%s href=%s count=%s", page_title, href, len(urls))
+        if clean_urls and not (trained_url or untrained_url):
+            logger.error("[variants] no trained/untrained matched after filter page=%s href=%s clean=%s", page_title, href, len(clean_urls))
+
+        variants = []
+        if untrained_url:
+            variants.append({"label": "Untrained", "url": untrained_url})
+        if trained_url:
+            variants.append({"label": "Trained", "url": trained_url})
+
+        return {"name": page_title, "variants": variants}
+    except Exception as e:
+        logger.exception("[variants] scrape failed stage=%s page=%s href=%s error=%s", stage, page_title, href, str(e))
+        raise
 
 
 def _build_thumb_from_filename(filename: str, width: int = 256) -> str:
@@ -1654,20 +1662,22 @@ def _extract_wikitable_blocks(wikitext: str) -> List[str]:
     return re.findall(r"\{\|.*?\n\|\}", wikitext, flags=re.S)
 
 
-def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
+def _parse_cards_from_wikitext(wikitext: str) -> Tuple[List[Dict], Dict[str, int]]:
     """
     Parseo tolerante: recorre todas las wikitables, extrae filas con:
       - id numérico en la primera celda
       - link [[...]] en la segunda celda (o en alguna celda cercana)
       - primer File:... para thumb (si existe)
+
+    Retorna (items, diag)
     """
     items: List[Dict] = []
-
     tables = _extract_wikitable_blocks(wikitext)
     if not tables:
         # fallback: intentar split simple si no matchea
         tables = re.split(r"\n\|\}", wikitext)
 
+    rows_scanned = 0
     for table in tables:
         # saltamos tablas irrelevantes si definitivamente no tienen IDs numéricos
         if not re.search(r"\b\d{1,6}\b", table):
@@ -1675,6 +1685,7 @@ def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
 
         rows = re.split(r"\n\|-+", table)
         for row in rows:
+            rows_scanned += 1
             # ignorar headers
             if row.strip().startswith("!"):
                 continue
@@ -1694,7 +1705,7 @@ def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
                 continue
             card_id = m_id.group(1)
 
-            # 2) Nombre + href: preferimos celda 2 si existe; si no, buscamos primer [[...]]
+            # 2) Nombre + href
             name_cell = cells[1] if len(cells) >= 2 else row
             m_name = re.search(r"\[\[([^|\]]+)(?:\|([^]]+))?\]\]", name_cell)
             if not m_name:
@@ -1734,7 +1745,13 @@ def _parse_cards_from_wikitext(wikitext: str) -> List[Dict]:
     except Exception:
         pass
 
-    return out
+    diag = {
+        "tables_found": len(tables),
+        "rows_scanned": rows_scanned,
+        "items_raw": len(items),
+        "items_dedup": len(out),
+    }
+    return out, diag
 
 
 # ---------- Scraper real: página única List_of_cards (sin límites) ----------
@@ -1743,9 +1760,14 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
     Lee el wikitext de "List_of_cards" y lo parsea.
     Usa action=query+revisions (más estable para payloads grandes),
     y fallback a action=parse si no viene content.
+
+    Logs detallados de fallos / parse incompleto.
     """
+    stage = "start"
+    t0 = datetime.now(timezone.utc)
     async with httpx.AsyncClient() as client:
         # 1) Preferido: revisions content (menos propenso a truncar)
+        stage = "fetch_revisions"
         data = await _get_json(
             client,
             SEKAIPEDIA_API,
@@ -1773,6 +1795,7 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
 
         # 2) Fallback: action=parse
         if not wikitext:
+            stage = "fetch_parse_fallback"
             data2 = await _get_json(
                 client,
                 SEKAIPEDIA_API,
@@ -1788,9 +1811,79 @@ async def _scrape_cards_from_sekaipedia() -> List[Dict]:
             wikitext = parse.get("wikitext") or ""
 
     if not wikitext:
+        logger.error("[cards] wikitext empty stage=%s (upstream returned no content)", stage)
         return []
 
-    return _parse_cards_from_wikitext(wikitext)
+    stage = "parse_wikitext"
+    items, diag = _parse_cards_from_wikitext(wikitext)
+
+    elapsed_ms = int((datetime.now(timezone.utc) - t0).total_seconds() * 1000)
+    logger.info("[cards] parse done ms=%s diag=%s", elapsed_ms, diag)
+
+    # sanity minimum: si devuelve demasiado poco, lo tratamos como fallo (no como lista válida)
+    if len(items) < 200:
+        logger.error("[cards] parse produced too few items count=%s diag=%s", len(items), diag)
+        return []
+
+    return items
+
+
+async def _refresh_cards_once() -> None:
+    """
+    Refresca cartas si la BD no está fresca.
+    Actualiza BD + cache en memoria.
+    Usa _cards_lock para evitar scrapes concurrentes con /auth02/cards.
+
+    Si el scrape devuelve "menos de 90% (configurable)" del conteo previo en BD,
+    se considera INCOMPLETO y se loggea error (sin pisar DB).
+    """
+    if not db_pool:
+        return
+
+    async with _cards_lock:
+        try:
+            async with db_pool.acquire() as conn:
+                if await _cards_db_is_fresh(conn):
+                    return
+                old_count = await _cards_db_count(conn)
+
+            stage = "scrape"
+            items = await _scrape_cards_from_sekaipedia()
+            if not items:
+                logger.error("[cards] refresh failed: scrape returned 0 items stage=%s", stage)
+                return
+
+            new_count = len(items)
+            if old_count and new_count < int(old_count * CARDS_INCOMPLETE_RATIO):
+                logger.error(
+                    "[cards] INCOMPLETE scrape detected (auto). old=%s new=%s ratio=%s -> SKIP DB update",
+                    old_count,
+                    new_count,
+                    CARDS_INCOMPLETE_RATIO,
+                )
+                return
+
+            stage = "db_upsert"
+            async with db_pool.acquire() as conn:
+                await _cards_db_upsert_many(conn, items)
+
+            _cards_cache["items"] = items
+            _cards_cache["ts"] = datetime.now(timezone.utc)
+            logger.info("✅ Cards refreshed (auto): %s (old_db=%s)", len(items), old_count)
+        except Exception as e:
+            logger.exception("[cards] refresh failed (auto) error=%s", str(e))
+
+
+async def _refresh_cards_forever() -> None:
+    await asyncio.sleep(3)
+    while not _cards_stop.is_set():
+        await _refresh_cards_once()
+        try:
+            await asyncio.wait_for(
+                _cards_stop.wait(), timeout=CARDS_TTL.total_seconds()
+            )
+        except asyncio.TimeoutError:
+            pass
 
 
 # =================== API: /auth02/cards (con persistencia + force refresh) ===================
@@ -1805,6 +1898,9 @@ async def auth02_cards(
     - Por defecto, usa BD/cache si está fresco.
     - Si force=1, ignora freshness y fuerza scrape + upsert.
       Protegido por sesión (cookie sid) para evitar abuso.
+
+    Si el scrape devuelve una lista INCOMPLETA (menos de 90% del conteo previo en BD),
+    se loggea error y NO se pisa la BD; se devuelve la lista existente si hay.
     """
     force = bool(force)
     if force:
@@ -1828,6 +1924,7 @@ async def auth02_cards(
     async with _cards_lock:
         now = datetime.now(timezone.utc)
 
+        # recheck dentro del lock
         if not force and db_pool:
             async with db_pool.acquire() as conn:
                 try:
@@ -1839,16 +1936,42 @@ async def auth02_cards(
         if not force and _cards_cache["items"] and now - _cards_cache["ts"] < CARDS_TTL:
             return _cards_cache["items"]
 
+        old_count = 0
+        existing: List[Dict] = []
+        if db_pool:
+            async with db_pool.acquire() as conn:
+                try:
+                    old_count = await _cards_db_count(conn)
+                    existing = await _cards_db_all(conn)
+                except Exception:
+                    traceback.print_exc()
+                    old_count = 0
+                    existing = []
+
+        stage = "scrape"
         try:
             items = await _scrape_cards_from_sekaipedia()
             if not items:
-                if db_pool:
-                    async with db_pool.acquire() as conn:
-                        existing = await _cards_db_all(conn)
-                        if existing:
-                            return existing
+                logger.error("[cards] scrape returned 0 items stage=%s force=%s", stage, force)
+                if existing:
+                    return existing
                 raise HTTPException(
                     status_code=503, detail="Upstream unavailable or parse error"
+                )
+
+            new_count = len(items)
+            if old_count and new_count < int(old_count * CARDS_INCOMPLETE_RATIO):
+                logger.error(
+                    "[cards] INCOMPLETE scrape detected (/auth02/cards). old=%s new=%s ratio=%s -> KEEP EXISTING",
+                    old_count,
+                    new_count,
+                    CARDS_INCOMPLETE_RATIO,
+                )
+                if existing:
+                    return existing
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Incomplete scrape detected (old={old_count}, new={new_count})",
                 )
 
             _cards_cache["items"] = items
@@ -1856,18 +1979,17 @@ async def auth02_cards(
 
             if db_pool:
                 async with db_pool.acquire() as conn:
+                    stage = "db_upsert"
                     await _cards_db_upsert_many(conn, items)
 
+            logger.info("[cards] served fresh list count=%s old_db=%s force=%s", new_count, old_count, force)
             return items
         except HTTPException:
             raise
         except Exception as e:
-            traceback.print_exc()
-            if db_pool:
-                async with db_pool.acquire() as conn:
-                    existing = await _cards_db_all(conn)
-                    if existing:
-                        return existing
+            logger.exception("[cards] failed stage=%s error=%s", stage, str(e))
+            if existing:
+                return existing
             raise HTTPException(status_code=503, detail=f"Failed to scrape: {e}")
 
 
@@ -1876,10 +1998,19 @@ async def auth02_cards(
 async def get_card_variants(
     href: str = Query(..., description="URL absoluta de la Card:")
 ) -> Dict:
+    """
+    Devuelve variantes separadas:
+      - Untrained  (si no se detecta, fallback a thumb de sekaicards)
+      - Trained    (si se detecta)
+    Guarda cache en BD.
+    Logs detallados cuando falle el scraping o venga vacío.
+    """
     page_title = _page_title_from_href(href)
 
     page_id: Optional[int] = None
     thumb_url: Optional[str] = None
+
+    # 1) intentamos cache BD
     if db_pool:
         async with db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -1888,37 +2019,56 @@ async def get_card_variants(
             if row:
                 page_id = int(row["page_id"])
                 thumb_url = row["thumb"]
+
             if page_id:
                 variants, ts = await _variants_db_get(conn, page_id)
                 if variants and ts and (datetime.now(timezone.utc) - ts) < CARDS_TTL:
                     return {"name": page_title, "variants": variants}
 
-    data = {"name": page_title, "variants": []}
+    # 2) scrape variantes
+    scraped_variants: List[Dict] = []
     try:
         scraped = await _scrape_card_variants(href)
-        data["variants"] = scraped.get("variants", [])
+        scraped_variants = scraped.get("variants", []) or []
     except Exception:
-        traceback.print_exc()
+        # ya se loggea dentro del scraper con stage
+        scraped_variants = []
+
+    # 3) normalizar: Untrained + Trained separados
+    untrained_url = None
+    trained_url = None
+    for v in scraped_variants:
+        lbl = (v.get("label") or "").strip().lower()
+        if lbl == "untrained" and v.get("url"):
+            untrained_url = v["url"]
+        if lbl == "trained" and v.get("url"):
+            trained_url = v["url"]
 
     variants: List[Dict] = []
-    if thumb_url:
-        variants.append({"label": "Thumb", "url": thumb_url})
-    if data["variants"]:
-        for v in data["variants"]:
-            if v.get("label") == "Trained" and v.get("url") and v["url"] != thumb_url:
-                variants.append(v)
+    if untrained_url:
+        variants.append({"label": "Untrained", "url": untrained_url})
+    elif thumb_url:
+        # fallback a thumb si no hay untrained detectado
+        variants.append({"label": "Untrained", "url": thumb_url})
 
+    if trained_url:
+        variants.append({"label": "Trained", "url": trained_url})
+
+    if not variants:
+        logger.error("[variants] EMPTY response for href=%s (thumb=%s scraped=%s)", href, bool(thumb_url), len(scraped_variants))
+
+    # 4) persistir
     try:
         if db_pool and page_id:
             async with db_pool.acquire() as conn:
                 await _variants_db_save(conn, page_id, variants)
     except Exception:
-        traceback.print_exc()
+        logger.exception("[variants] failed to save variants page_id=%s href=%s", page_id, href)
 
     return {"name": page_title, "variants": variants}
 
 
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
-app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")    
+app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
 
