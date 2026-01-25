@@ -1974,6 +1974,7 @@ async def auth02_cards(
 
 
 # =================== API: /auth02/card-variants ===================
+# Nota: aquí está el fix para que NO salgan outfits/vestidos, solo imágenes de cartas.
 _BAD_KEYWORDS = [
     "banner",
     "sprite",
@@ -2000,6 +2001,36 @@ _BAD_KEYWORDS = [
     "mv",
     "promo",
     "teaser",
+    # ropa / modelos (evitar “vestidos” y assets no-card)
+    "outfit",
+    "dress",
+    "wardrobe",
+    "uniform",
+    "clothes",
+    "clothing",
+    "model",
+    "3d",
+    "live2d",
+    "l2d",
+    "mesh",
+    "rig",
+]
+
+# Penalización adicional por keywords de ropa (por si algún filename no cae en _BAD_KEYWORDS)
+_CLOTHING_KEYWORDS = [
+    "outfit",
+    "dress",
+    "wardrobe",
+    "uniform",
+    "clothes",
+    "clothing",
+    "costume",
+    "model",
+    "3d",
+    "live2d",
+    "l2d",
+    "mesh",
+    "rig",
 ]
 
 _TRAINED_RE = re.compile(
@@ -2031,6 +2062,30 @@ def _looks_card_image(fn: str) -> bool:
     if any(bad in s for bad in _BAD_KEYWORDS):
         return False
     return s.endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+
+def _looks_card_art(fn: str, card_id_hint: Optional[str] = None) -> bool:
+    """
+    Filtro estricto: intenta quedarse SOLO con artwork de carta (no outfits, no assets sueltos).
+    Reglas:
+      - Debe pasar _looks_card_image.
+      - Debe contener "card" o indicar trained/untrained en el filename.
+      - Si hay card_id_hint numérico, exige que el ID aparezca en el filename (cuando existan matches).
+    """
+    s = (fn or "").lower()
+    if not _looks_card_image(s):
+        return False
+
+    # Debe parecer imagen de carta
+    if "card" not in s and not (_is_trained(s) or _is_untrained(s)):
+        return False
+
+    # Si tenemos id, exigimos que aparezca; esto mata la mayoría de outfits
+    if card_id_hint and str(card_id_hint).isdigit():
+        if str(card_id_hint) not in s:
+            return False
+
+    return True
 
 
 def _prefer_unique(links: List[str]) -> List[str]:
@@ -2114,44 +2169,64 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
 
 async def _scrape_card_variants(href: str, card_id_hint: Optional[str] = None) -> Dict:
     """
-    Devuelve Untrained + Trained según naming.
-    Filtra fuerte por card_id_hint en filename si existe.
+    Devuelve Untrained + Trained según naming, filtrando fuerte para evitar outfits/vestidos.
     """
     page_title = _page_title_from_href(href)
     async with httpx.AsyncClient() as client:
         urls = await _fetch_page_images(client, page_title)
 
-    clean_urls_all = [u for u in urls if _looks_card_image(_filename_from_url(u))]
+    # 1) base: imágenes razonables por extensión + blacklist
+    all_imgs = [u for u in urls if _looks_card_image(_filename_from_url(u))]
 
-    clean_urls = clean_urls_all
+    # 2) estricto: parecer de carta + id (si hay)
+    strict_imgs = [
+        u for u in all_imgs if _looks_card_art(_filename_from_url(u), card_id_hint)
+    ]
+
+    # Si estricto encontró algo, usamos eso; si no, fallback a all_imgs (para no romper páginas raras)
+    candidate_imgs = strict_imgs or all_imgs
+
+    # Si hay ID, intentamos quedarnos con los que contienen el ID (solo si existen matches)
     if card_id_hint and str(card_id_hint).isdigit():
         cid = str(card_id_hint)
-        filtered = [u for u in clean_urls_all if cid in _filename_from_url(u)]
-        if filtered:
-            clean_urls = filtered
-
-    if not clean_urls:
-        clean_urls = clean_urls_all
+        id_filtered = [u for u in candidate_imgs if cid in _filename_from_url(u)]
+        if id_filtered:
+            candidate_imgs = id_filtered
 
     def score(u: str, target: str) -> int:
         fn = _filename_from_url(u)
         sc = 0
+
+        # castigo fuerte si parece ropa/modelo
+        if any(k in fn for k in _CLOTHING_KEYWORDS):
+            sc -= 2000
+
         if card_id_hint and str(card_id_hint).isdigit() and str(card_id_hint) in fn:
-            sc += 100
+            sc += 200
         if "card" in fn:
-            sc += 10
+            sc += 50
         if target == "untrained" and _is_untrained(fn):
-            sc += 50
+            sc += 150
         if target == "trained" and _is_trained(fn):
-            sc += 50
+            sc += 150
+
+        # preferir archivos que claramente sean arte (a veces "full"/"art" aparece)
+        if any(k in fn for k in ("full", "art", "illustration")):
+            sc += 10
+
         return sc
 
-    untrained_sorted = sorted(clean_urls, key=lambda u: score(u, "untrained"), reverse=True)
-    trained_sorted = sorted(clean_urls, key=lambda u: score(u, "trained"), reverse=True)
+    untrained_sorted = sorted(
+        candidate_imgs, key=lambda u: score(u, "untrained"), reverse=True
+    )
+    trained_sorted = sorted(
+        candidate_imgs, key=lambda u: score(u, "trained"), reverse=True
+    )
 
     untrained_url = untrained_sorted[0] if untrained_sorted else None
     trained_url = trained_sorted[0] if trained_sorted else None
 
+    # Evitar duplicado
     if trained_url == untrained_url:
         trained_url = None
 
@@ -2188,7 +2263,9 @@ async def _get_card_variants_for_href(href: str) -> Dict[str, Any]:
 
     scraped_variants: List[Dict] = []
     try:
-        scraped = await _scrape_card_variants(href, card_id_hint=str(page_id) if page_id else None)
+        scraped = await _scrape_card_variants(
+            href, card_id_hint=str(page_id) if page_id else None
+        )
         scraped_variants = scraped.get("variants", []) or []
     except Exception:
         traceback.print_exc()
