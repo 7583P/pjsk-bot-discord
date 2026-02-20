@@ -13,6 +13,10 @@ load_dotenv()
 GUILD_ID = int(os.getenv("GUILD_ID", "1371306026917298267"))
 DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port/dbname
 
+# --- NEW: Season Placement / Season reset config ---
+SEASON_PLACEMENT_ROLE_ID = 1470417525635551314
+SEASON_RESET_PENALTY = 100  # -100 MMR (aplicado como seed cuando jueguen, no aquí)
+
 # Diccionario con todos los roles de rango (Discord Role IDs)
 RANK_ROLE_IDS = {
     "Placement": 1371321594068336811,
@@ -46,7 +50,7 @@ async def get_conn():
 
 
 async def get_current_season():
-    sql = """ 
+    sql = """
     SELECT ID, Name, Active, StartDate, EndDate from seasons where active = true
     """
     conn = await get_conn()
@@ -58,8 +62,8 @@ async def get_current_season():
 
 
 async def get_all_seasons():
-    sql = """ 
-    SELECT id, name, active, startdate, enddate 
+    sql = """
+    SELECT id, name, active, startdate, enddate
     FROM seasons
     ORDER BY startdate DESC
     """
@@ -88,7 +92,7 @@ async def upsert_player(user_id: int, name: str, country: str):
         RETURNING user_id
     """
 
-    # seasonplayers has (player_id, season_id, ...) with a unique constraint on that pair
+    # seasonplayers has (user_id, season_id, ...) with a unique constraint on that pair
     sql_seasonplayers = """
         INSERT INTO seasonplayers (user_id, season_id, points, mmr, role)
         VALUES ($1, $2, 0, 0, 'Placement')
@@ -122,8 +126,6 @@ async def update_player_name(user_id: int, name: str):
 
 
 # Obtiene el nombre a mostrar con prioridad: nickname > show name > username global
-
-
 def get_member_name(member: discord.Member) -> str:
     if member.nick:
         return member.nick
@@ -177,7 +179,8 @@ class PlayersCog(commands.Cog):
             await upsert_player(member.id, name, "")
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention}! Excecute `/set_your_country <COUNTRY IN 2 LETTERS>` in #set_your_country to see your country in the page"
+                    f"Welcome {member.mention}! Execute `/set_your_country <2 LETTER ISO2>` "
+                    f"in #set_your_country to see your country in the page."
                 )
 
     @commands.Cog.listener()
@@ -196,10 +199,10 @@ class PlayersCog(commands.Cog):
         code = country.strip().upper()
         if not re.match(r"^[A-Z]{2}$", code):
             return await interaction.response.send_message(
-                "You should especify a 2 letter ISO2 code counrty", ephemeral=True
+                "You should specify a 2 letter ISO2 country code.", ephemeral=True
             )
-        name = get_member_name(interaction.user)
-        await upsert_player(interaction.user.id, name, code)
+        name = get_member_name(interaction.user)  # type: ignore
+        await upsert_player(interaction.user.id, name, code)  # type: ignore
         await interaction.response.send_message(
             f"✅ {name}, Country registered **{code}**.", ephemeral=True
         )
@@ -217,6 +220,8 @@ class PlayersCog(commands.Cog):
         Creates a new active season for the *current month* if none active covers today.
         """
         pool = self.db_pool
+        assert pool is not None, "DB pool not initialized"
+
         today = dt.date.today()
         startdate, enddate = self._month_bounds_utc(today)
         async with pool.acquire() as conn:
@@ -229,36 +234,33 @@ class PlayersCog(commands.Cog):
                       AND enddate   >= CURRENT_DATE
                     ORDER BY startdate DESC
                     LIMIT 1
-                """
+                    """
                 )
                 if cur:
-                    current_id = cur["id"]
+                    current_id = int(cur["id"])
                     prev = await conn.fetchrow(
                         """
                         SELECT id FROM seasons
                         WHERE id <> $1
                         ORDER BY enddate DESC NULLS LAST, startdate DESC
                         LIMIT 1
-                    """,
+                        """,
                         current_id,
                     )
-                    return current_id, (prev["id"] if prev else None), False
+                    return current_id, (int(prev["id"]) if prev else None), False
 
                 # create a new season spanning the current month
-                startdate, enddate = self._month_bounds_utc(today)
-                await conn.execute(
-                    "UPDATE seasons SET active = false WHERE active = true"
-                )
+                await conn.execute("UPDATE seasons SET active = false WHERE active = true")
                 row = await conn.fetchrow(
                     """
                     INSERT INTO seasons (name, active, startdate, enddate)
                     VALUES ('', true, $1, $2)
                     RETURNING id
-                """,
+                    """,
                     startdate,
                     enddate,
                 )
-                new_id = row["id"]
+                new_id = int(row["id"])
                 await conn.execute(
                     "UPDATE seasons SET name = $1 WHERE id = $2",
                     f"Season {new_id}",
@@ -270,10 +272,10 @@ class PlayersCog(commands.Cog):
                     WHERE id <> $1
                     ORDER BY enddate DESC NULLS LAST, startdate DESC
                     LIMIT 1
-                """,
+                    """,
                     new_id,
                 )
-                prev_id = prev["id"] if prev else None
+                prev_id = int(prev["id"]) if prev else None
                 return new_id, prev_id, True
 
     async def _apply_rank_role(
@@ -288,31 +290,62 @@ class PlayersCog(commands.Cog):
             else guild.get_member(int(member_or_id))
         )
         if member is None:
-            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
             try:
                 member = await guild.fetch_member(int(member_or_id))
             except Exception:
                 return False
 
-        # Normaliza y resuelve rol objetivo (fallback a Placement)
         role_name = (role_name or "Placement").strip()
         if role_name not in RANK_ROLE_IDS:
             role_name = "Placement"
 
         target_role = guild.get_role(RANK_ROLE_IDS[role_name])
         if not target_role:
-            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
             target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
             if not target_role:
                 return False
 
         # Mantener roles NO-rango y agregar el nuevo rango
-        keep = [r for r in member.roles if r.id not in rank_role_ids]
+        keep = [r for r in member.roles if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID]
         new_roles = list(dict.fromkeys(keep + [target_role]))
 
         try:
+            await member.edit(roles=new_roles, reason=reason or f"Apply rank {role_name}")
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def _apply_season_placement_role(
+        self, guild: discord.Guild, member_or_id, reason: str = ""
+    ) -> bool:
+        """
+        Season reset: aplicar rol Season Placement y remover roles de rango.
+        Mantiene todos los roles que no sean de rango.
+        """
+        rank_role_ids = set(RANK_ROLE_IDS.values())
+
+        member = (
+            member_or_id
+            if isinstance(member_or_id, discord.Member)
+            else guild.get_member(int(member_or_id))
+        )
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(member_or_id))
+            except Exception:
+                return False
+
+        sp_role = guild.get_role(SEASON_PLACEMENT_ROLE_ID)
+        if sp_role is None:
+            return False
+
+        keep = [r for r in member.roles if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID]
+        new_roles = list(dict.fromkeys(keep + [sp_role]))
+
+        try:
             await member.edit(
-                roles=new_roles, reason=reason or f"Apply rank {role_name}"
+                roles=new_roles,
+                reason=reason or "Season reset: Season Placement applied",
             )
             return True
         except (discord.Forbidden, discord.HTTPException):
@@ -332,34 +365,59 @@ class PlayersCog(commands.Cog):
 
         # 1) Ensure current season exists (create if needed)
         try:
-            current_season_id, prev_season_id, created = (
-                await self._ensure_current_season()
-            )
+            current_season_id, prev_season_id, created = await self._ensure_current_season()
         except Exception as e:
             return await interaction.response.send_message(
                 f"❌ DB error ensuring season: {e}", ephemeral=True
             )
 
+        # 1.5) Determinar quiénes recibirán Season Placement (jugó + tenía MMR/rango previo)
+        season_placement_uids: set[int] = set()
+        try:
+            if prev_season_id is not None:
+                assert self.db_pool is not None
+                async with self.db_pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT DISTINCT sp.user_id
+                        FROM seasonplayers sp
+                        WHERE sp.season_id = $1
+                          AND sp.mmr > 0
+                          AND sp.role <> 'Placement'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM match_history mh
+                              WHERE mh.season_id = $1
+                                AND mh.user_id   = sp.user_id
+                          )
+                        """,
+                        int(prev_season_id),
+                    )
+                    season_placement_uids = {int(r["user_id"]) for r in rows}
+        except Exception:
+            # si falla, no bloqueamos el reset; solo no aplicamos season placement
+            season_placement_uids = set()
+
         # 2) If there is a previous season, copy players into current (only new ones)
         migrated = 0
         try:
+            assert self.db_pool is not None
             async with self.db_pool.acquire() as conn:
                 async with conn.transaction():
                     if prev_season_id is not None:
-                        # Insert missing players from previous season
                         migrated = await conn.execute(
                             """
                             INSERT INTO seasonplayers (user_id, season_id, points, mmr, role, synced)
                             SELECT sp.user_id, $1, 0, 0, 'Placement', false
                             FROM seasonplayers sp
                             WHERE sp.season_id = $2
-                            AND NOT EXISTS (
-                                SELECT 1 FROM seasonplayers x
-                                WHERE x.user_id = sp.user_id AND x.season_id = $1
-                            )
-                        """,
-                            current_season_id,
-                            prev_season_id,
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM seasonplayers x
+                                  WHERE x.user_id = sp.user_id AND x.season_id = $1
+                              )
+                            """,
+                            int(current_season_id),
+                            int(prev_season_id),
                         )
                         # asyncpg returns "INSERT 0 N" → parse N
                         if isinstance(migrated, str) and migrated.startswith("INSERT"):
@@ -383,36 +441,44 @@ class PlayersCog(commands.Cog):
                     "❌ This command must be used inside a server.", ephemeral=True
                 )
 
+            assert self.db_pool is not None
             async with self.db_pool.acquire() as conn:
-                # fetch batch to sync
                 rows = await conn.fetch(
                     """
                     SELECT sp.user_id, sp.role
                     FROM seasonplayers sp
                     WHERE sp.season_id = $1
-                    AND sp.synced = false
-                """,
-                    current_season_id,
+                      AND sp.synced = false
+                    """,
+                    int(current_season_id),
                 )
 
                 synced = 0
                 for r in rows:
                     uid = int(r["user_id"])
-                    role_name = (r["role"] or "Placement").strip()
-                    ok = await self._apply_rank_role(
-                        guild, uid, role_name, reason=f"Season {current_season_id} sync"
-                    )
+
+                    # Si es elegible → Season Placement role (remueve ranks)
+                    if uid in season_placement_uids:
+                        ok = await self._apply_season_placement_role(
+                            guild, uid, reason=f"Season {current_season_id} reset: Season Placement"
+                        )
+                    else:
+                        # Normal → rol rank de la DB
+                        role_name = (r["role"] or "Placement").strip()
+                        ok = await self._apply_rank_role(
+                            guild, uid, role_name, reason=f"Season {current_season_id} sync"
+                        )
                     if ok:
                         synced += 1
 
-                # marcar synced=true para todos los procesados
+                # marcar synced=true (mismo comportamiento que tu versión previa)
                 await conn.execute(
                     """
                     UPDATE seasonplayers
                     SET synced = true
                     WHERE season_id = $1 AND synced = false
-                """,
-                    current_season_id,
+                    """,
+                    int(current_season_id),
                 )
 
         except Exception as e:
@@ -425,7 +491,8 @@ class PlayersCog(commands.Cog):
         await interaction.response.send_message(
             f"✅ Season {current_season_id} {created_text}. "
             f"Migrated **{migrated}** players from previous season. "
-            f"Synchronized roles for **{synced}** players.",
+            f"Synchronized roles for **{synced}** players. "
+            f"Season Placement applied to **{len(season_placement_uids)}** players.",
             ephemeral=True,
         )
 
