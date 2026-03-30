@@ -469,7 +469,10 @@ RANK_ROLE_IDS = {
 # Constantes de Placement
 # ——————————————————————————————
 PLACEMENT_ROLE_ID = 1371321594068336811
-
+SEASON_PLACEMENT_ROLE_ID = 1470417525635551314  # <-- el rol nuevo de season reset
+SEASON_RESET_PENALTY = 100
+PLACEMENT_DELTA_MIN = 24
+PLACEMENT_DELTA_MAX = 28
 
 class Top100View(View):
     def __init__(
@@ -584,6 +587,7 @@ class Matchmaking(commands.Cog):
             if member in info.get("players", []):
                 return rid
         return None
+        
 
     @staticmethod
     def pairwise_deltas_simple(
@@ -690,6 +694,20 @@ class Matchmaking(commands.Cog):
         # Placement se determina por rol del servidor (no por MMR)
         return any(r.id == PLACEMENT_ROLE_ID for r in getattr(member, "roles", []))
 
+    def _has_season_placement_role(self, member: discord.Member) -> bool:
+        return any(r.id == SEASON_PLACEMENT_ROLE_ID for r in getattr(member, "roles", []))
+    
+    @staticmethod
+    def _clamp_mmr(value: int) -> int:
+        return max(0, int(value))
+    
+    @staticmethod
+    def _normalize_season_placement_delta(delta: int) -> int:
+        sign = 1 if int(delta) >= 0 else -1
+        mag = abs(int(delta))
+        mag = max(PLACEMENT_DELTA_MIN, min(PLACEMENT_DELTA_MAX, mag))
+        return sign * mag
+
     def _minute_key_utc(self) -> int:
         now = datetime.datetime.utcnow().replace(second=0, microsecond=0)
         return int(now.timestamp())
@@ -757,6 +775,38 @@ class Matchmaking(commands.Cog):
                 return rid, info
         return None, None
 
+
+    async def _effective_display_mmrs(self, members: list[discord.Member]) -> dict[int, int]:
+        """
+        Devuelve el MMR que debe mostrarse en Discord:
+        - Si tiene Season Placement -> (prev_season_mmr - 100), clamp >= 0
+        - Si no -> current season mmr
+        """
+        if not members:
+            return {}
+
+        season_row = await self.get_current_season()
+        if not season_row:
+            return {m.id: 0 for m in members}
+
+        cur_id = int(season_row["id"])
+        prev_row = await self._get_previous_season(cur_id)
+        prev_id = int(prev_row["id"]) if prev_row else None
+
+        ids = [m.id for m in members]
+
+        # current season mmr (base)
+        current_map = await self._fetch_mmrs_batch(ids)
+
+        # override para Season Placement
+        sp_members = [m for m in members if self._has_season_placement_role(m)]
+        if prev_id and sp_members:
+            prev_map = await self._fetch_mmrs_batch_for_season(prev_id, [m.id for m in sp_members])
+            for m in sp_members:
+                seeded = self._clamp_mmr(int(prev_map.get(m.id, 0)) - SEASON_RESET_PENALTY)
+                current_map[m.id] = seeded
+
+        return current_map
 
     async def _announce_queue_countdown_prep_minute(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
@@ -963,7 +1013,7 @@ class Matchmaking(commands.Cog):
         placements = [m for m in members if self._is_placement_member(m)]
         nonplacements = [m for m in members if not self._is_placement_member(m)]
 
-        mmr_map = await self._fetch_mmrs_batch([m.id for m in nonplacements])
+        mmr_map = await self._effective_display_mmrs(nonplacements)
         join_order = self.queue_join_order.get(join_channel_id, {})
 
         nonplacements.sort(
@@ -1009,8 +1059,13 @@ class Matchmaking(commands.Cog):
 
         for i, group in enumerate(full_groups, start=1):
             # calcular avg mmr para naming (en base al grupo)
-            mmr_map = await self._fetch_mmrs_batch([m.id for m in group])
+            season_row = await self.get_current_season()
+            prev_row = await self._get_previous_season(int(season_row["id"])) if season_row else None
+            prev_season_id = int(prev_row["id"]) if prev_row else None
+
+            mmr_map = await self._effective_display_mmrs([m for m in group if not m.bot])
             mmr_vals = [int(mmr_map.get(m.id, 0)) for m in group]
+
             avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
             rank = self._rank_label_from_mmr(avg)
 
@@ -1316,7 +1371,7 @@ class Matchmaking(commands.Cog):
         placements = [m for m in members_all if self._is_placement_member(m)]
         nonplacements = [m for m in members_all if not self._is_placement_member(m)]
 
-        mmr_map = await self._fetch_mmrs_batch([m.id for m in nonplacements])
+        mmr_map = await self._effective_display_mmrs(nonplacements)
 
         nonplacements.sort(key=lambda m: (-int(mmr_map.get(m.id, 0)), m.id))
         # Placement al final, estable por id
@@ -1441,9 +1496,8 @@ class Matchmaking(commands.Cog):
         disp = self._disp(info, rid)
         players = info.get("players", [])
         # MMR para listar
-        mmr_map = await self._fetch_mmrs_batch(
-            [m.id for m in players if not self._is_placement_member(m)]
-        )
+        nonpl = [m for m in players if not self._is_placement_member(m)]
+        mmr_map = await self._effective_display_mmrs(nonpl)
         lines = []
         for m in players:
             if self._is_placement_member(m):
@@ -1641,7 +1695,13 @@ class Matchmaking(commands.Cog):
                 if m and not m.bot and not self._is_placement_member(m):
                     started_member_ids.append(m.id)
 
-        started_mmr_map = await self._fetch_mmrs_batch(list(set(started_member_ids)))
+        started_members = []
+        for _rid, info in started_rooms:
+            for m in info.get("players", []) or []:
+                if m and not m.bot and not self._is_placement_member(m):
+                    started_members.append(m)
+
+        started_mmr_map = await self._effective_display_mmrs(started_members)
 
         lines: list[str] = []
 
@@ -1678,10 +1738,7 @@ class Matchmaking(commands.Cog):
             lines.append("----------------")
             lines.append(f"FUTURE ROOMS (next slot <t:{future_slot_ts}:T>)")
 
-            mmr_map = await self._fetch_mmrs_batch(
-                [m.id for m in ordered if not self._is_placement_member(m)]
-            )
-
+            mmr_map = await self._effective_display_mmrs(ordered)
             groups = [ordered[i:i + ROOM_CAPACITY] for i in range(0, len(ordered), ROOM_CAPACITY)]
             for idx, g in enumerate(groups, start=1):
                 lines.append(f"ROOM {idx}")
@@ -1714,9 +1771,7 @@ class Matchmaking(commands.Cog):
         if not ordered:
             return ""
 
-        mmr_map = await self._fetch_mmrs_batch(
-            [m.id for m in ordered if not self._is_placement_member(m)]
-        )
+        mmr_map = await self._effective_display_mmrs(ordered)
 
         label = self._next_start_minute_label(now)
         lines = [f"----------------- Future Room (starting at {label})"]
@@ -2283,12 +2338,12 @@ class Matchmaking(commands.Cog):
         if not info:
             return ""
 
-        players = info.get("players", [])
+        players = [m for m in (info.get("players", []) or []) if m and not m.bot]
 
-        rows = []
-        for m in players:
-            mmr, _ = await self.fetch_player(m.id)
-            rows.append({"user_id": m.id, "mmr": int(mmr)})
+        # ✅ usa MMR “display” (SeasonPlacement => prev-100)
+        mmr_map = await self._effective_display_mmrs(players)
+
+        rows = [{"user_id": m.id, "mmr": int(mmr_map.get(m.id, 0))} for m in players]
         rows.sort(key=lambda r: r["mmr"], reverse=True)
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
@@ -2319,11 +2374,7 @@ class Matchmaking(commands.Cog):
             lines.append(f"• {name} ({r['mmr']})")
 
         ts = int(datetime.datetime.utcnow().timestamp())
-        return (
-            header
-            + ("\n" + "\n".join(lines) if lines else "")
-            + f"\n\nLast Update <t:{ts}:R>"
-        )
+        return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
 
     async def close_room(
         self, thread: discord.Thread, *, delay: int = 60, delete: bool = True
@@ -2993,6 +3044,24 @@ class Matchmaking(commands.Cog):
             """
             )
 
+
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seasonplayers (
+                    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+                    user_id   BIGINT  NOT NULL REFERENCES players(user_id) ON DELETE CASCADE,
+                    mmr       INTEGER NOT NULL DEFAULT 0,
+                    role      TEXT    NOT NULL DEFAULT 'Placement',
+                    PRIMARY KEY (season_id, user_id)
+                );
+                """
+            )
+
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr ON seasonplayers(season_id, mmr DESC);"
+            )
+
             # 1️⃣ Primero aseguro que la columna server exista
             await conn.execute(
                 """
@@ -3041,6 +3110,31 @@ class Matchmaking(commands.Cog):
             """
             )
 
+            #Season Reset
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seasons (
+                    id        SERIAL PRIMARY KEY,
+                    name      TEXT NOT NULL,
+                    active    BOOLEAN NOT NULL DEFAULT false,
+                    startdate TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    enddate   TIMESTAMPTZ
+                );
+                """
+            )
+
+            # SeasonPlayers
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seasonplayers (
+                    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+                    user_id   BIGINT  NOT NULL REFERENCES players(user_id) ON DELETE CASCADE,
+                    mmr       INTEGER NOT NULL DEFAULT 0,
+                    role      TEXT    NOT NULL DEFAULT 'Placement',
+                    PRIMARY KEY (season_id, user_id)
+                );
+                """
+            )
             # Índices útiles
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_songs_level_server ON songs(level, server);"
@@ -3318,14 +3412,18 @@ class Matchmaking(commands.Cog):
             counts[user_rank] = counts.get(user_rank, 0) + 1
 
         # 2) Determinar rango base según MMR promedio del room
-        has_placement = counts.get("Placement", 0) > 0
-        if has_placement:
+        has_rank_placement = counts.get("Placement", 0) > 0
+
+        if has_rank_placement:
+            # SOLO Placement legacy usa 24–28
             base_rank = "Placement"
         else:
-            # usa el MMR promedio de la sala para determinar el rango
-            base_rank = await self._get_room_rank_by_avg_mmr(players)
+            # Season Placement usa MMR “display” (prev-100), igual que el board
+            mmr_map = await self._effective_display_mmrs([m for m in players if m and not m.bot])
+            avg_mmr = round(sum(int(mmr_map.get(m.id, 0)) for m in players) / len(players)) if players else 0
+            base_rank = get_rank_from_mmr(avg_mmr)
             if base_rank not in BRACKET_RANGES:
-                base_rank = "Diamond"  # fallback neutro por si acaso
+                base_rank = "Diamond"
 
         low, high = BRACKET_RANGES[base_rank]
         allowed_diffs = ALLOWED_DIFFS_BY_RANK.get(base_rank, DIFFICULTY_PRIORITY)
@@ -3496,6 +3594,53 @@ class Matchmaking(commands.Cog):
         """
         async with self.db_pool.acquire() as conn:
             return await conn.fetchrow(sql)
+        
+    async def _get_previous_season(self, current_season_id: int) -> asyncpg.Record | None:
+        async with self.db_pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT id, name, active, startdate, enddate
+                FROM seasons
+                WHERE id <> $1
+                ORDER BY enddate DESC NULLS LAST, startdate DESC
+                LIMIT 1
+                """,
+                int(current_season_id),
+            )
+            
+    async def _fetch_previous_season_mmr(self, user_id: int, prev_season_id: int | None) -> int:
+        if not prev_season_id:
+            return 0
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT mmr
+                FROM seasonplayers
+                WHERE user_id = $1 AND season_id = $2
+                """,
+                int(user_id),
+                int(prev_season_id),
+            )
+        return int(row["mmr"]) if row else 0
+    
+    async def _fetch_mmrs_batch_for_season(self, season_id: int, user_ids: list[int]) -> dict[int, int]:
+        if not user_ids:
+            return {}
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, mmr
+                FROM seasonplayers
+                WHERE season_id = $1
+                AND user_id = ANY($2::bigint[])
+                """,
+                int(season_id),
+                user_ids,
+            )
+        out = {int(r["user_id"]): int(r["mmr"]) for r in rows}
+        for uid in user_ids:
+            out.setdefault(uid, 0)
+        return out
 
     async def fetch_player(self, user_id: int):
         season = await self.get_current_season()
@@ -3983,6 +4128,198 @@ class Matchmaking(commands.Cog):
 
         embed = await view.build_embed()
         await interaction.response.send_message(embed=embed, view=view)
+
+# Pon esto DENTRO de class Matchmaking(commands.Cog):
+
+
+    HISTORICO_CHANNEL_NAME = "historico"
+
+    @staticmethod
+    def _guess_next_season_name(current_name: str | None) -> str:
+        if not current_name:
+            return "Season 1"
+        m = re.search(r"(\d+)", current_name)
+        if m:
+            n = int(m.group(1)) + 1
+            return re.sub(r"\d+", str(n), current_name, count=1)
+        return f"{current_name} (New)"
+
+    @app_commands.command(
+        name="seasonreset",
+        description="SOFT RESET: cierra la season actual, crea una nueva y aplica Season Placement a jugadores con season previa.",
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        name="Nombre de la nueva season (opcional). Si se omite, se autogenera.",
+        announce="Si true, anuncia el cierre en #historico (si existe)."
+    )
+    async def seasonreset(
+        self,
+        interaction: discord.Interaction,
+        name: str | None = None,
+        announce: bool = True,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                cur = await conn.fetchrow(
+                    """
+                    SELECT id, name
+                    FROM seasons
+                    WHERE active = true
+                    ORDER BY startdate DESC
+                    LIMIT 1
+                    """
+                )
+                if not cur:
+                    return await interaction.followup.send(
+                        "❌ No hay una season activa en `seasons`.", ephemeral=True
+                    )
+
+                cur_id = int(cur["id"])
+                cur_name = str(cur["name"])
+
+                # cerrar season actual
+                await conn.execute(
+                    "UPDATE seasons SET active=false, enddate=now() WHERE id=$1",
+                    cur_id,
+                )
+
+                # crear nueva season
+                new_name = (name or self._guess_next_season_name(cur_name)).strip()
+                new_row = await conn.fetchrow(
+                    """
+                    INSERT INTO seasons (name, active, startdate)
+                    VALUES ($1, true, now())
+                    RETURNING id
+                    """,
+                    new_name,
+                )
+                new_id = int(new_row["id"])
+
+                # players registrados
+                registered_rows = await conn.fetch("SELECT user_id FROM players")
+                registered_ids = {int(r["user_id"]) for r in registered_rows}
+
+                # returning players = sí jugaron / sí tuvieron mmr real en la season anterior
+                returning_rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT sp.user_id
+                    FROM seasonplayers sp
+                    WHERE sp.season_id = $1
+                    AND (
+                            sp.mmr > 0
+                            OR EXISTS (
+                                SELECT 1
+                                FROM match_history mh
+                                WHERE mh.season_id = sp.season_id
+                                AND mh.user_id = sp.user_id
+                            )
+                        )
+                    """,
+                    cur_id,
+                )
+                returning_ids = {int(r["user_id"]) for r in returning_rows} & registered_ids
+                placement_ids = registered_ids - returning_ids
+
+                # nueva season: todos arrancan con mmr=0 / role='Placement' en DB
+                # la diferencia entre Placement normal vs Season Placement la marca Discord por ahora
+                if registered_ids:
+                    payload = [(new_id, uid, 0, "Placement") for uid in sorted(registered_ids)]
+                    CHUNK = 500
+                    for i in range(0, len(payload), CHUNK):
+                        await conn.executemany(
+                            """
+                            INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                            VALUES ($1, $2, $3, $4)
+                            ON CONFLICT (season_id, user_id)
+                            DO UPDATE SET mmr = EXCLUDED.mmr, role = EXCLUDED.role
+                            """,
+                            payload[i:i+CHUNK],
+                        )
+
+                # opcional: coherencia visual en tabla players
+                if registered_ids:
+                    await conn.execute("UPDATE players SET role='Placement'")
+
+        placement_role = guild.get_role(PLACEMENT_ROLE_ID)
+        season_placement_role = guild.get_role(SEASON_PLACEMENT_ROLE_ID)
+
+        if placement_role is None:
+            return await interaction.followup.send(
+                f"❌ No encuentro rol Placement (ID={PLACEMENT_ROLE_ID}).",
+                ephemeral=True,
+            )
+
+        if season_placement_role is None:
+            return await interaction.followup.send(
+                f"❌ No encuentro rol Season Placement (ID={SEASON_PLACEMENT_ROLE_ID}).",
+                ephemeral=True,
+            )
+
+        # limpiar cualquier rank normal + season placement antes de reasignar
+        rank_role_ids = set(RANK_ROLE_IDS.values()) | {SEASON_PLACEMENT_ROLE_ID}
+
+        me = guild.get_member(self.bot.user.id) if self.bot.user else None
+        can_manage_nicks = bool(me and me.guild_permissions.manage_nicknames)
+
+        edited = 0
+        for uid in sorted(registered_ids):
+            member = guild.get_member(uid)
+            if not member or member.bot:
+                continue
+
+            keep = [r for r in member.roles if r.id not in rank_role_ids]
+
+            # Returning players -> Season Placement
+            # New / sin historial -> Placement normal
+            target_role = season_placement_role if uid in returning_ids else placement_role
+            new_roles = list(dict.fromkeys(keep + [target_role]))
+
+            try:
+                new_nick = None
+                if can_manage_nicks and member.nick:
+                    new_nick = re.sub(r"\s*\[[^\]]+\]\s*$", "", member.nick).strip() or None
+
+                await member.edit(
+                    roles=new_roles,
+                    nick=new_nick if can_manage_nicks else discord.utils.MISSING,
+                    reason=f"Season reset -> {new_name}",
+                )
+                edited += 1
+            except Exception:
+                pass
+
+            if edited % 10 == 0:
+                await asyncio.sleep(1.0)
+
+        if announce:
+            historico = discord.utils.get(guild.text_channels, name=self.HISTORICO_CHANNEL_NAME)
+            if historico:
+                try:
+                    await historico.send(
+                        f"📦 **Season archived**: **{cur_name}** (ID {cur_id})\n"
+                        f"🆕 **New season**: **{new_name}** (ID {new_id})\n"
+                        f"🔁 **Season Placement**: {len(returning_ids)} returning players\n"
+                        f"🆕 **Placement**: {len(placement_ids)} new / sin historial"
+                    )
+                except Exception:
+                    pass
+
+        await interaction.followup.send(
+            f"✅ Season reset done.\n"
+            f"- Closed: **{cur_name}** (ID {cur_id})\n"
+            f"- New: **{new_name}** (ID {new_id})\n"
+            f"- Season Placement: **{len(returning_ids)}**\n"
+            f"- Placement normal: **{len(placement_ids)}**",
+            ephemeral=True,
+        )
 
     @commands.command(name="cleanup_ghosts")
     @commands.has_permissions(administrator=True)
@@ -4615,6 +4952,7 @@ class Matchmaking(commands.Cog):
         # Bloquear submits mientras dura la votación
         room["vote_in_progress"] = True
 
+        room["vote_in_progress"] = True
         try:
             # ---- Votación ----
             intro = (
@@ -4671,10 +5009,7 @@ class Matchmaking(commands.Cog):
                     break
 
             if ganador is None:
-                if counts["✅"] > counts["❎"]:
-                    ganador = "✅"
-                else:
-                    ganador = "❎"
+                ganador = "✅" if counts["✅"] > counts["❎"] else "❎"
 
             try:
                 await vote_msg.edit(
@@ -4684,18 +5019,33 @@ class Matchmaking(commands.Cog):
                 pass
 
             if ganador != "✅":
-                return await ctx.send(
-                    "Submit declined. There might be an error, try doing it again."
-                )
+                await ctx.send("Submit declined. There might be an error, try doing it again.")
+                return
 
             # ==============================
             # VOTO APROBADO → aplicar MMR
             # ==============================
-            medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-
             result_id = await self._next_result_id()
 
-            # players_list UNA sola vez
+            # --- resolver seasons ---
+            season_row = await self.get_current_season()
+            if not season_row:
+                await ctx.send("❌ No active season found.")
+                return
+
+            season_id = int(season_row["id"])
+            season_name = str(season_row["name"])
+
+            prev_row = await self._get_previous_season(season_id)
+            prev_season_id = int(prev_row["id"]) if prev_row else None
+
+            # --- map prev mmr SOLO para season placement (batch) ---
+            sp_ids = [m.id for m in players if self._has_season_placement_role(m)]
+            prev_mmr_map: dict[int, int] = {}
+            if prev_season_id and sp_ids:
+                prev_mmr_map = await self._fetch_mmrs_batch_for_season(prev_season_id, sp_ids)
+
+            # --- construir players_list ---
             players_list = []
             for member in players:
                 uid = member.id
@@ -4709,7 +5059,6 @@ class Matchmaking(commands.Cog):
                     )
                     or ""
                 )
-
                 if not profile_cc and cc:
                     profile_cc = cc.upper()
                     await self.db_pool.execute(
@@ -4719,8 +5068,13 @@ class Matchmaking(commands.Cog):
                     )
 
                 display_flag = country_flag(profile_cc)
-
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
+
+                is_season_placement = self._has_season_placement_role(member)
+                is_rank_placement = (current_role == "Placement")
+
+                prev_season_mmr = int(prev_mmr_map.get(uid, 0)) if is_season_placement else 0
+
                 players_list.append(
                     {
                         "member": member,
@@ -4728,18 +5082,30 @@ class Matchmaking(commands.Cog):
                         "stats": stats,
                         "total": total_points,
                         "old": int(old),
-                        "mmr_actual": int(old),
+                        "mmr_actual": int(old),  # base; se sobreescribe si es placement
                         "role": current_role,
                         "display_flag": display_flag,
-                        "was_placement": (current_role == "Placement"),
+                        "was_placement": bool(is_season_placement or is_rank_placement),
+                        "is_season_placement": bool(is_season_placement),
+                        "prev_season_mmr": prev_season_mmr,
+                        "is_rank_placement": bool(is_rank_placement),
                         "seed_mmr": None,
                         "seed_rank": None,
                     }
                 )
 
-            # Seed Placement
+            # --- aplicar seeds (FUERA del for member) ---
             for p in players_list:
-                if p["role"] == "Placement":
+                if p.get("is_season_placement", False):
+                    prev_mmr = int(p.get("prev_season_mmr") or 0)
+                    seeded = self._clamp_mmr(prev_mmr - SEASON_RESET_PENALTY)
+                    p["mmr_actual"] = seeded
+                    p["seed_mmr"] = seeded
+                    p["seed_rank"] = get_rank_from_mmr(seeded)
+                    p["was_placement"] = True
+                    continue
+
+                if p.get("is_rank_placement", False):
                     seed_mmr, seed_rank = self.placement_seed_from_stats(p["stats"])
                     p["mmr_actual"] = int(seed_mmr)
                     p["seed_mmr"] = int(seed_mmr)
@@ -4748,11 +5114,8 @@ class Matchmaking(commands.Cog):
 
             # Room MMR (con seeds)
             room_mmr = (
-                round(
-                    sum(int(p["mmr_actual"]) for p in players_list) / len(players_list)
-                )
-                if players_list
-                else None
+                round(sum(int(p["mmr_actual"]) for p in players_list) / len(players_list))
+                if players_list else None
             )
 
             # Orden final: puntos desc; empate → Placement primero
@@ -4763,27 +5126,30 @@ class Matchmaking(commands.Cog):
 
             ratings = [int(p["mmr_actual"]) for p in players_list]
             order = list(range(len(players_list)))
-            deltas = self.pairwise_deltas_simple(
-                ratings, order, K=50, scale=400, cap=39
-            )
+            deltas = self.pairwise_deltas_simple(ratings, order, K=50, scale=400, cap=39)
             deltas = self._apply_tie_logic_placement_priority(players_list, deltas)
-
-            season_row = await self.get_current_season()
-            season_id = int(season_row["id"])
-            season_name = season_row["name"]
 
             summary = []
 
             for idx, p in enumerate(players_list, start=1):
                 mmr_prev = int(p["mmr_actual"])
-                mmr_delta = int(deltas[idx - 1])
-                mmr_final = mmr_prev + mmr_delta
+                raw_delta = int(deltas[idx - 1])
+
+                mmr_delta = (
+                    self._normalize_season_placement_delta(raw_delta)
+                    if p.get("is_season_placement", False)
+                    else raw_delta
+                )
+
+                mmr_final = self._clamp_mmr(mmr_prev + mmr_delta)
                 role_name = get_rank_from_mmr(mmr_final)
 
-                stats = p["stats"]
-                s_p, s_g, s_g2, s_b, s_m = stats
+                p["mmr_prev"] = mmr_prev
+                p["mmr_delta"] = mmr_delta
+                p["mmr_final"] = mmr_final
 
-                # UPSERT seasonplayers
+                s_p, s_g, s_g2, s_b, s_m = p["stats"]
+
                 await self.db_pool.execute(
                     """
                     INSERT INTO seasonplayers (season_id, user_id, mmr, role)
@@ -4797,7 +5163,6 @@ class Matchmaking(commands.Cog):
                     role_name,
                 )
 
-                # match_history
                 await self.db_pool.execute(
                     """
                     INSERT INTO match_history (
@@ -4812,179 +5177,46 @@ class Matchmaking(commands.Cog):
                     result_id,
                     p["member"].id,
                     idx,
-                    s_p,
-                    s_g,
-                    s_g2,
-                    s_b,
-                    s_m,
-                    mmr_prev,
-                    mmr_final,
-                    mmr_delta,
+                    s_p, s_g, s_g2, s_b, s_m,
+                    mmr_prev, mmr_final, mmr_delta,
                     bool(p["was_placement"]),
                     mmr_delta >= 0,
                 )
 
-                # Roles de rank
-                role_id = RANK_ROLE_IDS.get(role_name)
-                if role_id:
-                    role_obj = ctx.guild.get_role(role_id)
-                    if role_obj:
-                        old_ranks = set(RANK_ROLE_IDS.values()) | {PLACEMENT_ROLE_ID}
-                        keep_roles = [
-                            r for r in p["member"].roles if r.id not in old_ranks
-                        ]
-                        new_roles = list(dict.fromkeys(keep_roles + [role_obj]))
-                        try:
-                            await p["member"].edit(
-                                roles=new_roles, reason="Rank update"
-                            )
-                        except (discord.Forbidden, discord.HTTPException) as e:
-                            await ctx.send(
-                                f"⚠️ No pude actualizar roles de {p['member'].mention}: {e}"
-                            )
-
-                # Nick opcional
-                if ctx.guild.me.guild_permissions.manage_nicknames:
-                    base = p["member"].display_name
-                    nick = f"{base} [{role_name}]"
-                    if len(nick) > 32:
-                        nick = f"{base[:max(0, 32 - len(role_name) - 3)]} [{role_name}]"
-                    try:
-                        await p["member"].edit(nick=nick)
-                    except (discord.Forbidden, discord.HTTPException) as e:
-                        await ctx.send(
-                            f"⚠️ No pude cambiar nick de {p['member'].mention}: {e}"
-                        )
-
-                name_with_flag = (
-                    f"{p['member'].display_name} {p['display_flag']}".rstrip()
-                )
-                summary.append(
-                    (
-                        idx,
-                        name_with_flag,
-                        p["total"],
-                        p["stats"],
-                        mmr_prev,
-                        mmr_delta,
-                        mmr_final,
-                        p["was_placement"],
-                        get_rank_from_mmr(mmr_prev),
-                    )
-                )
-
-            # PUBLICAR RESULTADOS
-            join_parent = ctx.channel.parent
-            result_chan_id = (
-                JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-            )
-            result_chan = (
-                await self._resolve_channel(result_chan_id, fallback=ctx.channel)
-                if result_chan_id
-                else ctx.channel
-            )
-
-            gap_low = room.get("gap_low")
-            gap_high = room.get("gap_high")
-            songs = room.get("songs") or []
-
-            if songs:
-                await self.db_pool.executemany(
+                await self.db_pool.execute(
                     """
-                    INSERT INTO match_songs (result_id, song_name, level, difficulty, notes_count)
-                    VALUES ($1, $2, $3, $4, $5)
+                    UPDATE players
+                    SET role = $2
+                    WHERE user_id = $1
                     """,
-                    [
-                        (result_id, title, lvl, diff, notes)
-                        for (title, lvl, diff, notes) in songs
-                    ],
+                    p["member"].id,
+                    role_name,
                 )
 
-            gap_text = ""
-            if gap_low is not None and gap_high is not None:
-                gap_text = f" · Lv {gap_low}-{gap_high}"
-                if room_mmr is not None:
-                    gap_text += f" · Avg MMR {room_mmr}"
-
-            songs_block = ""
-            if songs:
-                song_lines = [
-                    f"Lv {lvl} {diff} — {title} ({notes} notes)"
-                    for (title, lvl, diff, notes) in songs
-                ]
-                songs_block = "\n**Songs (Lv / Diff / Notes):**\n" + "\n".join(
-                    song_lines
+                applied_role = await self._apply_rank_role(
+                    ctx.guild,
+                    p["member"],
+                    role_name,
+                    reason=f"Submit result #{result_id}",
                 )
 
-            header_line = f"ID: {result_id}{gap_text}{songs_block}"
-
-            buf = generate_results_image(
-                summary,
-                font_path="assets/rodinntlg_eb.otf",
-                side_image=Image.open("assets/logo.png"),
-            )
-            image_bytes = buf.read()
-
-            embed = discord.Embed(
-                title=f"RESULTS — {season_name}",
-                description=header_line,
-                color=0x00F7FF,
-            ).set_image(url="attachment://results.png")
-
-            msg_result = await result_chan.send(
-                embed=embed, file=discord.File(io.BytesIO(image_bytes), "results.png")
-            )
-            await ctx.send(
-                embed=embed, file=discord.File(io.BytesIO(image_bytes), "results.png")
-            )
-            await result_chan.send("MMR Updated")
-            await ctx.send("MMR Updated")
-
-            await self.db_pool.execute(
-                """
-                INSERT INTO results (
-                    result_id, season_id, season_name, channel_id, message_id,
-                    gap_low, gap_high, room_mmr, songs_block
+                summary.append(
+                    f"#{idx} {p['member'].display_name} | "
+                    f"{mmr_prev} -> {mmr_final} ({mmr_delta:+}) | "
+                    f"{role_name} | role={'ok' if applied_role else 'fail'}"
                 )
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                """,
-                result_id,
-                season_id,
-                season_name,
-                msg_result.channel.id,
-                msg_result.id,
-                gap_low,
-                gap_high,
-                room_mmr,
-                songs_block.strip() if songs_block else None,
-            )
 
-            # ✅ Quitar roles queue a los jugadores del match (EN/JP)
+            room["finished"] = True
+            room["closed"] = True
+
             try:
                 await self._remove_queue_roles(players)
             except Exception:
                 pass
 
-            room["closed"] = True
-            room["finished"] = True
-
-            await ctx.send("This room has been submited results")
-
-            rid = next(
-                (
-                    rid
-                    for rid, r in self.rooms.items()
-                    if r.get("thread") and r["thread"] == ctx.channel.id
-                ),
-                None,
-            )
-            if rid is not None:
-                try:
-                    self.bot.dispatch("room_finished", rid)
-                except Exception:
-                    pass
-
-            asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
+            if summary:
+                await ctx.send("Results applied:\n```" + "\n".join(summary) + "\n```")
+            # pero asegurándote que siga con ESTA MISMA indentación (dentro del try)
 
         finally:
             room["vote_in_progress"] = False
@@ -4992,44 +5224,41 @@ class Matchmaking(commands.Cog):
     async def _apply_rank_role(
         self, guild: discord.Guild, member_or_id, role_name: str, reason: str = ""
     ) -> bool:
-        rank_role_ids = set(RANK_ROLE_IDS.values())
+        rank_role_ids = set(RANK_ROLE_IDS.values()) | {SEASON_PLACEMENT_ROLE_ID}
 
-        # Resolver member
         member = (
             member_or_id
             if isinstance(member_or_id, discord.Member)
             else guild.get_member(int(member_or_id))
         )
         if member is None:
-            # Como fallback, intenta fetch_member (puede fallar si no está en el guild)
             try:
                 member = await guild.fetch_member(int(member_or_id))
             except Exception:
                 return False
 
-        # Normaliza y resuelve rol objetivo (fallback a Placement)
         role_name = (role_name or "Placement").strip()
         if role_name not in RANK_ROLE_IDS:
             role_name = "Placement"
 
         target_role = guild.get_role(RANK_ROLE_IDS[role_name])
         if not target_role:
-            # Si el rol no existe en el servidor, cae a Placement si existe; si no, no se puede asignar.
             target_role = guild.get_role(RANK_ROLE_IDS["Placement"])
             if not target_role:
                 return False
 
-        # Mantener roles NO-rango y agregar el nuevo rango
         keep = [r for r in member.roles if r.id not in rank_role_ids]
         new_roles = list(dict.fromkeys(keep + [target_role]))
 
         try:
             await member.edit(
-                roles=new_roles, reason=reason or f"Apply rank {role_name}"
+                roles=new_roles,
+                reason=reason or f"Apply rank {role_name}",
             )
             return True
         except (discord.Forbidden, discord.HTTPException):
             return False
+
 
     @commands.command(name="edit_user_mmr")
     async def edit_user_mmr(
@@ -5065,15 +5294,31 @@ class Matchmaking(commands.Cog):
         if ctx.author.id not in [878310498720940102, 1364401080661708892]:
             return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
         try:
+            season_row = await self.get_current_season()
+            if not season_row:
+                return await ctx.reply("❌ No active season found.")
+
+            season_id = int(season_row["id"])
+
             result = await self.db_pool.fetchrow(
                 """
-                SELECT role FROM seasonplayers WHERE user_id = $1;
+                SELECT role
+                FROM seasonplayers
+                WHERE season_id = $1
+                  AND user_id = $2
                 """,
+                season_id,
                 member.id,
             )
-            result = dict(result)
+
+            if not result:
+                return await ctx.reply("❌ User has no row in current season.")
+
             await self._apply_rank_role(
-                ctx.guild, member, result["role"], reason="Fixing user's ranked roles"
+                ctx.guild,
+                member,
+                str(result["role"]),
+                reason="Fixing user's ranked roles",
             )
             await ctx.reply("Done!")
         except Exception as e:
@@ -5082,8 +5327,6 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
-
 
 
 
