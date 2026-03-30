@@ -470,7 +470,7 @@ RANK_ROLE_IDS = {
 # ——————————————————————————————
 PLACEMENT_ROLE_ID = 1371321594068336811
 SEASON_PLACEMENT_ROLE_ID = 1470417525635551314  # <-- el rol nuevo de season reset
-SEASON_RESET_PENALTY = 100
+SEASON_RESET_PENALTY = 50
 PLACEMENT_DELTA_MIN = 24
 PLACEMENT_DELTA_MAX = 28
 
@@ -5327,6 +5327,9 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
+
+
 
 
 
