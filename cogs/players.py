@@ -15,7 +15,7 @@ DATABASE_URL = os.getenv("DB_HOST")  # Formato: postgresql://user:pass@host:port
 
 # --- NEW: Season Placement / Season reset config ---
 SEASON_PLACEMENT_ROLE_ID = 1470417525635551314
-SEASON_RESET_PENALTY = 100  # -100 MMR (aplicado como seed cuando jueguen, no aquí)
+SEASON_RESET_PENALTY = 50  # -100 MMR (aplicado como seed cuando jueguen, no aquí)
 
 # Diccionario con todos los roles de rango (Discord Role IDs)
 RANK_ROLE_IDS = {
