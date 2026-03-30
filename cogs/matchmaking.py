@@ -475,14 +475,9 @@ PLACEMENT_DELTA_MIN = 24
 PLACEMENT_DELTA_MAX = 28
 
 class Top100View(View):
-    def __init__(
-        self,
-        db_pool: asyncpg.Pool,
-        interaction: discord.Interaction,
-        season_id: int,
-        season_name: str,
-    ):
+    def __init__(self, cog, db_pool, interaction, season_id, season_name):
         super().__init__(timeout=None)
+        self.cog = cog
         self.db = db_pool
         self.inter = interaction
         self.season_id = season_id
@@ -516,14 +511,19 @@ class Top100View(View):
 
         embed = Embed(title=f"PJSK LOUNGE TOP 100 — {self.season_name}", color=0x00FFFB)
         header = "TOP| Name                     |   MMR   | Rank\n"
-        separator = "---+--------------------------+---------+-----------\n"
+        separator = "---+--------------------------+---------+----------------\n"
         lines = []
+        
         for idx, r in enumerate(rows, start=offset + 1):
             member = self.inter.guild.get_member(r["user_id"])
             name = (member.display_name if member else f"ID {r['user_id']}")[:25]
             mmr = f"{r['mmr']:,}"
             rank = r["role"]
-            lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank}")
+        
+            sp = member is not None and self.cog._has_season_placement_role(member)
+            rank_label = f"{rank} [SP]" if sp else rank
+        
+            lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank_label}")
 
         embed.description = (
             "```\n"
@@ -588,7 +588,12 @@ class Matchmaking(commands.Cog):
                 return rid
         return None
         
+    def _season_status_label(self, member: discord.Member | None) -> str | None:
+        if member and self._has_season_placement_role(member):
+            return "Season Placement"
+        return None
 
+    
     @staticmethod
     def pairwise_deltas_simple(
         ratings: list[int],
@@ -1716,15 +1721,19 @@ class Matchmaking(commands.Cog):
             rows = []
             for m in players:
                 if self._is_placement_member(m):
-                    rows.append((m.display_name, -1, True))
+                    rows.append((m.display_name, -1, "placement"))
+                elif self._has_season_placement_role(m):
+                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "season_placement"))
                 else:
-                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), False))
-
-            # non-placement primero, luego placement; MMR desc
-            rows.sort(key=lambda x: (x[2], -x[1], x[0].lower()))
-            for name, mmr, is_pl in rows:
-                if is_pl:
+                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "regular"))
+            
+            rows.sort(key=lambda x: (x[2] == "placement", -x[1], x[0].lower()))
+            
+            for name, mmr, status in rows:
+                if status == "placement":
                     lines.append(f"{name} Placement")
+                elif status == "season_placement":
+                    lines.append(f"{name} {mmr}MMR — Season Placement")
                 else:
                     lines.append(f"{name} {mmr}MMR")
             lines.append("")  # blank line entre rooms
@@ -1745,6 +1754,8 @@ class Matchmaking(commands.Cog):
                 for m in g:
                     if self._is_placement_member(m):
                         lines.append(f"{m.display_name} Placement")
+                    elif self._has_season_placement_role(m):
+                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR — Season Placement")
                     else:
                         lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
 
@@ -2370,8 +2381,10 @@ class Matchmaking(commands.Cog):
 
         lines = []
         for r in rows:
+            member = guild.get_member(r["user_id"])
             name = await self.resolve_member_name(guild, r["user_id"])
-            lines.append(f"• {name} ({r['mmr']})")
+            suffix = " — Season Placement" if member and self._has_season_placement_role(member) else ""
+            lines.append(f"• {name} ({r['mmr']}){suffix}")
 
         ts = int(datetime.datetime.utcnow().timestamp())
         return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
@@ -3913,13 +3926,17 @@ class Matchmaking(commands.Cog):
 
         mmr_delta_last10 = data["last10_mmr_delta"]
         mmr_delta_str = f"{mmr_delta_last10:+d}"
-
+        
+        season_status = self._season_status_label(interaction.user)
+        status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
+        
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {interaction.user.mention}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
             f"• **MMR:** {data['mmr']}\n"
             f"• **Rank:** {data['role']}\n"
+            f"{status_line}"
             f"• **Matches Played:** {data['matches_played']}\n"
             f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
             f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
@@ -4016,15 +4033,17 @@ class Matchmaking(commands.Cog):
 
         mmr_delta_last10 = data["last10_mmr_delta"]
         mmr_delta_str = f"{mmr_delta_last10:+d}"
-
-        player_name = await self.resolve_member_name(interaction.guild, user.id)
-
+        
+        season_status = self._season_status_label(interaction.user)
+        status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
+        
         msg = (
             f"**Stats — Season {season_name}**\n"
-            f"• **Player:** {player_name}\n"
+            f"• **Player:** {interaction.user.mention}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
             f"• **MMR:** {data['mmr']}\n"
             f"• **Rank:** {data['role']}\n"
+            f"{status_line}"
             f"• **Matches Played:** {data['matches_played']}\n"
             f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
             f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
@@ -4070,18 +4089,22 @@ class Matchmaking(commands.Cog):
         board = self._format_cutoffs_board(season_name, data)
         await interaction.response.send_message(board)
 
-
+    
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
     async def mmr_self(self, interaction: discord.Interaction):
         mmr_val, role = await self.fetch_player(interaction.user.id)
         name = interaction.user.display_name
-        if role == "Placement":
-            await interaction.response.send_message(f"{name} Is in placement")
-        else:
-            await interaction.response.send_message(
-                f"{name} has {mmr_val} MMR and rank {role}."
-            )
+        season_status = self._season_status_label(interaction.user)
+    
+        if role == "Placement" and not season_status:
+            await interaction.response.send_message(f"{name} is in Placement.")
+            return
+    
+        extra = f" {season_status}." if season_status else ""
+        await interaction.response.send_message(
+            f"{name} has {mmr_val} MMR and rank {role}.{extra}"
+        )
 
     @app_commands.command(
         name="top100", description="Top 100 jugadores por MMR con paginación"
@@ -4112,7 +4135,7 @@ class Matchmaking(commands.Cog):
                 "⚠️ Season not found.", ephemeral=True
             )
 
-        view = Top100View(self.db_pool, interaction, season_id, season_name)
+        view = Top100View(self, self.db_pool, interaction, season_id, season_name)
 
         total = await self.db_pool.fetchval(
             """
@@ -4228,10 +4251,31 @@ class Matchmaking(commands.Cog):
                 returning_ids = {int(r["user_id"]) for r in returning_rows} & registered_ids
                 placement_ids = registered_ids - returning_ids
 
-                # nueva season: todos arrancan con mmr=0 / role='Placement' en DB
-                # la diferencia entre Placement normal vs Season Placement la marca Discord por ahora
+                # nueva season:
+                # - returning players: arrancan con prev_season_mmr - 50
+                # - new players: arrancan en 0 / Placement
                 if registered_ids:
-                    payload = [(new_id, uid, 0, "Placement") for uid in sorted(registered_ids)]
+                    payload = []
+                
+                    for uid in sorted(registered_ids):
+                        if uid in returning_ids:
+                            prev_mmr = await conn.fetchval(
+                                """
+                                SELECT mmr
+                                FROM seasonplayers
+                                WHERE season_id = $1 AND user_id = $2
+                                """,
+                                cur_id,
+                                uid,
+                            ) or 0
+                
+                            seeded_mmr = self._clamp_mmr(int(prev_mmr) - SEASON_RESET_PENALTY)
+                            seeded_role = get_rank_from_mmr(seeded_mmr)
+                
+                            payload.append((new_id, uid, seeded_mmr, seeded_role))
+                        else:
+                            payload.append((new_id, uid, 0, "Placement"))
+                
                     CHUNK = 500
                     for i in range(0, len(payload), CHUNK):
                         await conn.executemany(
@@ -4246,7 +4290,40 @@ class Matchmaking(commands.Cog):
 
                 # opcional: coherencia visual en tabla players
                 if registered_ids:
-                    await conn.execute("UPDATE players SET role='Placement'")
+                    for uid in sorted(registered_ids):
+                        if uid in returning_ids:
+                            prev_mmr = await conn.fetchval(
+                                """
+                                SELECT mmr
+                                FROM seasonplayers
+                                WHERE season_id = $1 AND user_id = $2
+                                """,
+                                cur_id,
+                                uid,
+                            ) or 0
+                
+                            seeded_mmr = self._clamp_mmr(int(prev_mmr) - SEASON_RESET_PENALTY)
+                            seeded_role = get_rank_from_mmr(seeded_mmr)
+                
+                            await conn.execute(
+                                """
+                                UPDATE players
+                                SET mmr = $2, role = $3
+                                WHERE user_id = $1
+                                """,
+                                uid,
+                                seeded_mmr,
+                                seeded_role,
+                            )
+                        else:
+                            await conn.execute(
+                                """
+                                UPDATE players
+                                SET mmr = 0, role = 'Placement'
+                                WHERE user_id = $1
+                                """,
+                                uid,
+                            )
 
         placement_role = guild.get_role(PLACEMENT_ROLE_ID)
         season_placement_role = guild.get_role(SEASON_PLACEMENT_ROLE_ID)
