@@ -779,7 +779,7 @@ class Matchmaking(commands.Cog):
     async def _effective_display_mmrs(self, members: list[discord.Member]) -> dict[int, int]:
         """
         Devuelve el MMR que debe mostrarse en Discord:
-        - Si tiene Season Placement -> (prev_season_mmr - 100), clamp >= 0
+        - Si tiene Season Placement -> (prev_season_mmr - 50), clamp >= 0
         - Si no -> current season mmr
         """
         if not members:
