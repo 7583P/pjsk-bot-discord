@@ -4146,7 +4146,7 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="seasonreset",
-        description="SOFT RESET: cierra la season actual, crea una nueva y aplica Season Placement a jugadores con season previa.",
+        description="Reinicia la temporada y limpia estadísticas."
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.checks.has_permissions(administrator=True)
