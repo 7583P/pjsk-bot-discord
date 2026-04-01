@@ -471,8 +471,7 @@ RANK_ROLE_IDS = {
 PLACEMENT_ROLE_ID = 1371321594068336811
 SEASON_PLACEMENT_ROLE_ID = 1470417525635551314  # <-- el rol nuevo de season reset
 SEASON_RESET_PENALTY = 50
-PLACEMENT_DELTA_MIN = 24
-PLACEMENT_DELTA_MAX = 28
+
 
 SEASON_CHOICES = [
     app_commands.Choice(name="Current", value="current"),
@@ -484,55 +483,33 @@ SEASON_CHOICES = [
     app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
 ]
 
-class Top100View(View):
-    def __init__(self, cog, db_pool, interaction, season_id, season_name):
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.db = db_pool
-        self.inter = interaction
-        self.season_id = season_id
-        self.season_name = season_name
-        self.page = 0
-        self.per_page = 20
-        self._join_lock = asyncio.Lock()
-
-    async def build_embed(self) -> Embed:
-        # total jugadores en ESA season
-        total_all = await self.db.fetchval(
-            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1", self.season_id
+async def build_embed(self) -> Embed:
+        all_rows = await self.cog._build_visible_leaderboard_rows(
+            self.inter.guild,
+            self.season_id,
         )
-        total = min(total_all or 0, 100)
+
+        total = min(len(all_rows), 100)
         max_page = (total - 1) // self.per_page if total else 0
 
         offset = self.page * self.per_page
-        rows = await self.db.fetch(
-            """
-            SELECT p.user_id, sp.mmr, sp.role
-            FROM players p
-            INNER JOIN seasonplayers sp ON p.user_id = sp.user_id
-            WHERE sp.season_id = $3
-            ORDER BY sp.mmr DESC
-            OFFSET $1 LIMIT $2
-            """,
-            offset,
-            self.per_page,
-            self.season_id,
-        )
+        rows = all_rows[:100][offset : offset + self.per_page]
 
         embed = Embed(title=f"PJSK LOUNGE TOP 100 — {self.season_name}", color=0x00FFFB)
         header = "TOP| Name                     |   MMR   | Rank\n"
         separator = "---+--------------------------+---------+----------------\n"
         lines = []
-        
+
         for idx, r in enumerate(rows, start=offset + 1):
-            member = self.inter.guild.get_member(r["user_id"])
-            name = (member.display_name if member else f"ID {r['user_id']}")[:25]
-            mmr = f"{r['mmr']:,}"
-            rank = r["role"]
-        
-            sp = member is not None and self.cog._has_season_placement_role(member)
-            rank_label = f"{rank} [SP]" if sp else rank
-        
+            member = r["member"]
+            name = (
+                member.display_name[:25]
+                if member is not None
+                else f"ID {r['user_id']}"
+            )
+            mmr = f"{int(r['visible_mmr']):,}"
+            rank_label = f"{r['role']} [SP]" if r["is_unplayed_sp"] else r["role"]
+
             lines.append(f"{idx:>2} | {name:<25} | {mmr:>7} | {rank_label}")
 
         embed.description = (
@@ -544,8 +521,9 @@ class Top100View(View):
         )
         return embed
 
-    @button(emoji="◀️", style=ButtonStyle.secondary)
-    async def prev_page(
+@button(emoji="◀️", style=ButtonStyle.secondary)
+
+async def prev_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         if self.page > 0:
@@ -563,8 +541,9 @@ class Top100View(View):
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-    @button(emoji="▶️", style=ButtonStyle.secondary)
-    async def next_page(
+@button(emoji="▶️", style=ButtonStyle.secondary)
+
+async def next_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         total_all = await self.db.fetchval(
@@ -603,6 +582,30 @@ class Matchmaking(commands.Cog):
             return "Season Placement"
         return None
 
+
+    async def _is_current_season_id(self, season_id: int | None) -> bool:
+        if not season_id:
+            return False
+        current = await self.get_current_season()
+        return bool(current and int(current["id"]) == int(season_id))
+
+    async def _display_mmr_for_member(
+        self,
+        member: discord.Member | None,
+        real_mmr: int,
+        season_id: int | None,
+    ) -> int:
+        """
+        Muestra 0 MMR para Season Placement SOLO en la season activa.
+        Internamente el MMR real no cambia.
+        """
+        if member is None:
+            return int(real_mmr)
+
+        if await self._is_current_season_id(season_id) and self._has_season_placement_role(member):
+            return 0
+
+        return int(real_mmr)
     
     @staticmethod
     def pairwise_deltas_simple(
@@ -716,12 +719,6 @@ class Matchmaking(commands.Cog):
     def _clamp_mmr(value: int) -> int:
         return max(0, int(value))
     
-    @staticmethod
-    def _normalize_season_placement_delta(delta: int) -> int:
-        sign = 1 if int(delta) >= 0 else -1
-        mag = abs(int(delta))
-        mag = max(PLACEMENT_DELTA_MIN, min(PLACEMENT_DELTA_MAX, mag))
-        return sign * mag
 
     def _minute_key_utc(self) -> int:
         now = datetime.datetime.utcnow().replace(second=0, microsecond=0)
@@ -1041,6 +1038,140 @@ class Matchmaking(commands.Cog):
         placements.sort(key=lambda m: join_order.get(m.id, 10**18))
 
         return nonplacements + placements
+
+    async def _is_unplayed_season_placement(
+        self,
+        member: discord.Member | None,
+        season_id: int | None,
+        matches_played: int = 0,
+    ) -> bool:
+        if member is None:
+            return False
+
+        return bool(
+            matches_played == 0
+            and await self._is_current_season_id(season_id)
+            and self._has_season_placement_role(member)
+        )
+
+
+    async def _display_mmr_for_member(
+        self,
+        member: discord.Member | None,
+        real_mmr: int,
+        season_id: int | None,
+        matches_played: int = 0,
+    ) -> int:
+        if await self._is_unplayed_season_placement(member, season_id, matches_played):
+            return 0
+        return int(real_mmr)
+
+
+    async def _display_peak_mmr_for_member(
+        self,
+        member: discord.Member | None,
+        real_peak_mmr: int,
+        season_id: int | None,
+        matches_played: int = 0,
+    ) -> int:
+        if await self._is_unplayed_season_placement(member, season_id, matches_played):
+            return 0
+        return int(real_peak_mmr)
+
+
+    async def _build_visible_leaderboard_rows(
+        self,
+        guild: discord.Guild,
+        season_id: int,
+    ) -> list[dict]:
+        current = await self.get_current_season()
+        is_current = bool(current and int(current["id"]) == int(season_id))
+
+        prev_row = await self._get_previous_season(season_id) if is_current else None
+        prev_id = int(prev_row["id"]) if prev_row else None
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    sp.user_id,
+                    sp.mmr,
+                    sp.role,
+                    COALESCE(mh.matches_played, 0) AS matches_played,
+                    prev.prev_mmr,
+                    prev.prev_pos
+                FROM seasonplayers sp
+                LEFT JOIN (
+                    SELECT user_id, COUNT(*)::int AS matches_played
+                    FROM match_history
+                    WHERE season_id = $1
+                    GROUP BY user_id
+                ) mh
+                    ON mh.user_id = sp.user_id
+                LEFT JOIN (
+                    SELECT
+                        sp2.user_id,
+                        sp2.mmr AS prev_mmr,
+                        RANK() OVER (ORDER BY sp2.mmr DESC, sp2.user_id ASC) AS prev_pos
+                    FROM seasonplayers sp2
+                    WHERE sp2.season_id = $2
+                ) prev
+                    ON prev.user_id = sp.user_id
+                WHERE sp.season_id = $1
+                """,
+                season_id,
+                prev_id,
+            )
+
+        out = []
+        for r in rows:
+            member = guild.get_member(r["user_id"])
+            if member is None:
+                try:
+                    member = await guild.fetch_member(r["user_id"])
+                except Exception:
+                    member = None
+
+            matches_played = int(r["matches_played"] or 0)
+            mmr = int(r["mmr"] or 0)
+
+            is_unplayed_sp = await self._is_unplayed_season_placement(
+                member,
+                season_id,
+                matches_played,
+            )
+
+            out.append(
+                {
+                    "user_id": int(r["user_id"]),
+                    "member": member,
+                    "role": str(r["role"]),
+                    "mmr": mmr,
+                    "visible_mmr": 0 if is_unplayed_sp else mmr,
+                    "matches_played": matches_played,
+                    "prev_mmr": int(r["prev_mmr"] or 0),
+                    "prev_pos": int(r["prev_pos"] or 10**9),
+                    "is_unplayed_sp": is_unplayed_sp,
+                }
+            )
+
+        def sort_key(row: dict):
+            # bucket 0 = jugadores que YA jugaron esta season
+            # bucket 1 = Season Placement sin jugar
+            # bucket 2 = resto sin jugar
+            bucket = 0 if row["matches_played"] > 0 else (1 if row["is_unplayed_sp"] else 2)
+
+            if bucket == 0:
+                return (0, -row["mmr"], row["user_id"])
+
+            if bucket == 1:
+                # se ordenan por cómo quedaron en la season pasada
+                return (1, row["prev_pos"], -row["prev_mmr"], row["user_id"])
+
+            return (2, -row["mmr"], row["user_id"])
+
+        out.sort(key=sort_key)
+        return out
 
     async def _prepare_rooms_for_join_channel(
         self, guild: discord.Guild, join_channel: discord.TextChannel
@@ -2241,59 +2372,51 @@ class Matchmaking(commands.Cog):
 
         return (row["id"], row["name"]) if row else (None, val)
 
-    async def _fetch_user_stats(self, user_id: int, season_id: int):
-        """
-        Devuelve un dict con:
-        - pos, total, mmr, role             (de seasonplayers)
-        - matches_played                    (COUNT(*) de match_history)
-        - last10_wins, last10_losses        (W-L Last 10)
-        - last10_mmr_delta                  (suma de mmr_delta en las últimas 10 partidas)
-        - peak_mmr                          (máximo mmr_after de la season)
-        Todo filtrado por season_id, así sirve para cualquier season.
-        """
-        sql = """
-        WITH ranked AS (
-          SELECT
-            sp.user_id,
-            sp.mmr,
-            sp.role,
-            RANK() OVER (ORDER BY sp.mmr DESC) AS pos
-          FROM seasonplayers sp
-          WHERE sp.season_id = $2
+    async def _fetch_user_stats(
+        self,
+        guild: discord.Guild,
+        user: discord.Member,
+        season_id: int,
+    ):
+        leaderboard = await self._build_visible_leaderboard_rows(guild, season_id)
+        total = len(leaderboard)
+
+        target_idx = next(
+            (i for i, row in enumerate(leaderboard) if int(row["user_id"]) == int(user.id)),
+            None,
         )
-        SELECT r.pos,
-               (SELECT COUNT(*) FROM seasonplayers WHERE season_id = $2) AS total,
-               r.mmr,
-               r.role
-        FROM ranked r
-        WHERE r.user_id = $1
-        """
+        if target_idx is None:
+            return None
 
         async with self.db_pool.acquire() as conn:
-            row = await conn.fetchrow(sql, user_id, season_id)
+            row = await conn.fetchrow(
+                """
+                SELECT sp.mmr, sp.role
+                FROM seasonplayers sp
+                WHERE sp.season_id = $1 AND sp.user_id = $2
+                """,
+                season_id,
+                user.id,
+            )
             if not row:
                 return None
 
-            pos = int(row["pos"])
-            total = int(row["total"])
             mmr = int(row["mmr"])
-            role = row["role"]
+            role = str(row["role"])
 
-            # Total de partidas jugadas en la season
             matches_played = (
                 await conn.fetchval(
                     """
-                SELECT COUNT(*)
-                FROM match_history
-                WHERE season_id = $1 AND user_id = $2
-                """,
+                    SELECT COUNT(*)
+                    FROM match_history
+                    WHERE season_id = $1 AND user_id = $2
+                    """,
                     season_id,
-                    user_id,
+                    user.id,
                 )
                 or 0
             )
 
-            # Últimas 10 partidas (o menos si no hay tantas)
             recent_rows = await conn.fetch(
                 """
                 SELECT is_win, mmr_delta
@@ -2303,16 +2426,13 @@ class Matchmaking(commands.Cog):
                 LIMIT 10
                 """,
                 season_id,
-                user_id,
+                user.id,
             )
 
             last10_wins = sum(1 for r in recent_rows if r["is_win"])
             last10_losses = sum(1 for r in recent_rows if not r["is_win"])
-            last10_delta = (
-                sum(int(r["mmr_delta"]) for r in recent_rows) if recent_rows else 0
-            )
+            last10_delta = sum(int(r["mmr_delta"]) for r in recent_rows) if recent_rows else 0
 
-            # Peak MMR dentro de la season (máximo MMR alcanzado en cualquier momento)
             peak_mmr = await conn.fetchval(
                 """
                 SELECT GREATEST(MAX(mmr_before), MAX(mmr_after))
@@ -2320,25 +2440,36 @@ class Matchmaking(commands.Cog):
                 WHERE season_id = $1 AND user_id = $2
                 """,
                 season_id,
-                user_id,
+                user.id,
             )
-
-            # Si no tiene histórico, usamos el MMR actual
             if peak_mmr is None:
                 peak_mmr = mmr
 
+        visible_mmr = await self._display_mmr_for_member(
+            user,
+            mmr,
+            season_id,
+            int(matches_played),
+        )
+
+        visible_peak = await self._display_peak_mmr_for_member(
+            user,
+            int(peak_mmr),
+            season_id,
+            int(matches_played),
+        )
+
         return {
-            "pos": pos,
+            "pos": target_idx + 1,
             "total": total,
-            "mmr": mmr,
+            "mmr": visible_mmr,
             "role": role,
-            "matches_played": matches_played,
+            "matches_played": int(matches_played),
             "last10_wins": last10_wins,
             "last10_losses": last10_losses,
             "last10_mmr_delta": last10_delta,
-            "peak_mmr": int(peak_mmr),
+            "peak_mmr": visible_peak,
         }
-
     async def resolve_member_name(self, guild: discord.Guild, user_id: int) -> str:
         """Nick del servidor > global display name > username."""
         member = guild.get_member(user_id)
@@ -4140,15 +4271,21 @@ class Matchmaking(commands.Cog):
 
         mmr_delta_last10 = data["last10_mmr_delta"]
         mmr_delta_str = f"{mmr_delta_last10:+d}"
-        
+
         season_status = self._season_status_label(interaction.user)
         status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
-        
+
+        visible_mmr = await self._display_mmr_for_member(
+            interaction.user,
+            int(data["mmr"]),
+            season_id,
+        )
+
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {interaction.user.mention}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
-            f"• **MMR:** {data['mmr']}\n"
+            f"• **MMR:** {visible_mmr}\n"
             f"• **Rank:** {data['role']}\n"
             f"{status_line}"
             f"• **Matches Played:** {data['matches_played']}\n"
@@ -4230,7 +4367,7 @@ class Matchmaking(commands.Cog):
                 "⚠️ No encontré la temporada seleccionada.", ephemeral=True
             )
 
-        data = await self._fetch_user_stats(user.id, season_id)
+        data = await self._fetch_user_stats(interaction.guild, user, season_id)
         if not data:
             player_name = await self.resolve_member_name(interaction.guild, user.id)
             return await interaction.response.send_message(
@@ -4240,15 +4377,21 @@ class Matchmaking(commands.Cog):
 
         mmr_delta_last10 = data["last10_mmr_delta"]
         mmr_delta_str = f"{mmr_delta_last10:+d}"
-        
-        season_status = self._season_status_label(interaction.user)
+
+        season_status = self._season_status_label(user)
         status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
-        
+
+        visible_mmr = await self._display_mmr_for_member(
+            user,
+            int(data["mmr"]),
+            season_id,
+        )
+
         msg = (
             f"**Stats — Season {season_name}**\n"
-            f"• **Player:** {interaction.user.mention}\n"
+            f"• **Player:** {user.mention}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
-            f"• **MMR:** {data['mmr']}\n"
+            f"• **MMR:** {visible_mmr}\n"
             f"• **Rank:** {data['role']}\n"
             f"{status_line}"
             f"• **Matches Played:** {data['matches_played']}\n"
@@ -4294,14 +4437,22 @@ class Matchmaking(commands.Cog):
         mmr_val, role = await self.fetch_player(interaction.user.id)
         name = interaction.user.display_name
         season_status = self._season_status_label(interaction.user)
-    
+        current = await self.get_current_season()
+        current_id = int(current["id"]) if current else None
+
+        visible_mmr = await self._display_mmr_for_member(
+            interaction.user,
+            int(mmr_val),
+            current_id,
+        )
+
         if role == "Placement" and not season_status:
             await interaction.response.send_message(f"{name} is in Placement.")
             return
-    
+
         extra = f" {season_status}." if season_status else ""
         await interaction.response.send_message(
-            f"{name} has {mmr_val} MMR and rank {role}.{extra}"
+            f"{name} has {visible_mmr} MMR and rank {role}.{extra}"
         )
 
     @app_commands.command(
@@ -5403,11 +5554,7 @@ class Matchmaking(commands.Cog):
                 mmr_prev = int(p["mmr_actual"])
                 raw_delta = int(deltas[idx - 1])
 
-                mmr_delta = (
-                    self._normalize_season_placement_delta(raw_delta)
-                    if p.get("is_season_placement", False)
-                    else raw_delta
-                )
+                mmr_delta = raw_delta
 
                 mmr_final = self._clamp_mmr(mmr_prev + mmr_delta)
                 role_name = get_rank_from_mmr(mmr_final)
@@ -5595,3 +5742,4 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
