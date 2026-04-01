@@ -474,6 +474,16 @@ SEASON_RESET_PENALTY = 50
 PLACEMENT_DELTA_MIN = 24
 PLACEMENT_DELTA_MAX = 28
 
+SEASON_CHOICES = [
+    app_commands.Choice(name="Current", value="current"),
+    app_commands.Choice(name="Season 3", value="season 3"),
+    app_commands.Choice(name="Season 2", value="season 2"),
+    app_commands.Choice(name="Season 1", value="season 1"),
+    app_commands.Choice(name="Pre Season", value="pre season"),
+    app_commands.Choice(name="Beta Test Season", value="beta test season"),
+    app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
+]
+
 class Top100View(View):
     def __init__(self, cog, db_pool, interaction, season_id, season_name):
         super().__init__(timeout=None)
@@ -2191,13 +2201,6 @@ class Matchmaking(commands.Cog):
     async def _resolve_season_id(
         self, season_choice: str | None
     ) -> tuple[int | None, str]:
-        """
-        Devuelve (season_id, season_name) según la elección del usuario.
-        - None o "current/actual" => temporada activa
-        - También acepta Season 3, Season 2, Season 1, Pre Season,
-          Beta Test Season y Alpha Test Season
-        - Si no coincide, intenta por nombre exacto o por ID numérico
-        """
         val = (season_choice or "current").strip()
         key = val.lower()
 
@@ -2235,24 +2238,6 @@ class Matchmaking(commands.Cog):
                     "SELECT id, name FROM seasons WHERE id = $1",
                     int(key),
                 )
-
-        return (row["id"], row["name"]) if row else (None, val)
-        async with self.db_pool.acquire() as conn:
-            # Intento por nombres (case-insensitive), priorizando la más reciente
-            where = " OR ".join(
-                f"LOWER(name) = ${i+1}" for i in range(len(candidate_names))
-            )
-            row = await conn.fetchrow(
-                f"SELECT id, name FROM seasons WHERE {where} ORDER BY startdate DESC LIMIT 1",
-                *[c.lower() for c in candidate_names],
-            )
-
-            if not row:
-                # Si el usuario pasó un ID numérico
-                if key.isdigit():
-                    row = await conn.fetchrow(
-                        "SELECT id, name FROM seasons WHERE id = $1", int(key)
-                    )
 
         return (row["id"], row["name"]) if row else (None, val)
 
@@ -4124,21 +4109,14 @@ class Matchmaking(commands.Cog):
         )
 
 
-        SEASON_CHOICES = [
-        app_commands.Choice(name="Current", value="current"),
-        app_commands.Choice(name="Season 3", value="season 3"),
-        app_commands.Choice(name="Season 2", value="season 2"),
-        app_commands.Choice(name="Season 1", value="season 1"),
-        app_commands.Choice(name="Pre Season", value="pre season"),
-        app_commands.Choice(name="Beta Test Season", value="beta test season"),
-        app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
-    ]
-
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(
-        season="Select a season."
+    @app_commands.command(
+        name="stats",
+        description="Shows your position, mmr and rank in the selected season",
     )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(season="Select a season.")
     @app_commands.choices(season=SEASON_CHOICES)
+
     
     async def stats(
         self,
@@ -4227,12 +4205,17 @@ class Matchmaking(commands.Cog):
         else:
             await interaction.response.send_message(content)
 
+    @app_commands.command(
+        name="stats_user",
+        description="Shows another player's stats for the selected season",
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
         user="Player",
         season="Select a season."
     )
     @app_commands.choices(season=SEASON_CHOICES)
-    
+
     async def stats_user(
         self,
         interaction: discord.Interaction,
@@ -4274,9 +4257,12 @@ class Matchmaking(commands.Cog):
         )
         await interaction.response.send_message(msg)
 
-    @app_commands.describe(
-        season="Select a season."
+    @app_commands.command(
+        name="cutoffs",
+        description="Shows the MMR cutoff table for the selected season",
     )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.describe(season="Select a season.")
     @app_commands.choices(season=SEASON_CHOICES)
     
     async def cutoffs(
@@ -5608,6 +5594,10 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
+
+
+
 
 
 
