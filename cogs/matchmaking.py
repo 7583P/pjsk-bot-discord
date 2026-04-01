@@ -2540,6 +2540,7 @@ class Matchmaking(commands.Cog):
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db_pool: asyncpg.Pool | None = None
         self._songs_lock = asyncio.Lock()
         self.queues = {cid: set() for cid in ALLOWED_JOIN_CHANNELS}
         self._slot_last_key = {}
@@ -2550,8 +2551,6 @@ class Matchmaking(commands.Cog):
         self.queue_join_order: dict[int, dict[int, int]] = {
             cid: {} for cid in ALLOWED_JOIN_CHANNELS
         }
-
-        # ✅ AGREGA ESTO:
         self._join_lock = asyncio.Lock()
 
         self.rooms: dict[int, dict] = {}
@@ -2559,8 +2558,9 @@ class Matchmaking(commands.Cog):
             if os.path.isfile("assets/cached_rooms.json"):
                 with open("assets/cached_rooms.json", "r", encoding="utf-8") as f:
                     self.rooms = json.load(f)
-        except:
+        except Exception:
             pass
+
         self._sched_last_minute = {}  # parent_id -> minute_ts
         self._sched_last_slot = {}  # parent_id -> (y,m,d,hm)
 
@@ -2909,6 +2909,11 @@ class Matchmaking(commands.Cog):
                 member.id,
             )
 
+    async def cog_load(self):
+        if self.db_pool is None:
+            self.db_pool = await asyncpg.create_pool(DATABASE_URL)
+
+        async with self.db_pool.acquire() as conn:
             # Jugadores
             await conn.execute(
                 """
@@ -2921,7 +2926,6 @@ class Matchmaking(commands.Cog):
                 """
             )
 
-            # Compatibilidad con instalaciones previas
             await conn.execute(
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS mmr INTEGER NOT NULL DEFAULT 0;"
             )
@@ -2932,6 +2936,7 @@ class Matchmaking(commands.Cog):
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
 
+        # deja debajo el resto de tu cog_load tal como ya lo tienes
             # NEW: tabla de resultados, indexados por un ID global que NO se resetea
             await conn.execute(
                 """
@@ -3897,6 +3902,12 @@ class Matchmaking(commands.Cog):
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
         await interaction.response.defer(ephemeral=True)
+
+        if self.db_pool is None:
+            return await interaction.followup.send(
+                "❌ Database pool not initialized. Restart the bot and try again.",
+                ephemeral=True,
+            )
 
         current_season = await self.get_current_season()
         if not current_season:
