@@ -483,7 +483,19 @@ SEASON_CHOICES = [
     app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
 ]
 
-async def build_embed(self) -> Embed:
+class Top100View(View):
+    def __init__(self, cog, db_pool, interaction, season_id, season_name):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.db = db_pool
+        self.inter = interaction
+        self.season_id = season_id
+        self.season_name = season_name
+        self.page = 0
+        self.per_page = 20
+        self._join_lock = asyncio.Lock()
+
+    async def build_embed(self) -> Embed:
         all_rows = await self.cog._build_visible_leaderboard_rows(
             self.inter.guild,
             self.season_id,
@@ -521,18 +533,18 @@ async def build_embed(self) -> Embed:
         )
         return embed
 
-@button(emoji="◀️", style=ButtonStyle.secondary)
-
-async def prev_page(
+    @button(emoji="◀️", style=ButtonStyle.secondary)
+    async def prev_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         if self.page > 0:
             self.page -= 1
 
-        total_all = await self.db.fetchval(
-            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1", self.season_id
-        )
-        total = min(total_all or 0, 100)
+        total = min(len(await self.cog._build_visible_leaderboard_rows(
+            self.inter.guild,
+            self.season_id,
+        )), 100)
+
         max_page = (total - 1) // self.per_page if total else 0
 
         self.prev_page.disabled = self.page == 0
@@ -541,15 +553,15 @@ async def prev_page(
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
 
-@button(emoji="▶️", style=ButtonStyle.secondary)
-
-async def next_page(
+    @button(emoji="▶️", style=ButtonStyle.secondary)
+    async def next_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        total_all = await self.db.fetchval(
-            "SELECT COUNT(*) FROM seasonplayers WHERE season_id = $1", self.season_id
-        )
-        total = min(total_all or 0, 100)
+        total = min(len(await self.cog._build_visible_leaderboard_rows(
+            self.inter.guild,
+            self.season_id,
+        )), 100)
+
         max_page = (total - 1) // self.per_page if total else 0
 
         if self.page < max_page:
@@ -560,7 +572,6 @@ async def next_page(
 
         new_embed = await self.build_embed()
         await interaction.response.edit_message(embed=new_embed, view=self)
-
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
@@ -4248,8 +4259,6 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(season="Select a season.")
     @app_commands.choices(season=SEASON_CHOICES)
-
-    
     async def stats(
         self,
         interaction: discord.Interaction,
@@ -4262,8 +4271,11 @@ class Matchmaking(commands.Cog):
                 "⚠️ Season not found", ephemeral=True
             )
 
-        user_id = interaction.user.id
-        data = await self._fetch_user_stats(user_id, season_id)
+        data = await self._fetch_user_stats(
+            interaction.guild,
+            interaction.user,
+            season_id,
+        )
         if not data:
             return await interaction.response.send_message(
                 f"You dont have register in **Season {season_name}**.", ephemeral=True
@@ -4275,17 +4287,11 @@ class Matchmaking(commands.Cog):
         season_status = self._season_status_label(interaction.user)
         status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
 
-        visible_mmr = await self._display_mmr_for_member(
-            interaction.user,
-            int(data["mmr"]),
-            season_id,
-        )
-
         msg = (
             f"**Stats — Season {season_name}**\n"
             f"• **Player:** {interaction.user.mention}\n"
             f"• **Position:** #{data['pos']} of {data['total']}\n"
-            f"• **MMR:** {visible_mmr}\n"
+            f"• **MMR:** {data['mmr']}\n"
             f"• **Rank:** {data['role']}\n"
             f"{status_line}"
             f"• **Matches Played:** {data['matches_played']}\n"
@@ -5742,4 +5748,3 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
