@@ -2909,10 +2909,6 @@ class Matchmaking(commands.Cog):
                 member.id,
             )
 
-    async def cog_load(self):
-        # Pool global de PostgreSQL
-        self.db_pool = await asyncpg.create_pool(DATABASE_URL)
-        async with self.db_pool.acquire() as conn:
             # Jugadores
             await conn.execute(
                 """
@@ -2930,16 +2926,10 @@ class Matchmaking(commands.Cog):
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS mmr INTEGER NOT NULL DEFAULT 0;"
             )
             await conn.execute(
-                "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'Placement';"
             )
-            # NEW: tabla de settings globales (para el contador de results)
             await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS global_settings (
-                    key   TEXT PRIMARY KEY,
-                    value BIGINT NOT NULL
-                );
-                """
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
 
             # NEW: tabla de resultados, indexados por un ID global que NO se resetea
@@ -5594,15 +5584,3 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
-
-
-
-
-
-
-
-
-
-
-
-
