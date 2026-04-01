@@ -2910,17 +2910,21 @@ class Matchmaking(commands.Cog):
             await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS players (
-                    user_id BIGINT PRIMARY KEY,                    
+                    user_id BIGINT PRIMARY KEY,
+                    mmr     INTEGER NOT NULL DEFAULT 0,
                     role    TEXT    DEFAULT 'Placement',
                     country TEXT    DEFAULT ''
                 );
                 """
             )
-            # (Compat) por si faltaba la columna country en instalaciones previas
+
+            # Compatibilidad con instalaciones previas
+            await conn.execute(
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS mmr INTEGER NOT NULL DEFAULT 0;"
+            )
             await conn.execute(
                 "ALTER TABLE players ADD COLUMN IF NOT EXISTS country TEXT DEFAULT '';"
             )
-
             # NEW: tabla de settings globales (para el contador de results)
             await conn.execute(
                 """
@@ -3058,23 +3062,6 @@ class Matchmaking(commands.Cog):
             )
 
 
-
-            await conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS seasonplayers (
-                    season_id INTEGER NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
-                    user_id   BIGINT  NOT NULL REFERENCES players(user_id) ON DELETE CASCADE,
-                    mmr       INTEGER NOT NULL DEFAULT 0,
-                    role      TEXT    NOT NULL DEFAULT 'Placement',
-                    PRIMARY KEY (season_id, user_id)
-                );
-                """
-            )
-
-            await conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr ON seasonplayers(season_id, mmr DESC);"
-            )
-
             # 1️⃣ Primero aseguro que la columna server exista
             await conn.execute(
                 """
@@ -3147,6 +3134,10 @@ class Matchmaking(commands.Cog):
                     PRIMARY KEY (season_id, user_id)
                 );
                 """
+            )
+
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr ON seasonplayers(season_id, mmr DESC);"
             )
             # Índices útiles
             await conn.execute(
@@ -5404,6 +5395,8 @@ class Matchmaking(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Matchmaking(bot))
+
+
 
 
 
