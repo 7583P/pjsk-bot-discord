@@ -3880,6 +3880,228 @@ class Matchmaking(commands.Cog):
 
 
     @app_commands.command(
+    name="migrate_players_to_newseason",
+    description="Backfill the active season with players from the previous season and apply Season Placement / Placement."
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        announce="Si true, anuncia el resultado en #historico (si existe).",
+        wipe_current="Si true, borra primero las filas existentes de la season activa para miembros del server."
+    )
+    async def migrate_players_to_newseason(
+        self,
+        interaction: discord.Interaction,
+        announce: bool = True,
+        wipe_current: bool = False,
+    ):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        await interaction.response.defer(ephemeral=True)
+
+        current_season = await self.get_current_season()
+        if not current_season:
+            return await interaction.followup.send(
+                "❌ No hay una season activa en `seasons`.",
+                ephemeral=True,
+            )
+
+        cur_id = int(current_season["id"])
+        cur_name = str(current_season["name"])
+
+        prev_season = await self._get_previous_season(cur_id)
+        if not prev_season:
+            return await interaction.followup.send(
+                "❌ No encontré una season previa para migrar.",
+                ephemeral=True,
+            )
+
+        prev_id = int(prev_season["id"])
+        prev_name = str(prev_season["name"])
+
+        placement_role = guild.get_role(PLACEMENT_ROLE_ID)
+        season_placement_role = guild.get_role(SEASON_PLACEMENT_ROLE_ID)
+
+        if placement_role is None:
+            return await interaction.followup.send(
+                f"❌ No encuentro rol Placement (ID={PLACEMENT_ROLE_ID}).",
+                ephemeral=True,
+            )
+
+        if season_placement_role is None:
+            return await interaction.followup.send(
+                f"❌ No encuentro rol Season Placement (ID={SEASON_PLACEMENT_ROLE_ID}).",
+                ephemeral=True,
+            )
+
+        # Solo jugadores registrados que sigan estando en el servidor
+        guild_member_ids = {m.id for m in guild.members if not m.bot}
+
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                registered_rows = await conn.fetch("SELECT user_id FROM players")
+                registered_ids = {int(r["user_id"]) for r in registered_rows}
+
+                target_ids = registered_ids & guild_member_ids
+                if not target_ids:
+                    return await interaction.followup.send(
+                        "⚠️ No encontré jugadores registrados que sigan en el servidor.",
+                        ephemeral=True,
+                    )
+
+                if wipe_current:
+                    await conn.execute(
+                        """
+                        DELETE FROM seasonplayers
+                        WHERE season_id = $1
+                          AND user_id = ANY($2::bigint[])
+                        """,
+                        cur_id,
+                        list(target_ids),
+                    )
+
+                # Returning players = sí jugaron / sí tuvieron mmr real en la season anterior
+                returning_rows = await conn.fetch(
+                    """
+                    SELECT DISTINCT sp.user_id
+                    FROM seasonplayers sp
+                    WHERE sp.season_id = $1
+                      AND (
+                            sp.mmr > 0
+                            OR EXISTS (
+                                SELECT 1
+                                FROM match_history mh
+                                WHERE mh.season_id = sp.season_id
+                                  AND mh.user_id = sp.user_id
+                            )
+                      )
+                    """,
+                    prev_id,
+                )
+
+                returning_ids = {int(r["user_id"]) for r in returning_rows} & target_ids
+                placement_ids = target_ids - returning_ids
+
+                payload = []
+                player_updates = []
+
+                for uid in sorted(target_ids):
+                    if uid in returning_ids:
+                        prev_mmr = await conn.fetchval(
+                            """
+                            SELECT mmr
+                            FROM seasonplayers
+                            WHERE season_id = $1 AND user_id = $2
+                            """,
+                            prev_id,
+                            uid,
+                        ) or 0
+
+                        seeded_mmr = self._clamp_mmr(int(prev_mmr) - SEASON_RESET_PENALTY)
+                        seeded_role = get_rank_from_mmr(seeded_mmr)
+                    else:
+                        seeded_mmr = 0
+                        seeded_role = "Placement"
+
+                    payload.append((cur_id, uid, seeded_mmr, seeded_role))
+                    player_updates.append((uid, seeded_mmr, seeded_role))
+
+                # Upsert seasonplayers de la season activa
+                CHUNK = 500
+                for i in range(0, len(payload), CHUNK):
+                    await conn.executemany(
+                        """
+                        INSERT INTO seasonplayers (season_id, user_id, mmr, role)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (season_id, user_id)
+                        DO UPDATE SET
+                            mmr = EXCLUDED.mmr,
+                            role = EXCLUDED.role
+                        """,
+                        payload[i:i + CHUNK],
+                    )
+
+                # Coherencia visual en tabla players
+                for i in range(0, len(player_updates), CHUNK):
+                    await conn.executemany(
+                        """
+                        UPDATE players
+                        SET mmr = $2, role = $3
+                        WHERE user_id = $1
+                        """,
+                        player_updates[i:i + CHUNK],
+                    )
+
+        # Reasignar roles en Discord
+        rank_role_ids = set(RANK_ROLE_IDS.values()) | {SEASON_PLACEMENT_ROLE_ID}
+
+        me = guild.get_member(self.bot.user.id) if self.bot.user else None
+        can_manage_nicks = bool(me and me.guild_permissions.manage_nicknames)
+
+        edited = 0
+        failed = 0
+
+        for uid in sorted(target_ids):
+            member = guild.get_member(uid)
+            if not member or member.bot:
+                continue
+
+            keep = [r for r in member.roles if r.id not in rank_role_ids]
+
+            # Returning players -> Season Placement
+            # Nuevos / sin historial -> Placement normal
+            target_role = season_placement_role if uid in returning_ids else placement_role
+            new_roles = list(dict.fromkeys(keep + [target_role]))
+
+            try:
+                new_nick = None
+                if can_manage_nicks and member.nick:
+                    new_nick = re.sub(r"\s*\[[^\]]+\]\s*$", "", member.nick).strip() or None
+
+                await member.edit(
+                    roles=new_roles,
+                    nick=new_nick if can_manage_nicks else discord.utils.MISSING,
+                    reason=f"Migrate players to active season -> {cur_name}",
+                )
+                edited += 1
+            except Exception:
+                failed += 1
+
+            if (edited + failed) % 10 == 0:
+                await asyncio.sleep(1.0)
+
+        if announce:
+            historico = discord.utils.get(guild.text_channels, name=self.HISTORICO_CHANNEL_NAME)
+            if historico:
+                try:
+                    await historico.send(
+                        f"🛠️ **Season migration applied**\n"
+                        f"📦 **Previous season**: **{prev_name}** (ID {prev_id})\n"
+                        f"🆕 **Active season**: **{cur_name}** (ID {cur_id})\n"
+                        f"🔁 **Season Placement**: {len(returning_ids)} returning players\n"
+                        f"🆕 **Placement**: {len(placement_ids)} new / sin historial\n"
+                        f"👥 **Migrated members in server**: {len(target_ids)}\n"
+                        f"✅ **Roles edited**: {edited}\n"
+                        f"⚠️ **Role edit failed**: {failed}"
+                    )
+                except Exception:
+                    pass
+
+        await interaction.followup.send(
+            f"✅ Migration complete.\n"
+            f"**Previous season:** {prev_name} (ID {prev_id})\n"
+            f"**Active season:** {cur_name} (ID {cur_id})\n"
+            f"**Migrated registered members in server:** {len(target_ids)}\n"
+            f"**Season Placement:** {len(returning_ids)}\n"
+            f"**Placement:** {len(placement_ids)}\n"
+            f"**Roles edited:** {edited}\n"
+            f"**Role edit failed:** {failed}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
         name="stats",
         description="Shows your position, mmr and rank in the selected season",
     )
