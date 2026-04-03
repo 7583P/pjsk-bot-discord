@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Literal, List
 
 rank_colors = {
+    "Season Placement": ("#ff8519", "#ff8519"),
     "Placement": ("#ff4600", "#ff7000"),
     "Iron": ("#8d7f79", "#5f514a"),
     "Iron ⬆": ("#917f76", "#775341"),
