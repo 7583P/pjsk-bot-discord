@@ -2459,7 +2459,7 @@ class Matchmaking(commands.Cog):
                 WHERE season_id = $1 AND user_id = $2
                 """,
                 season_id,
-                user_id,
+                user.id,
             )
 
             # Si no tiene histórico, usamos el MMR actual
@@ -3262,6 +3262,15 @@ class Matchmaking(commands.Cog):
                     END IF;
                 END$$;
             """
+            )
+
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS global_settings (
+                    key   TEXT PRIMARY KEY,
+                    value BIGINT NOT NULL
+                );
+                """
             )
 
             #Season Reset
@@ -5386,8 +5395,6 @@ class Matchmaking(commands.Cog):
 
         # Bloquear submits mientras dura la votación
         room["vote_in_progress"] = True
-
-        room["vote_in_progress"] = True
         try:
             # ---- Votación ----
             intro = (
@@ -5571,7 +5578,6 @@ class Matchmaking(commands.Cog):
                 raw_delta = int(deltas[idx - 1])
 
                 mmr_delta = raw_delta
-
                 mmr_final = self._clamp_mmr(mmr_prev + mmr_delta)
                 role_name = get_rank_from_mmr(mmr_final)
 
@@ -5624,16 +5630,14 @@ class Matchmaking(commands.Cog):
                     role_name,
                 )
 
-                applied_role = await self._apply_rank_role(
+                await self._apply_rank_role(
                     ctx.guild,
                     p["member"],
                     role_name,
                     reason=f"Submit result #{result_id}",
                 )
 
-                name_with_flag = (
-                    f"{p['member'].display_name} {p['display_flag']}".rstrip()
-                )
+                name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append(
                     (
                         idx,
@@ -5648,117 +5652,121 @@ class Matchmaking(commands.Cog):
                     )
                 )
 
-                # PUBLICAR RESULTADOS
-                join_parent = ctx.channel.parent
-                result_chan_id = (
-                    JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
-                )
-                result_chan = (
-                    await self._resolve_channel(result_chan_id, fallback=ctx.channel)
-                    if result_chan_id
-                    else ctx.channel
-                )
-                
-                gap_low = room.get("gap_low")
-                gap_high = room.get("gap_high")
-                songs = room.get("songs") or []
-                
-                if songs:
-                    await self.db_pool.executemany(
-                        """
-                        INSERT INTO match_songs (result_id, song_name, level, difficulty, notes_count)
-                        VALUES ($1, $2, $3, $4, $5)
-                        """,
-                        [
-                            (result_id, title, lvl, diff, notes)
-                            for (title, lvl, diff, notes) in songs
-                        ],
-                    )
-                
-                gap_text = ""
-                if gap_low is not None and gap_high is not None:
-                    gap_text = f" · Lv {gap_low}-{gap_high}"
-                    if room_mmr is not None:
-                        gap_text += f" · Avg MMR {room_mmr}"
-                
-                songs_block = ""
-                if songs:
-                    song_lines = [
-                        f"Lv {lvl} {diff} — {title} ({notes} notes)"
+            # =========================
+            # PUBLICAR RESULTADOS 1 SOLA VEZ
+            # =========================
+            join_parent = ctx.channel.parent
+            result_chan_id = JOIN_TO_RESULTS.get(join_parent.id) if join_parent else None
+            result_chan = (
+                await self._resolve_channel(result_chan_id, fallback=ctx.channel)
+                if result_chan_id
+                else ctx.channel
+            )
+
+            gap_low = room.get("gap_low")
+            gap_high = room.get("gap_high")
+            songs = room.get("songs") or []
+
+            if songs:
+                await self.db_pool.executemany(
+                    """
+                    INSERT INTO match_songs (result_id, song_name, level, difficulty, notes_count)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    [
+                        (result_id, title, lvl, diff, notes)
                         for (title, lvl, diff, notes) in songs
-                    ]
-                    songs_block = "\n**Songs (Lv / Diff / Notes):**\n" + "\n".join(song_lines)
-                
-                header_line = f"ID: {result_id}{gap_text}{songs_block}"
-                
+                    ],
+                )
+
+            gap_text = ""
+            if gap_low is not None and gap_high is not None:
+                gap_text = f" · Lv {gap_low}-{gap_high}"
+                if room_mmr is not None:
+                    gap_text += f" · Avg MMR {room_mmr}"
+
+            songs_block = ""
+            if songs:
+                song_lines = [
+                    f"Lv {lvl} {diff} — {title} ({notes} notes)"
+                    for (title, lvl, diff, notes) in songs
+                ]
+                songs_block = "\n**Songs (Lv / Diff / Notes):**\n" + "\n".join(song_lines)
+
+            header_line = f"ID: {result_id}{gap_text}{songs_block}"
+
+            with Image.open("assets/logo.png") as logo_img:
                 buf = generate_results_image(
                     summary,
                     font_path="assets/rodinntlg_eb.otf",
-                    side_image=Image.open("assets/logo.png"),
+                    side_image=logo_img.copy(),
                 )
-                image_bytes = buf.read()
-                
-                embed = discord.Embed(
-                    title=f"RESULTS — {season_name}",
-                    description=header_line,
-                    color=0x00F7FF,
-                ).set_image(url="attachment://results.png")
-                
-                msg_result = await result_chan.send(
-                    embed=embed,
-                    file=discord.File(io.BytesIO(image_bytes), "results.png"),
+
+            image_bytes = buf.read()
+
+            embed = discord.Embed(
+                title=f"RESULTS — {season_name}",
+                description=header_line,
+                color=0x00F7FF,
+            ).set_image(url="attachment://results.png")
+
+            msg_result = await result_chan.send(
+                embed=embed,
+                file=discord.File(io.BytesIO(image_bytes), "results.png"),
+            )
+
+            await ctx.send(
+                embed=embed,
+                file=discord.File(io.BytesIO(image_bytes), "results.png"),
+            )
+
+            await result_chan.send("MMR Updated")
+            await ctx.send("MMR Updated")
+
+            await self.db_pool.execute(
+                """
+                INSERT INTO results (
+                    result_id, season_id, season_name, channel_id, message_id,
+                    gap_low, gap_high, room_mmr, songs_block
                 )
-                await ctx.send(
-                    embed=embed,
-                    file=discord.File(io.BytesIO(image_bytes), "results.png"),
-                )
-                await result_chan.send("MMR Updated")
-                await ctx.send("MMR Updated")
-                
-                await self.db_pool.execute(
-                    """
-                    INSERT INTO results (
-                        result_id, season_id, season_name, channel_id, message_id,
-                        gap_low, gap_high, room_mmr, songs_block
-                    )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                    """,
-                    result_id,
-                    season_id,
-                    season_name,
-                    msg_result.channel.id,
-                    msg_result.id,
-                    gap_low,
-                    gap_high,
-                    room_mmr,
-                    songs_block.strip() if songs_block else None,
-                )
-                
-                room["finished"] = True
-                room["closed"] = True
-                
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                """,
+                result_id,
+                season_id,
+                season_name,
+                msg_result.channel.id,
+                msg_result.id,
+                gap_low,
+                gap_high,
+                room_mmr,
+                songs_block.strip() if songs_block else None,
+            )
+
+            room["finished"] = True
+            room["closed"] = True
+
+            try:
+                await self._remove_queue_roles(players)
+            except Exception:
+                pass
+
+            await ctx.send("This room has been submited results")
+
+            rid = next(
+                (
+                    rid
+                    for rid, r in self.rooms.items()
+                    if r.get("thread") and r["thread"] == ctx.channel.id
+                ),
+                None,
+            )
+            if rid is not None:
                 try:
-                    await self._remove_queue_roles(players)
+                    self.bot.dispatch("room_finished", rid)
                 except Exception:
                     pass
-                
-                await ctx.send("This room has been submited results")
-                
-                rid = next(
-                    (
-                        rid
-                        for rid, r in self.rooms.items()
-                        if r.get("thread") and r["thread"] == ctx.channel.id
-                    ),
-                    None,
-                )
-                if rid is not None:
-                    try:
-                        self.bot.dispatch("room_finished", rid)
-                    except Exception:
-                        pass
-                
-                asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
+
+            asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
             # pero asegurándote que siga con ESTA MISMA indentación (dentro del try)
 
         finally:
