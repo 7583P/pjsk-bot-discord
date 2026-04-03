@@ -5766,7 +5766,7 @@ class Matchmaking(commands.Cog):
                 except Exception:
                     pass
 
-            asyncio.create_task(self.close_room(ctx.channel, delay=60, delete=True))
+            asyncio.create_task(self.close_room(ctx.channel, delay=30, delete=True))
             # pero asegurándote que siga con ESTA MISMA indentación (dentro del try)
 
         finally:
