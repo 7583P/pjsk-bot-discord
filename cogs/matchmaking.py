@@ -580,14 +580,22 @@ class Matchmaking(commands.Cog):
     RAW_JP = "https://raw.githubusercontent.com/Sekai-World/sekai-master-db-diff/main"
     DIFFS = DIFFICULTY_PRIORITY
 
+
     def _find_player_room_id(self, member: discord.Member) -> int | None:
+        target_id = int(member.id)
         for rid, info in self.rooms.items():
             if info.get("finished", False):
                 continue
-            if member in info.get("players", []):
-                return rid
+            for p in info.get("players", []) or []:
+                pid = getattr(p, "id", p)
+                try:
+                    pid = int(pid)
+                except Exception:
+                    continue
+                if pid == target_id:
+                    return rid
         return None
-        
+
     def _season_status_label(self, member: discord.Member | None) -> str | None:
         if member and self._has_season_placement_role(member):
             return "Season Placement"
@@ -798,6 +806,32 @@ class Matchmaking(commands.Cog):
                 return rid, info
         return None, None
 
+
+
+    def _find_player_room(
+        self,
+        member: discord.Member,
+        *,
+        join_channel_id: int | None = None,
+        include_started: bool = True,
+    ) -> tuple[int | None, dict | None]:
+        target_id = int(member.id)
+        for rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if join_channel_id is not None and int(info.get("join_channel_id") or 0) != int(join_channel_id):
+                continue
+            if not include_started and info.get("started", False):
+                continue
+            for p in info.get("players", []) or []:
+                pid = getattr(p, "id", p)
+                try:
+                    pid = int(pid)
+                except Exception:
+                    continue
+                if pid == target_id:
+                    return rid, info
+        return None, None
 
     async def _effective_display_mmrs(self, members: list[discord.Member]) -> dict[int, int]:
         """
@@ -1827,60 +1861,54 @@ class Matchmaking(commands.Cog):
         return (base + dt.timedelta(hours=1)).replace(minute=bases[0])
 
 
+
     async def build_rooms_overview_text(self, guild: discord.Guild, join_channel_id: int) -> str:
         """
         Texto para #rooms:
-        - Lista rooms STARTED (con timestamp)
-        - Luego lista FUTURE ROOMS (desde la queue /c), agrupadas de 5 y con huecos
+        - Muestra solo las salas activas/iniciadas
+        - Y, si existe, la única sala pendiente por completar
         """
-        now = self._now_lima()
+        active_rooms: list[tuple[int, dict]] = []
+        pending_room: tuple[int, dict] | None = None
 
-        # ---------- STARTED ROOMS (threads existentes) ----------
-        started_rooms: list[tuple[int, dict]] = []
         for rid, info in self._rooms_for_parent(join_channel_id):
             if info.get("finished", False):
                 continue
-            if info.get("phase") == PHASE_STARTED or info.get("started", False):
-                started_rooms.append((rid, info))
 
-        started_rooms.sort(key=lambda t: int(t[1].get("display_num") or 999999))
+            players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
 
-        # batch mmr para players de rooms started
-        started_member_ids: list[int] = []
-        for _rid, info in started_rooms:
-            for m in info.get("players", []) or []:
-                if m and not m.bot and not self._is_placement_member(m):
-                    started_member_ids.append(m.id)
+            if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+                active_rooms.append((rid, info))
+            elif pending_room is None and len(players) < ROOM_CAPACITY:
+                pending_room = (rid, info)
 
-        started_members = []
-        for _rid, info in started_rooms:
-            for m in info.get("players", []) or []:
-                if m and not m.bot and not self._is_placement_member(m):
-                    started_members.append(m)
+        active_rooms.sort(key=lambda t: int(t[1].get("display_num") or 999999))
 
-        started_mmr_map = await self._effective_display_mmrs(started_members)
+        members_for_mmr: list[discord.Member] = []
+        for _rid, info in active_rooms:
+            members_for_mmr.extend([m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)])
+        if pending_room is not None:
+            members_for_mmr.extend([m for m in (pending_room[1].get("players", []) or []) if m and not getattr(m, "bot", False)])
 
+        mmr_map = await self._effective_display_mmrs(members_for_mmr)
         lines: list[str] = []
 
-        for rid, info in started_rooms:
+        for rid, info in active_rooms:
             disp = self._disp(info, rid)
-            started_at = info.get("started_at")
-            ts_part = f"<t:{int(started_at)}:T>" if started_at else "—"
+            lines.append(f"ROOM {disp} ACTIVE")
 
-            lines.append(f"ROOM {disp} STARTED {ts_part}")
-
-            players = [m for m in (info.get("players", []) or []) if m and not m.bot]
+            players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
             rows = []
             for m in players:
                 if self._is_placement_member(m):
                     rows.append((m.display_name, -1, "placement"))
                 elif self._has_season_placement_role(m):
-                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "season_placement"))
+                    rows.append((m.display_name, int(mmr_map.get(m.id, 0)), "season_placement"))
                 else:
-                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "regular"))
-            
+                    rows.append((m.display_name, int(mmr_map.get(m.id, 0)), "regular"))
+
             rows.sort(key=lambda x: (x[2] == "placement", -x[1], x[0].lower()))
-            
+
             for name, mmr, status in rows:
                 if status == "placement":
                     lines.append(f"{name} Placement")
@@ -1888,62 +1916,49 @@ class Matchmaking(commands.Cog):
                     lines.append(f"{name} {mmr}MMR — Season Placement")
                 else:
                     lines.append(f"{name} {mmr}MMR")
-            lines.append("")  # blank line entre rooms
+            lines.append("")
 
-        # ---------- FUTURE ROOMS (desde la QUEUE /c; sin thread) ----------
-        ordered = await self._get_ordered_queue_members(guild, join_channel_id)
-        if ordered:
-            future_slot = self._next_slot_dt_local(now)
-            future_slot_ts = int(future_slot.timestamp())
+        if pending_room is not None:
+            rid, info = pending_room
+            disp = self._disp(info, rid)
+            players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+            need = max(0, ROOM_CAPACITY - len(players))
 
-            lines.append("----------------")
-            lines.append(f"FUTURE ROOMS (next slot <t:{future_slot_ts}:T>)")
+            lines.append(f"ROOM {disp} PENDING ({len(players)}/{ROOM_CAPACITY})")
+            for m in players:
+                if self._is_placement_member(m):
+                    lines.append(f"{m.display_name} Placement")
+                elif self._has_season_placement_role(m):
+                    lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR — Season Placement")
+                else:
+                    lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
 
-            mmr_map = await self._effective_display_mmrs(ordered)
-            groups = [ordered[i:i + ROOM_CAPACITY] for i in range(0, len(ordered), ROOM_CAPACITY)]
-            for idx, g in enumerate(groups, start=1):
-                lines.append(f"ROOM {idx}")
-                for m in g:
-                    if self._is_placement_member(m):
-                        lines.append(f"{m.display_name} Placement")
-                    elif self._has_season_placement_role(m):
-                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR — Season Placement")
-                    else:
-                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
+            if need > 0:
+                lines.append(f"Need {need} player(s) to fill the room. `/start` is available from 3 players.")
+            lines.append("")
 
-                # huecos visuales hasta 5
-                for _ in range(ROOM_CAPACITY - len(g)):
-                    lines.append("")
+        return "\n".join(lines).rstrip() or "No active rooms."
 
-                lines.append("")
-
-        return "\n".join(lines).rstrip()
-
-            
 
     async def build_future_room_block(
         self, guild: discord.Guild, join_channel_id: int, now: dt.datetime
     ) -> str:
-        """
-        Bloque para que el cog Rooms lo agregue debajo de todas las salas:
-        ----------------- Future Room (starting at :x0)
-        u1 (mmr)
-        u2 (mmr)
-        """
-        ordered = await self._get_ordered_queue_members(guild, join_channel_id)
-        if not ordered:
+        rid, info = await self._find_joinable_room(join_channel_id)
+        if rid is None or not info:
             return ""
 
-        mmr_map = await self._effective_display_mmrs(ordered)
+        players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+        if not players or info.get("started", False):
+            return ""
 
-        label = self._next_start_minute_label(now)
-        lines = [f"----------------- Future Room (starting at {label})"]
-        for m in ordered:
+        mmr_map = await self._effective_display_mmrs(players)
+
+        lines = [f"----------------- Room {self._disp(info, rid)} Pending ({len(players)}/{ROOM_CAPACITY})"]
+        for m in players:
             if self._is_placement_member(m):
                 lines.append(f"{m.display_name} (Placement)")
             else:
                 lines.append(f"{m.display_name} ({int(mmr_map.get(m.id, 0))})")
-
         return "\n".join(lines)
 
     async def _room_mmrs(self, players: list[discord.Member]) -> dict[int, int]:
@@ -1970,6 +1985,7 @@ class Matchmaking(commands.Cog):
         vals = [mmr_map.get(m.id, 0) for m in players]
         return int(round(sum(vals) / len(vals))) if vals else 0
 
+
     async def _create_room(
         self,
         join_channel: discord.TextChannel,
@@ -1977,26 +1993,24 @@ class Matchmaking(commands.Cog):
         thread_name: str | None = None,
     ):
         if not thread_name:
-            # fallback seguro
-            dt_local = self._now_lima()
-            thread_name = f"room {dt_local.strftime('%Y-%m-%d %H%M')}"
+            thread_name = "room-new"
 
         thread = await join_channel.create_thread(
             name=thread_name,
             type=discord.ChannelType.private_thread,
             auto_archive_duration=1440,
-            invitable=True,  # 👈 importante si tu versión lo soporta
+            invitable=True,
         )
 
-        await asyncio.sleep(0.2)  # 👈 evita “thread not ready” en algunos servers
+        await asyncio.sleep(0.2)
 
         info = {
             "thread": thread.id,
             "join_channel_id": join_channel.id,
             "server": server_code,
             "players": [],
-            "phase": PHASE_FUTURE,  # FUTURE: thread listo, songs aún NO
-            "locked_in_thread": True,  # si quieres que estén bloqueados desde PREP
+            "phase": PHASE_PENDING,
+            "locked_in_thread": False,
             "started": False,
             "finished": False,
             "created_ts": int(self._now_lima().timestamp()),
@@ -2005,38 +2019,101 @@ class Matchmaking(commands.Cog):
         self.rooms[rid] = info
         return rid, info
 
+    async def _find_joinable_room(
+        self, join_channel_id: int
+    ) -> tuple[int | None, dict | None]:
+        pending: list[tuple[int, dict]] = []
+        for rid, info in self._rooms_for_parent(join_channel_id):
+            if info.get("finished", False):
+                continue
+            if info.get("started", False):
+                continue
+            players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+            if len(players) < ROOM_CAPACITY:
+                pending.append((rid, info))
+
+        pending.sort(
+            key=lambda t: (
+                int(t[1].get("display_num") or 999999),
+                int(t[1].get("created_ts", 0)),
+                t[0],
+            )
+        )
+        return pending[0] if pending else (None, None)
+
+    async def _start_room_now(
+        self,
+        rid: int,
+        info: dict,
+        *,
+        started_by: discord.Member | None = None,
+        reason: str = "manual",
+    ) -> bool:
+        if not info or info.get("finished", False):
+            return False
+        if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+            return False
+
+        players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+        if len(players) < 3:
+            return False
+
+        thread = await self._get_room_thread(info)
+        if thread is None:
+            return False
+
+        await self.launch_song_poll(info)
+
+        info["phase"] = PHASE_STARTED
+        info["started"] = True
+        info["started_at"] = int(self._now_lima().timestamp())
+
+        try:
+            if reason == "auto":
+                await thread.send("✅ Room is full (5/5). Match started automatically. Good luck and have fun!")
+            elif started_by is not None:
+                await thread.send(f"✅ Match started by {started_by.mention}. Good luck and have fun!")
+            else:
+                await thread.send("✅ Match started. Good luck and have fun!")
+        except Exception:
+            pass
+
+        try:
+            await self.update_room_board(thread.guild, rid)
+        except Exception:
+            pass
+
+        self.bot.dispatch("room_updated", rid)
+        return True
+
+
     async def _reindex_parent_rooms(self, guild: discord.Guild, parent_id: int):
         """
-        Recalcula display_num por parent #join:
-        - Primero NO started (incluye STARTING), luego started
-        - Dentro de NO started: Average MMR DESC (más alto = room-1)
-        - Desempates: created_ts asc, rid asc
-        Además renombra thread a room-{display_num}.
+        Reindexa las salas visibles de un canal join:
+        - Primero las activas/iniciadas
+        - Luego la sala pendiente por completar
+        - Dentro de cada grupo: por orden previo si existe, si no por created_ts
+        Además renombra el thread a room-{display_num}.
         """
         items = self._rooms_for_parent(parent_id)
 
-        scored: list[tuple[bool, int, int, int, dict]] = []
-        # tupla: (started, -avg, created_ts, rid, info)
-        for rid, info in items:
+        def sort_key(item: tuple[int, dict]):
+            rid, info = item
             started = bool(info.get("started", False))
             created = int(info.get("created_ts", 0))
-            players = info.get("players", [])
-            avg = await self._avg_mmr(players) if players else -1
-            scored.append((started, -int(avg), created, rid, info))
+            display_num = int(info.get("display_num") or 999999)
+            return (0 if started else 1, display_num if display_num != 999999 else created, created, rid)
 
-        scored.sort(key=lambda t: (1 if t[0] else 0, t[1], t[2], t[3]))
-
-        for idx, (_started, _negavg, _created, rid, info) in enumerate(scored, start=1):
+        for idx, (rid, info) in enumerate(sorted(items, key=sort_key), start=1):
             info["display_num"] = idx
-            th: discord.Thread = self.bot.get_channel(
-                info["join_channel_id"]
-            ).get_thread(info["thread"])
-            try:
-                await th.edit(name=f"room-{idx}")
-            except Exception:
-                pass
 
-            # refrescar encabezado del tablero del thread
+            thread = await self._get_room_thread(info)
+            if thread is not None:
+                try:
+                    await thread.edit(name=f"room-{idx}")
+                except Exception:
+                    pass
+
             try:
                 await self.update_room_board(guild, rid)
             except Exception:
@@ -2518,22 +2595,16 @@ class Matchmaking(commands.Cog):
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
 
+
         started = bool(info.get("started", False))
-        starting = bool(info.get("starting", False))
         finished = bool(info.get("finished", False))
 
         if finished:
             status = "[FINISHED]"
         elif started:
-            started_at = info.get("started_at")
-            ts_part = f" <t:{int(started_at)}:T>" if started_at else ""
-            status = f"[STARTED]{ts_part}"
-        elif starting:
-            dl = info.get("start_deadline_ts")
-            ts_part = f" <t:{int(dl)}:R>" if dl else ""
-            status = f"[STARTING]{ts_part}"
+            status = "[ACTIVE]"
         else:
-            status = "[NOT STARTED]"
+            status = "[PENDING]"
 
         disp = self._disp(info, rid)
         header = f"Room {disp}: {len(rows)}/{capacity} Players · Average MMR {avg} · {status}"
@@ -2697,7 +2768,6 @@ class Matchmaking(commands.Cog):
         self.queues = {cid: set() for cid in ALLOWED_JOIN_CHANNELS}
         self._slot_last_key = {}
         self._need_last_minute = {}
-        self.room_slot_scheduler.start()
         self._prep_last_minute = {}  # join_id -> (y,m,d,h,min) gate para PREP
         self._queue_counter = 0
         self.queue_join_order: dict[int, dict[int, int]] = {
@@ -3841,9 +3911,10 @@ class Matchmaking(commands.Cog):
                 return ch
         return await guild.create_text_channel(JOIN_CHANNEL_NAME)
 
+
     @app_commands.command(
         name="c",
-        description="Join queue for the next room slot",
+        description="Create or join the current room",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def join_room(self, interaction: discord.Interaction):
@@ -3860,73 +3931,133 @@ class Matchmaking(commands.Cog):
         member: discord.Member = interaction.user  # type: ignore
 
         async with self._join_lock:
-            # Guard: ya estás en una sala activa (cualquier fase no-finished)
-            already_room = self._find_player_room_id(member)
-            if already_room is not None:
+            already_room_id = self._find_player_room_id(member)
+            if already_room_id is not None:
+                _rid, info = self._find_player_room(member)
+                disp = self._disp(info, already_room_id) if info else already_room_id
                 return await interaction.response.send_message(
-                    "❌ You are already in a room. You cannot queue again until that room finishes.",
+                    f"❌ You are already in room **{disp}**.",
                     ephemeral=True,
                 )
 
-            # Guard: ya estás en cola (EN o JP)
-            for cid in ALLOWED_JOIN_CHANNELS:
-                if member.id in self.queues.get(cid, set()):
-                    return await interaction.response.send_message(
-                        "❌ You are already in the queue.", ephemeral=True
+            rid, info = await self._find_joinable_room(ch.id)
+            created_new_room = False
+
+            if rid is None or info is None:
+                server_code = JOIN_CHANNEL_CFG.get(ch.id, {}).get("server", "en")
+                rid, info = await self._create_room(ch, server_code=server_code, thread_name="room-new")
+                created_new_room = True
+
+            await self._add_member_to_room(member, rid, info)
+            info["phase"] = PHASE_PENDING
+            info["locked_in_thread"] = False
+
+            thread = await self._get_room_thread(info)
+            if thread is not None:
+                try:
+                    await thread.send(
+                        f"{member.mention} joined the room. ({len(info.get('players', []))}/{ROOM_CAPACITY})"
                     )
+                except Exception:
+                    pass
 
-            # Lock-down: durante PREP se bloquea SOLO si need==0 (tu lógica actual)
-            now = self._now_lima()
-            if await self._is_join_locked(guild, ch.id, now):
-                return await interaction.response.send_message(
-                    "⛔ Queue is locked down until the next slot.", ephemeral=True
-                )
+            await self._reindex_parent_rooms(guild, ch.id)
+            await self.update_room_board(guild, rid)
+            self.bot.dispatch("room_updated", rid)
 
-            # Siempre encola (no se intenta meter a rooms “unfilled”)
-            self.queues.setdefault(ch.id, set()).add(member.id)
-            self._queue_counter += 1
-            self.queue_join_order[ch.id][member.id] = self._queue_counter
+            disp = self._disp(info, rid)
+            player_count = len(
+                [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+            )
+            auto_started = False
+            if player_count >= ROOM_CAPACITY:
+                auto_started = await self._start_room_now(rid, info, started_by=None, reason="auto")
 
-            # Rol de queue según canal
-            await self._assign_queue_role_for_join(member, ch.id)
+        if auto_started:
+            return await interaction.response.send_message(
+                f"Joined room **{disp}**. The room reached **5/5** and started automatically.",
+                ephemeral=True,
+            )
 
-            # Calcular posición informativa (orden determinístico)
-            ordered = await self._get_ordered_queue_members(guild, ch.id)
-            try:
-                idx = ordered.index(member)
-            except ValueError:
-                idx = len(ordered) - 1
-
-            room_no = (idx // ROOM_CAPACITY) + 1
-            pos_in_room = (idx % ROOM_CAPACITY) + 1
-            need = await self._need_players_next_room(guild, ch.id)
-
-            # Slot informativo
-            slot_dt = self._next_slot_dt_local(now)
-            slot_ts = int(slot_dt.timestamp())
-
-            # Notificar al cog Rooms para refrescar #rooms
-            self.bot.dispatch("room_updated", None)
-
-        # Respuesta (fuera del lock)
-        await interaction.response.send_message(
-            f"Queued. Future room **{room_no}** ({pos_in_room}/5). "
-            f"{'Room complete.' if need == 0 else f'Need {need} more to complete the next room.'}\n"
-            f"Next slot: <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
+        room_action = "Created" if created_new_room else "Joined"
+        extra = ""
+        if player_count >= 3:
+            extra = " `/start` is now available for this room."
+        return await interaction.response.send_message(
+            f"{room_action} room **{disp}** ({player_count}/{ROOM_CAPACITY}).{extra}",
             ephemeral=True,
         )
 
-        # Mensaje público en #join / #jp-join
-        try:
-            qcount = len(self.queues.get(ch.id, set()))
-            await ch.send(f"({member.mention}) Joined the queue (`{qcount}`)")
-        except Exception:
-            pass
+    @app_commands.command(
+        name="start",
+        description="Start your current room once it has at least 3 players",
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def start_room(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
+        member: discord.Member = interaction.user  # type: ignore
+        ch = interaction.channel
+
+        async with self._join_lock:
+            rid: int | None = None
+            info: dict | None = None
+
+            if isinstance(ch, discord.Thread):
+                rid, info = self._find_room_by_thread_id(ch.id)
+            elif isinstance(ch, discord.TextChannel) and ch.id in ALLOWED_JOIN_CHANNELS:
+                rid, info = self._find_player_room(member, join_channel_id=ch.id)
+            else:
+                return await interaction.response.send_message(
+                    "Use this command inside your room thread or in #join / #jp-join.",
+                    ephemeral=True,
+                )
+
+            if rid is None or info is None:
+                return await interaction.response.send_message(
+                    "❌ You do not have an active room here.",
+                    ephemeral=True,
+                )
+
+            player_ids = {int(getattr(p, "id", p)) for p in (info.get("players", []) or [])}
+            if int(member.id) not in player_ids:
+                return await interaction.response.send_message(
+                    "❌ You are not part of this room.",
+                    ephemeral=True,
+                )
+
+            if info.get("finished", False):
+                return await interaction.response.send_message(
+                    "❌ This room is already closed.",
+                    ephemeral=True,
+                )
+
+            if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+                return await interaction.response.send_message(
+                    "ℹ️ This room already started.",
+                    ephemeral=True,
+                )
+
+            players = [m for m in (info.get("players", []) or []) if m and not getattr(m, "bot", False)]
+            if len(players) < 3:
+                return await interaction.response.send_message(
+                    f"❌ You need at least **3 players** to start. Current: **{len(players)}/{ROOM_CAPACITY}**.",
+                    ephemeral=True,
+                )
+
+            await self._start_room_now(rid, info, started_by=member, reason="manual")
+            await self._reindex_parent_rooms(guild, int(info["join_channel_id"]))
+
+        return await interaction.response.send_message(
+            "✅ Room started.",
+            ephemeral=True,
+        )
 
     @app_commands.command(
         name="d",
-        description="Drop queue in #join/#jp-join OR leave your current room thread",
+        description="Leave your current room before it starts",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def leave_queue(self, interaction: discord.Interaction):
@@ -3937,110 +4068,62 @@ class Matchmaking(commands.Cog):
 
         member: discord.Member = interaction.user  # type: ignore
 
-        # ------------------------------------------------------------
-        # CASO A: /d dentro de un ROOM THREAD -> salir de la sala actual
-        # ------------------------------------------------------------
-        if isinstance(ch, discord.Thread):
-            async with self._join_lock:
-                rid, info = self._find_room_by_thread_id(ch.id)
-                if not info:
-                    return await interaction.response.send_message(
-                        "ℹ️ This thread is not an active room.", ephemeral=True
-                    )
-
-                if member not in (info.get("players", []) or []):
-                    return await interaction.response.send_message(
-                        "ℹ️ You are not listed as a player in this room.", ephemeral=True
-                    )
-
-                # Si ya empezó, no permitir /d (usa /forfeit según tu flujo)
-                if info.get("phase") == PHASE_STARTED or info.get("started", False):
-                    return await interaction.response.send_message(
-                        "❌ This match already started. Use `/forfeit` if everyone agrees to close the room.",
-                        ephemeral=True,
-                    )
-
-                # Remover del room + del thread
-                await self._remove_member_from_room(member, int(rid), info)
-
-                # Best-effort: quitar roles de queue (por si acaso)
-                try:
-                    await self._remove_queue_roles([member])
-                except Exception:
-                    pass
-
-                # Mensaje público dentro del thread
-                try:
-                    await ch.send(f"({member.mention}) Left the room.")
-                except Exception:
-                    pass
-
-                # Si queda vacío -> archivar/cerrar el hilo
-                if len(info.get("players", []) or []) == 0:
-                    try:
-                        await ch.send("Room is empty. Archiving this thread.")
-                    except Exception:
-                        pass
-
-                    # close_room ya saca del dict y dispara room_finished
-                    try:
-                        await self.close_room(ch, delay=0, delete=False)  # archive+lock
-                    except Exception:
-                        pass
-
-                # Reindex visual (room-1, room-2, ...)
-                try:
-                    await self._reindex_parent_rooms(guild, int(info["join_channel_id"]))
-                except Exception:
-                    pass
-
-                # Refrescar #rooms
-                try:
-                    self.bot.dispatch("room_updated", None)
-                except Exception:
-                    pass
-
-            return await interaction.response.send_message("Removed from room.", ephemeral=True)
-
-        # ------------------------------------------------------------
-        # CASO B: /d en #join / #jp-join -> salir SOLO de la queue
-        # ------------------------------------------------------------
-        if not isinstance(ch, discord.TextChannel) or ch.id not in ALLOWED_JOIN_CHANNELS:
-            return await interaction.response.send_message(
-                "This command works in #join/#jp-join (drop queue) or inside a room thread (leave room).",
-                ephemeral=True,
-            )
-
         async with self._join_lock:
-            q = self.queues.get(ch.id, set())
-            if member.id not in q:
+            rid: int | None = None
+            info: dict | None = None
+
+            if isinstance(ch, discord.Thread):
+                rid, info = self._find_room_by_thread_id(ch.id)
+            elif isinstance(ch, discord.TextChannel) and ch.id in ALLOWED_JOIN_CHANNELS:
+                rid, info = self._find_player_room(member, join_channel_id=ch.id, include_started=False)
+            else:
                 return await interaction.response.send_message(
-                    "ℹ️ You are not in the queue.", ephemeral=True
+                    "Use this command inside your room thread or in #join / #jp-join.",
+                    ephemeral=True,
                 )
 
-            q.discard(member.id)
-            self.queue_join_order.get(ch.id, {}).pop(member.id, None)
+            if rid is None or info is None:
+                return await interaction.response.send_message(
+                    "ℹ️ You are not in a pending room.",
+                    ephemeral=True,
+                )
 
-            try:
-                await self._remove_queue_roles([member])
-            except Exception:
-                pass
+            player_ids = {int(getattr(p, "id", p)) for p in (info.get("players", []) or [])}
+            if int(member.id) not in player_ids:
+                return await interaction.response.send_message(
+                    "ℹ️ You are not part of this room.",
+                    ephemeral=True,
+                )
 
-            # Notificar al cog Rooms
-            try:
-                self.bot.dispatch("room_updated", None)
-            except Exception:
-                pass
+            if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+                return await interaction.response.send_message(
+                    "❌ This room already started. Use `/forfeit` to close it.",
+                    ephemeral=True,
+                )
 
-            # Mensaje público
-            try:
-                qcount = len(q)
-                await ch.send(f"({member.mention}) Dropped the queue (`{qcount}`)")
-            except Exception:
-                pass
+            await self._remove_member_from_room(member, int(rid), info)
 
-        return await interaction.response.send_message("Removed from queue.", ephemeral=True)
+            thread = await self._get_room_thread(info)
+            if thread is not None:
+                try:
+                    await thread.send(f"{member.mention} left the room.")
+                except Exception:
+                    pass
 
+            if len(info.get("players", []) or []) == 0:
+                if thread is not None:
+                    try:
+                        await thread.send("Room is empty. Closing thread.")
+                    except Exception:
+                        pass
+                    await self.close_room(thread, delay=0, delete=True)
+            else:
+                await self.update_room_board(guild, rid)
+
+            await self._reindex_parent_rooms(guild, int(info["join_channel_id"]))
+            self.bot.dispatch("room_updated", rid)
+
+        return await interaction.response.send_message("Removed from room.", ephemeral=True)
 
     @app_commands.command(
         name="migrate_players_to_newseason",
@@ -5136,128 +5219,79 @@ class Matchmaking(commands.Cog):
 
 
 
+
     @app_commands.command(
-        name="forfeit", description="Vote to forfeit the current room."
+        name="forfeit", description="Close the current room and delete its thread."
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def forfeit(self, interaction: discord.Interaction):
-        # Debe ejecutarse dentro de un thread de room
+        guild = interaction.guild
+        if guild is None:
+            return await interaction.response.send_message("Guild not found.", ephemeral=True)
+
+        member: discord.Member = interaction.user  # type: ignore
         ch = interaction.channel
-        if not isinstance(ch, (discord.Thread, discord.TextChannel)):
-            await interaction.response.send_message(
-                "This command must be used inside a room thread.", ephemeral=True
-            )
-            return
 
-        # Encontrar room por thread
-        room_id = None
-        room = None
+        async with self._join_lock:
+            rid: int | None = None
+            info: dict | None = None
 
-        for rid, info in (self.rooms or {}).items():
-            thr_id = info.get("thread")
-
-            if thr_id is not None and thr_id == ch.id:
-                room_id = rid
-                room = info
-                break
-
-        if room is None:
-            await interaction.response.send_message(
-                "This does not look like an active room thread.", ephemeral=True
-            )
-            return
-
-        if room.get("finished") or room.get("closed"):
-            await interaction.response.send_message(
-                "This room is already closed.", ephemeral=True
-            )
-            return
-
-        # Resolver lista actual de jugadores (Members)
-        raw_players = room.get("players", []) or []
-        players_now: list[discord.Member] = []
-        for p in raw_players:
-            if isinstance(p, discord.Member):
-                if not p.bot:
-                    players_now.append(p)
-            elif isinstance(p, discord.User):
-                # best effort: convertir a Member si está en guild
-                if interaction.guild:
-                    m = interaction.guild.get_member(p.id)
-                    if m and not m.bot:
-                        players_now.append(m)
-            elif isinstance(p, int):
-                if interaction.guild:
-                    m = interaction.guild.get_member(p)
-                    if m and not m.bot:
-                        players_now.append(m)
-
-        # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
-        n_players = len(players_now)
-        threshold = max(1, (n_players // 2) + 1)  # mayoría simple
-
-        # Estructura de votos
-        votes = room.setdefault("forfeit_votes", {})
-        uid = interaction.user.id
-
-        # Registrar voto "YES"
-        votes[str(uid)] = True
-
-        yes_count = sum(1 for v in votes.values() if v is True)
-
-        # Si no alcanza, solo reporta estado
-        if yes_count < threshold:
-            try:
-                await interaction.response.send_message(
-                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required.",
-                    ephemeral=False,
-                )
-            except discord.InteractionResponded:
-                await interaction.followup.send(
-                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required."
-                )
-            return
-
-        # Aprobado: cerrar room
-        room["finished"] = True
-        room["closed"] = True
-
-        # ✅ PUNTO 5: remover roles de queue a quienes siguen en la room
-        try:
-            await self._remove_queue_roles(players_now)
-        except Exception:
-            pass
-
-        # Notificar en el thread
-        try:
             if isinstance(ch, discord.Thread):
-                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
+                rid, info = self._find_room_by_thread_id(ch.id)
+            elif isinstance(ch, discord.TextChannel) and ch.id in ALLOWED_JOIN_CHANNELS:
+                rid, info = self._find_player_room(member, join_channel_id=ch.id)
             else:
-                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
-        except Exception:
-            pass
+                return await interaction.response.send_message(
+                    "Use this command inside your room thread or in #join / #jp-join.",
+                    ephemeral=True,
+                )
 
-        # Disparar evento para Rooms cog
-        try:
-            self.bot.dispatch("room_finished", room_id)
-        except Exception:
-            pass
+            if rid is None or info is None:
+                return await interaction.response.send_message(
+                    "This does not look like an active room.",
+                    ephemeral=True,
+                )
 
-        # Cerrar hilo
-        try:
-            # Si tu close_room ya maneja delete/archive según flags
-            asyncio.create_task(self.close_room(ch, delay=5, delete=True))
-        except Exception:
-            pass
+            player_ids = {int(getattr(p, "id", p)) for p in (info.get("players", []) or [])}
+            if int(member.id) not in player_ids:
+                return await interaction.response.send_message(
+                    "❌ You are not part of this room.",
+                    ephemeral=True,
+                )
 
-        # Responder interacción
+            if info.get("finished", False):
+                return await interaction.response.send_message(
+                    "This room is already closed.",
+                    ephemeral=True,
+                )
+
+            info["finished"] = True
+            info["closed"] = True
+
+            thread = await self._get_room_thread(info)
+            if thread is not None:
+                try:
+                    await thread.send(f"🏳️ Room forfeited by {member.mention}. Closing thread.")
+                except Exception:
+                    pass
+
+            self.bot.dispatch("room_updated", rid)
+
+            if thread is not None:
+                await self.close_room(thread, delay=0, delete=True)
+            else:
+                self.rooms.pop(rid, None)
+                self.bot.dispatch("room_finished", rid)
+
         try:
             await interaction.response.send_message(
-                "✅ Forfeit confirmed. Room will be closed.", ephemeral=True
+                "✅ Room closed.",
+                ephemeral=True,
             )
         except discord.InteractionResponded:
             await interaction.followup.send(
-                "✅ Forfeit confirmed. Room will be closed.", ephemeral=True
+                "✅ Room closed.",
+                ephemeral=True,
             )
 
     @commands.command(name="calc", aliases=["calculate"])
@@ -5287,7 +5321,7 @@ class Matchmaking(commands.Cog):
         if room.get("started") is False:
             return await ctx.send(
                 "Songs have not been selected yet. "
-                "The room starts on the scheduled slot when it reaches 5 players."
+                "Use `/start` once the room has at least 3 players, or wait until it reaches 5 players to start automatically."
             )
 
         lines = ctx.message.content.splitlines()
