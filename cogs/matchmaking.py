@@ -806,6 +806,83 @@ class Matchmaking(commands.Cog):
                 return rid, info
         return None, None
 
+    async def _get_room_thread(self, info: dict | None) -> discord.Thread | None:
+        if not info:
+            return None
+
+        thread_id = int(info.get("thread") or 0)
+        if not thread_id:
+            return None
+
+        cached = self.bot.get_channel(thread_id)
+        if isinstance(cached, discord.Thread):
+            return cached
+
+        parent_id = int(info.get("join_channel_id") or 0)
+        parent = self.bot.get_channel(parent_id)
+        if isinstance(parent, discord.TextChannel):
+            thread = parent.get_thread(thread_id)
+            if isinstance(thread, discord.Thread):
+                return thread
+
+        try:
+            fetched = await self.bot.fetch_channel(thread_id)
+            if isinstance(fetched, discord.Thread):
+                return fetched
+        except Exception:
+            pass
+
+        return None
+
+    async def _room_members_resolved(
+        self,
+        info: dict,
+        guild: discord.Guild | None = None,
+    ) -> list[discord.Member]:
+        members: list[discord.Member] = []
+        for p in info.get("players", []) or []:
+            if isinstance(p, discord.Member):
+                if not p.bot:
+                    members.append(p)
+                continue
+
+            try:
+                pid = int(getattr(p, "id", p))
+            except Exception:
+                continue
+
+            member = guild.get_member(pid) if guild is not None else None
+            if member is None and guild is not None:
+                try:
+                    member = await guild.fetch_member(pid)
+                except Exception:
+                    member = None
+
+            if member is not None and not member.bot:
+                members.append(member)
+
+        return members
+
+    async def _build_room_thread_name(
+        self,
+        guild: discord.Guild,
+        rid: int,
+        info: dict,
+    ) -> str:
+        disp = self._disp(info, rid)
+        players = await self._room_members_resolved(info, guild)
+
+        if players:
+            mmr_map = await self._effective_display_mmrs(players)
+            values = [int(mmr_map.get(m.id, 0)) for m in players]
+            avg_mmr = int(round(sum(values) / len(values))) if values else 0
+            rank = get_rank_from_mmr(avg_mmr)
+        else:
+            avg_mmr = 0
+            rank = "Placement"
+
+        name = f"room-{disp}-{rank}-{avg_mmr}mmr"
+        return name[:100]
 
 
     def _find_player_room(
@@ -2079,6 +2156,11 @@ class Matchmaking(commands.Cog):
             pass
 
         try:
+            await self._reindex_parent_rooms(thread.guild, int(info["join_channel_id"]))
+        except Exception:
+            pass
+
+        try:
             await self.update_room_board(thread.guild, rid)
         except Exception:
             pass
@@ -2110,7 +2192,8 @@ class Matchmaking(commands.Cog):
             thread = await self._get_room_thread(info)
             if thread is not None:
                 try:
-                    await thread.edit(name=f"room-{idx}")
+                    new_name = await self._build_room_thread_name(guild, rid, info)
+                    await thread.edit(name=new_name)
                 except Exception:
                     pass
 
@@ -2127,9 +2210,10 @@ class Matchmaking(commands.Cog):
             return
         info["players"].append(member)
         try:
-            await self.bot.get_channel(info["join_channel_id"]).get_thread(
-                info["thread"]
-            ).add_user(member)
+            thread = await self._get_room_thread(info)
+            if thread is None:
+                raise discord.NotFound(response=None, message="Room thread not found")
+            await thread.add_user(member)
         except discord.Forbidden as e:
             log.error(
                 "add_user Forbidden in %s for %s (%s). Check Manage Threads/Create Private Threads perms.",
@@ -2154,9 +2238,9 @@ class Matchmaking(commands.Cog):
             return
         info["players"].remove(member)
         try:
-            await self.bot.get_channel(info["join_channel_id"]).get_thread(
-                info["thread"]
-            ).remove_user(member)
+            thread = await self._get_room_thread(info)
+            if thread is not None:
+                await thread.remove_user(member)
         except Exception:
             pass
         await self.update_room_board(member.guild, rid)
@@ -2631,6 +2715,7 @@ class Matchmaking(commands.Cog):
             return
 
         self._closing_threads.add(thread.id)
+        parent_id: int | None = None
         try:
             await asyncio.sleep(delay)
             # 1) Intenta cerrar/borrar el hilo
@@ -2654,11 +2739,20 @@ class Matchmaking(commands.Cog):
                 None,
             )
             if rid is not None:
-                self.rooms.pop(rid, None)
+                info = self.rooms.pop(rid, None)
+                if info is not None:
+                    parent_id = int(info.get("join_channel_id") or 0) or None
                 try:
                     self.bot.dispatch("room_finished", rid)
                 except Exception:
                     pass
+
+            if parent_id is not None:
+                try:
+                    await self._reindex_parent_rooms(thread.guild, parent_id)
+                except Exception:
+                    pass
+
             self._closing_threads.discard(thread.id)
 
     async def _fetch_cutoff(self, season_id: int, top_n: int) -> int | None:
@@ -2718,10 +2812,22 @@ class Matchmaking(commands.Cog):
         if info.get("finished", False):
             return
 
-        thread: discord.Thread = self.bot.get_channel(
-            info["join_channel_id"]
-        ).get_thread(info["thread"])
+        thread = await self._get_room_thread(info)
+        if thread is None:
+            dead_rid = next((k for k, v in self.rooms.items() if v is info), None)
+            if dead_rid is not None:
+                self.rooms.pop(dead_rid, None)
+                self.bot.dispatch("room_finished", dead_rid)
+            return
+
         try:
+            try:
+                new_name = await self._build_room_thread_name(guild, rid, info)
+                if thread.name != new_name:
+                    await thread.edit(name=new_name)
+            except Exception:
+                pass
+
             content = await self._render_room_board_text(guild, rid)
             msg_id = info.get("board_msg_id")
 
@@ -4075,7 +4181,7 @@ class Matchmaking(commands.Cog):
             if isinstance(ch, discord.Thread):
                 rid, info = self._find_room_by_thread_id(ch.id)
             elif isinstance(ch, discord.TextChannel) and ch.id in ALLOWED_JOIN_CHANNELS:
-                rid, info = self._find_player_room(member, join_channel_id=ch.id, include_started=False)
+                rid, info = self._find_player_room(member, join_channel_id=ch.id, include_started=True)
             else:
                 return await interaction.response.send_message(
                     "Use this command inside your room thread or in #join / #jp-join.",
