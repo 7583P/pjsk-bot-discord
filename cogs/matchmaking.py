@@ -361,6 +361,10 @@ VOTE_TIMEOUT_SUBMIT = 30
 VOTE_TIMEOUT_FORFEIT = 30
 LIMA_TZ = ZoneInfo("America/Lima")
 
+INACTIVE_THREAD_WARN_SECONDS = 5 * 60
+INACTIVE_THREAD_KICK_SECONDS = 60
+INACTIVE_THREAD_CHECK_SECONDS = 15
+
 PHASE_FUTURE = "FUTURE"  # en cola (sin hilo)
 PHASE_PREPARED = "PREPARED"  # hilo creado + canciones posteadas (locked-in)
 PHASE_STARTED = "STARTED"  # inicio real en :00/:30
@@ -2205,10 +2209,37 @@ class Matchmaking(commands.Cog):
     def _disp(self, info: dict, fallback_rid: int) -> int:
         return int(info.get("display_num") or fallback_rid)
 
+    def _ensure_room_activity_state(self, info: dict) -> dict[str, dict[str, int | None]]:
+        state = info.get("thread_activity")
+        if not isinstance(state, dict):
+            state = {}
+            info["thread_activity"] = state
+        return state
+
+    def _touch_room_member_activity(
+        self,
+        info: dict,
+        member_id: int,
+        *,
+        now_ts: int | None = None,
+    ) -> None:
+        state = self._ensure_room_activity_state(info)
+        ts = int(now_ts or self._now_lima().timestamp())
+        state[str(int(member_id))] = {
+            "last_seen_ts": ts,
+            "warned_at_ts": None,
+        }
+
+    def _clear_room_member_activity(self, info: dict, member_id: int) -> None:
+        state = self._ensure_room_activity_state(info)
+        state.pop(str(int(member_id)), None)
+
     async def _add_member_to_room(self, member: discord.Member, rid: int, info: dict):
         if member in info.get("players", []):
+            self._touch_room_member_activity(info, member.id)
             return
         info["players"].append(member)
+        self._touch_room_member_activity(info, member.id)
         try:
             thread = await self._get_room_thread(info)
             if thread is None:
@@ -2235,8 +2266,10 @@ class Matchmaking(commands.Cog):
         self, member: discord.Member, rid: int, info: dict
     ):
         if member not in info.get("players", []):
+            self._clear_room_member_activity(info, member.id)
             return
         info["players"].remove(member)
+        self._clear_room_member_activity(info, member.id)
         try:
             thread = await self._get_room_thread(info)
             if thread is not None:
@@ -2244,6 +2277,64 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
         await self.update_room_board(member.guild, rid)
+
+    async def _remove_inactive_member_from_room(
+        self,
+        guild: discord.Guild,
+        rid: int,
+        info: dict,
+        member: discord.Member,
+        *,
+        thread: discord.Thread | None = None,
+    ) -> bool:
+        if info.get("finished", False):
+            return False
+        if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+            return False
+
+        player_ids = {int(getattr(p, "id", p)) for p in (info.get("players", []) or [])}
+        if int(member.id) not in player_ids:
+            self._clear_room_member_activity(info, member.id)
+            return False
+
+        await self._remove_member_from_room(member, rid, info)
+
+        if thread is None:
+            thread = await self._get_room_thread(info)
+
+        if thread is not None:
+            try:
+                await thread.send(
+                    f"⏰ {member.mention} was removed from the room due to inactivity before the match started."
+                )
+            except Exception:
+                pass
+
+        if len(info.get("players", []) or []) == 0:
+            info["finished"] = True
+            info["closed"] = True
+            if thread is not None:
+                try:
+                    await thread.send("Room is empty. Closing thread.")
+                except Exception:
+                    pass
+                await self.close_room(thread, delay=0, delete=True)
+            else:
+                self.rooms.pop(rid, None)
+                self.bot.dispatch("room_finished", rid)
+        else:
+            try:
+                await self.update_room_board(guild, rid)
+            except Exception:
+                pass
+
+        try:
+            await self._reindex_parent_rooms(guild, int(info.get("join_channel_id") or 0))
+        except Exception:
+            pass
+
+        self.bot.dispatch("room_updated", rid)
+        return True
 
     async def _cascade_insert(
         self,
@@ -2961,24 +3052,88 @@ class Matchmaking(commands.Cog):
     async def _before_room_slot_scheduler(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(seconds=INACTIVE_THREAD_CHECK_SECONDS)
+    async def room_prestart_inactivity_watch(self):
+        guild = self.bot.get_guild(GUILD_ID)
+        if guild is None:
+            return
+
+        async with self._join_lock:
+            for rid, info in list(self.rooms.items()):
+                if info.get("finished", False):
+                    continue
+                if info.get("started", False) or info.get("phase") == PHASE_STARTED:
+                    continue
+
+                thread = await self._get_room_thread(info)
+                if thread is None:
+                    continue
+
+                state = self._ensure_room_activity_state(info)
+                now_ts = int(self._now_lima().timestamp())
+                members = await self._room_members_resolved(info, guild)
+
+                for member in list(members):
+                    key = str(int(member.id))
+                    entry = state.get(key)
+                    if not isinstance(entry, dict):
+                        self._touch_room_member_activity(info, member.id, now_ts=now_ts)
+                        entry = state.get(key) or {}
+
+                    last_seen_ts = int(entry.get("last_seen_ts") or now_ts)
+                    warned_at_ts = entry.get("warned_at_ts")
+                    warned_at_ts = int(warned_at_ts) if warned_at_ts is not None else None
+
+                    if warned_at_ts is not None:
+                        if now_ts - warned_at_ts >= INACTIVE_THREAD_KICK_SECONDS:
+                            refreshed = state.get(key)
+                            refreshed_last_seen = int((refreshed or {}).get("last_seen_ts") or last_seen_ts)
+                            refreshed_warned = (refreshed or {}).get("warned_at_ts")
+                            if refreshed_warned is None or refreshed_last_seen > warned_at_ts:
+                                continue
+
+                            await self._remove_inactive_member_from_room(
+                                guild,
+                                rid,
+                                info,
+                                member,
+                                thread=thread,
+                            )
+                        continue
+
+                    if now_ts - last_seen_ts >= INACTIVE_THREAD_WARN_SECONDS:
+                        try:
+                            await thread.send(
+                                f"⏰ {member.mention}, you have been inactive in this thread for 5 minutes. "
+                                f"Send any message here within 1 minute or you will be removed from the room."
+                            )
+                        except Exception:
+                            continue
+
+                        state[key] = {
+                            "last_seen_ts": last_seen_ts,
+                            "warned_at_ts": now_ts,
+                        }
+
+    @room_prestart_inactivity_watch.before_loop
+    async def _before_room_prestart_inactivity_watch(self):
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
 
         if isinstance(message.channel, Thread):
-            room = next(
-                (
-                    r
-                    for r in self.rooms.values()
-                    if r.get("thread") and r["thread"] == message.channel.id
-                ),
-                None,
-            )
+            rid, room = self._find_room_by_thread_id(message.channel.id)
             if not room:
                 return
 
-            allowed_ids = {m.id for m in room.get("players", []) if m}
+            allowed_ids = {
+                int(getattr(m, "id", m))
+                for m in (room.get("players", []) or [])
+                if m is not None
+            }
 
             # Bloquear @everyone / @here y roles siempre
             if message.mention_everyone or message.role_mentions:
@@ -2996,6 +3151,9 @@ class Matchmaking(commands.Cog):
                     except Exception:
                         pass
                     return
+
+            if message.author.id in allowed_ids:
+                self._touch_room_member_activity(room, message.author.id)
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
@@ -3487,7 +3645,12 @@ class Matchmaking(commands.Cog):
         self.refresh_songs.start()
         await self.refresh_songs()
 
+        if not self.room_prestart_inactivity_watch.is_running():
+            self.room_prestart_inactivity_watch.start()
+
     async def cog_unload(self):
+        if self.room_prestart_inactivity_watch.is_running():
+            self.room_prestart_inactivity_watch.stop()
         await self.db_pool.close()
 
     @tasks.loop(hours=1)
