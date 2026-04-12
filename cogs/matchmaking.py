@@ -4081,8 +4081,7 @@ class Matchmaking(commands.Cog):
 
         if auto_started:
             return await interaction.response.send_message(
-                f"Joined room **{disp}**. The room reached **5/5** and started automatically.",
-                ephemeral=True,
+                f"Joined room **{disp}**. The room reached **5/5** and started automatically."
             )
 
         room_action = "Created" if created_new_room else "Joined"
@@ -4090,8 +4089,7 @@ class Matchmaking(commands.Cog):
         if player_count >= 3:
             extra = " `/start` is now available for this room."
         return await interaction.response.send_message(
-            f"{room_action} room **{disp}** ({player_count}/{ROOM_CAPACITY}).{extra}",
-            ephemeral=True,
+            f"{room_action} room **{disp}** ({player_count}/{ROOM_CAPACITY}).{extra}"
         )
 
     @app_commands.command(
@@ -4229,7 +4227,7 @@ class Matchmaking(commands.Cog):
             await self._reindex_parent_rooms(guild, int(info["join_channel_id"]))
             self.bot.dispatch("room_updated", rid)
 
-        return await interaction.response.send_message("Removed from room.", ephemeral=True)
+        return await interaction.response.send_message("Removed from room.")
 
     @app_commands.command(
         name="migrate_players_to_newseason",
