@@ -1326,7 +1326,7 @@ _cards_cache: Dict[str, object] = {
     "items": [],
     "ts": datetime.fromtimestamp(0, tz=timezone.utc),
 }
-CARDS_TTL = timedelta(hours=6)
+CARDS_TTL = timedelta(minutes=int(os.getenv("CARDS_TTL_MINUTES", "15")))
 _cards_lock = asyncio.Lock()
 
 # --------- AUTO REFRESH (background poller) ----------
@@ -1519,6 +1519,14 @@ def _prefer_square(links: List[str]) -> List[str]:
     return out
 
 
+def _pick_first_distinct(urls: List[str], *exclude: Optional[str]) -> Optional[str]:
+    excluded = {u for u in exclude if u}
+    for u in urls:
+        if u and u not in excluded:
+            return u
+    return None
+
+
 def _page_title_from_href(href: str) -> str:
     try:
         path = urlparse(href).path
@@ -1580,7 +1588,11 @@ async def _scrape_card_variants(href: str) -> Dict:
     Devuelve variantes separadas:
       - Untrained
       - Trained
-    Nota: el "thumb" de la lista se usa como fallback de Untrained en el endpoint (si no se detecta untrained).
+
+    Estrategia:
+      1) intenta detectar por nombre de archivo
+      2) si solo encuentra una, usa otra imagen distinta como complemento
+      3) si no encuentra etiquetas pero hay 2 imágenes válidas, usa las 2 primeras
     """
     page_title = _page_title_from_href(href)
     stage = "start"
@@ -1591,6 +1603,7 @@ async def _scrape_card_variants(href: str) -> Dict:
 
         stage = "filter_images"
         clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
+        clean_urls = _prefer_square(clean_urls)
 
         trained_links: List[str] = []
         untrained_links: List[str] = []
@@ -1604,6 +1617,14 @@ async def _scrape_card_variants(href: str) -> Dict:
         trained_url = trained_links[0] if trained_links else None
         untrained_url = untrained_links[0] if untrained_links else None
 
+        if untrained_url and not trained_url:
+            trained_url = _pick_first_distinct(clean_urls, untrained_url)
+        elif trained_url and not untrained_url:
+            untrained_url = _pick_first_distinct(clean_urls, trained_url)
+        elif not untrained_url and not trained_url and len(clean_urls) >= 2:
+            untrained_url = clean_urls[0]
+            trained_url = _pick_first_distinct(clean_urls, untrained_url)
+
         if not urls:
             logger.error("[variants] no images found via MediaWiki images for page=%s href=%s", page_title, href)
         if urls and not clean_urls:
@@ -1614,7 +1635,7 @@ async def _scrape_card_variants(href: str) -> Dict:
         variants = []
         if untrained_url:
             variants.append({"label": "Untrained", "url": untrained_url})
-        if trained_url:
+        if trained_url and trained_url != untrained_url:
             variants.append({"label": "Trained", "url": trained_url})
 
         return {"name": page_title, "variants": variants}
@@ -1914,7 +1935,10 @@ async def auth02_cards(
         async with db_pool.acquire() as conn:
             try:
                 if await _cards_db_is_fresh(conn):
-                    return await _cards_db_all(conn)
+                    items = await _cards_db_all(conn)
+                    _cards_cache["items"] = items
+                    _cards_cache["ts"] = datetime.now(timezone.utc)
+                    return items
             except Exception:
                 traceback.print_exc()
 
@@ -1929,7 +1953,10 @@ async def auth02_cards(
             async with db_pool.acquire() as conn:
                 try:
                     if await _cards_db_is_fresh(conn):
-                        return await _cards_db_all(conn)
+                        items = await _cards_db_all(conn)
+                        _cards_cache["items"] = items
+                        _cards_cache["ts"] = datetime.now(timezone.utc)
+                        return items
                 except Exception:
                     traceback.print_exc()
 
@@ -2051,7 +2078,7 @@ async def get_card_variants(
         # fallback a thumb si no hay untrained detectado
         variants.append({"label": "Untrained", "url": thumb_url})
 
-    if trained_url:
+    if trained_url and trained_url != (variants[0]["url"] if variants else None):
         variants.append({"label": "Trained", "url": trained_url})
 
     if not variants:
@@ -2071,4 +2098,3 @@ async def get_card_variants(
 # =================== Static ===================
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
-
