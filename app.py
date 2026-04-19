@@ -1536,7 +1536,101 @@ def _page_title_from_href(href: str) -> str:
         return ""
 
 
-async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[str]:
+_VARIANT_TOKEN_STOPWORDS = {
+    "file",
+    "card",
+    "art",
+    "image",
+    "full",
+    "transparent",
+    "render",
+    "trimmed",
+    "cropped",
+    "small",
+    "large",
+    "thumb",
+    "thumbnail",
+    "after",
+    "before",
+    "training",
+    "trained",
+    "untrained",
+    "normal",
+    "base",
+}
+
+
+def _normalize_media_key(source: str) -> str:
+    raw = unquote(str(source or "")).strip().lower()
+    if "://" in raw or "/" in raw:
+        raw = _filename_from_url(raw)
+    raw = raw.rsplit(".", 1)[0]
+    raw = raw.replace("_", " ").replace("-", " ")
+    raw = re.sub(r"\([^)]*\)", " ", raw)
+    raw = re.sub(r"(?:after|before)\s+training", " ", raw)
+    raw = re.sub(
+        r"(?:trained|untrained|idolized|normal|base|card|art|image|full|render|transparent|trimmed|cropped|thumb|thumbnail|small|large)",
+        " ",
+        raw,
+    )
+    raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
+def _media_tokens(source: str) -> List[str]:
+    key = _normalize_media_key(source)
+    return [
+        tok
+        for tok in re.findall(r"[a-z0-9]+", key)
+        if len(tok) >= 2 and tok not in _VARIANT_TOKEN_STOPWORDS
+    ]
+
+
+def _variant_candidate_score(
+    candidate_title: str,
+    candidate_url: str,
+    page_title: str,
+    thumb_url: Optional[str],
+    page_id: Optional[int] = None,
+) -> int:
+    combined = f"{candidate_title} {candidate_url}".strip()
+    key = _normalize_media_key(combined)
+    tokens = set(_media_tokens(combined))
+
+    page_key = _normalize_media_key(page_title)
+    page_tokens = set(_media_tokens(page_title))
+    thumb_key = _normalize_media_key(thumb_url or "")
+    thumb_tokens = set(_media_tokens(thumb_url or ""))
+
+    score = 0
+    if page_id and str(page_id) in key:
+        score += 12
+
+    if thumb_key:
+        if key == thumb_key:
+            score += 100
+        if thumb_key and (thumb_key in key or key in thumb_key):
+            score += 35
+        score += len(tokens & thumb_tokens) * 8
+
+    if page_key:
+        if page_key and (page_key in key or key in page_key):
+            score += 18
+        score += len(tokens & page_tokens) * 4
+
+    filename = _filename_from_url(candidate_url)
+    if _is_trained(filename) or _is_trained(candidate_title):
+        score += 3
+    if _is_untrained(filename) or _is_untrained(candidate_title):
+        score += 3
+
+    if any(bad in key for bad in _BAD_KEYWORDS):
+        score -= 20
+
+    return score
+
+
+async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List[Dict[str, Any]]:
     if not page_title:
         return []
     data1 = await _get_json(
@@ -1559,7 +1653,9 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
                 file_titles.append(t)
     if not file_titles:
         return []
-    urls: List[str] = []
+
+    items: List[Dict[str, Any]] = []
+    seen = set()
     for i in range(0, len(file_titles), 50):
         chunk = file_titles[i : i + 50]
         data2 = await _get_json(
@@ -1575,72 +1671,145 @@ async def _fetch_page_images(client: httpx.AsyncClient, page_title: str) -> List
             },
         )
         for _, finfo in (data2.get("query", {}).get("pages", {}) or {}).items():
+            title = finfo.get("title", "") or ""
             for ii in finfo.get("imageinfo") or []:
                 url = ii.get("thumburl") or ii.get("url")
-                if url:
-                    urls.append(_abs_sekaipedia(url))
+                if not url:
+                    continue
+                abs_url = _abs_sekaipedia(url)
+                if abs_url in seen:
+                    continue
+                seen.add(abs_url)
+                items.append(
+                    {
+                        "title": title,
+                        "url": abs_url,
+                        "width": ii.get("thumbwidth") or ii.get("width"),
+                        "height": ii.get("thumbheight") or ii.get("height"),
+                    }
+                )
         await _sleep_jitter(0.2, 0.5)
-    return _prefer_square(urls)
+    return items
 
 
-async def _scrape_card_variants(href: str) -> Dict:
+async def _scrape_card_variants(
+    href: str,
+    thumb_url: Optional[str] = None,
+    page_id: Optional[int] = None,
+) -> Dict:
     """
-    Devuelve variantes separadas:
-      - Untrained
-      - Trained
-
-    Estrategia:
-      1) intenta detectar por nombre de archivo
-      2) si solo encuentra una, usa otra imagen distinta como complemento
-      3) si no encuentra etiquetas pero hay 2 imágenes válidas, usa las 2 primeras
+    Variante robusta y conservadora:
+      - usa el thumb conocido como referencia principal
+      - solo acepta imágenes con suficiente similitud con esa carta
+      - prefiere devolver 1 variante correcta antes que 2 con personaje equivocado
     """
     page_title = _page_title_from_href(href)
     stage = "start"
     try:
         stage = "fetch_images"
         async with httpx.AsyncClient() as client:
-            urls = await _fetch_page_images(client, page_title)
+            raw_items = await _fetch_page_images(client, page_title)
 
-        stage = "filter_images"
-        clean_urls = [u for u in urls if _looks_card_image(_filename_from_url(u))]
-        clean_urls = _prefer_square(clean_urls)
+        stage = "score_candidates"
+        candidates: List[Dict[str, Any]] = []
+        for item in raw_items:
+            title = str(item.get("title") or "")
+            url = str(item.get("url") or "")
+            if not url:
+                continue
 
-        trained_links: List[str] = []
-        untrained_links: List[str] = []
-        for u in clean_urls:
-            fn = _filename_from_url(u)
-            if _is_trained(fn):
-                trained_links.append(u)
-            elif _is_untrained(fn):
-                untrained_links.append(u)
+            file_ref = f"{title} {_filename_from_url(url)}".lower()
+            if not _looks_card_image(file_ref):
+                continue
 
-        trained_url = trained_links[0] if trained_links else None
-        untrained_url = untrained_links[0] if untrained_links else None
+            score = _variant_candidate_score(title, url, page_title, thumb_url, page_id)
+            min_score = 8 if thumb_url else 4
+            if score < min_score:
+                continue
 
-        if untrained_url and not trained_url:
-            trained_url = _pick_first_distinct(clean_urls, untrained_url)
-        elif trained_url and not untrained_url:
-            untrained_url = _pick_first_distinct(clean_urls, trained_url)
-        elif not untrained_url and not trained_url and len(clean_urls) >= 2:
-            untrained_url = clean_urls[0]
-            trained_url = _pick_first_distinct(clean_urls, untrained_url)
+            candidates.append(
+                {
+                    "title": title,
+                    "url": url,
+                    "score": score,
+                    "filename": _filename_from_url(url),
+                }
+            )
 
-        if not urls:
-            logger.error("[variants] no images found via MediaWiki images for page=%s href=%s", page_title, href)
-        if urls and not clean_urls:
-            logger.error("[variants] images found but none passed filter for page=%s href=%s count=%s", page_title, href, len(urls))
-        if clean_urls and not (trained_url or untrained_url):
-            logger.error("[variants] no trained/untrained matched after filter page=%s href=%s clean=%s", page_title, href, len(clean_urls))
+        candidates.sort(key=lambda x: x["score"], reverse=True)
 
-        variants = []
+        if not raw_items:
+            logger.error(
+                "[variants] no images found via MediaWiki images for page=%s href=%s",
+                page_title,
+                href,
+            )
+        if raw_items and not candidates:
+            logger.warning(
+                "[variants] images found but none matched enough relevance page=%s href=%s count=%s",
+                page_title,
+                href,
+                len(raw_items),
+            )
+
+        labeled_untrained = [
+            c
+            for c in candidates
+            if _is_untrained(c["filename"]) or _is_untrained(c["title"])
+        ]
+        labeled_trained = [
+            c
+            for c in candidates
+            if _is_trained(c["filename"]) or _is_trained(c["title"])
+        ]
+
+        untrained_url: Optional[str] = thumb_url or None
+        if not untrained_url and labeled_untrained:
+            untrained_url = labeled_untrained[0]["url"]
+        if not untrained_url and candidates:
+            untrained_url = candidates[0]["url"]
+
+        trained_url: Optional[str] = None
+        for cand in labeled_trained:
+            if cand["url"] != untrained_url:
+                trained_url = cand["url"]
+                break
+
+        if not trained_url:
+            min_secondary = 12 if thumb_url else 8
+            for cand in candidates:
+                if cand["url"] == untrained_url:
+                    continue
+                if cand["score"] < min_secondary:
+                    continue
+                trained_url = cand["url"]
+                break
+
+        variants: List[Dict[str, str]] = []
         if untrained_url:
             variants.append({"label": "Untrained", "url": untrained_url})
         if trained_url and trained_url != untrained_url:
             variants.append({"label": "Trained", "url": trained_url})
 
+        if candidates:
+            logger.info(
+                "[variants] page=%s href=%s candidates=%s best=%s returned=%s",
+                page_title,
+                href,
+                len(candidates),
+                candidates[0]["score"],
+                len(variants),
+            )
+
         return {"name": page_title, "variants": variants}
     except Exception as e:
-        logger.exception("[variants] scrape failed stage=%s page=%s href=%s error=%s", stage, page_title, href, str(e))
+        logger.exception(
+            "[variants] scrape failed stage=%s page=%s href=%s error=%s",
+            stage,
+            page_title,
+            href,
+            str(e),
+        )
         raise
 
 
@@ -2055,7 +2224,7 @@ async def get_card_variants(
     # 2) scrape variantes
     scraped_variants: List[Dict] = []
     try:
-        scraped = await _scrape_card_variants(href)
+        scraped = await _scrape_card_variants(href, thumb_url=thumb_url, page_id=page_id)
         scraped_variants = scraped.get("variants", []) or []
     except Exception:
         # ya se loggea dentro del scraper con stage
