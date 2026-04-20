@@ -2001,7 +2001,7 @@ class Matchmaking(commands.Cog):
             "finished": False,
             "created_ts": int(self._now_lima().timestamp()),
         }
-        rid = max(self.rooms.keys(), default=0) + 1
+        rid = self._next_room_id()
         self.rooms[rid] = info
         return rid, info
 
@@ -2709,12 +2709,77 @@ class Matchmaking(commands.Cog):
         try:
             if os.path.isfile("assets/cached_rooms.json"):
                 with open("assets/cached_rooms.json", "r", encoding="utf-8") as f:
-                    self.rooms = json.load(f)
+                    self.rooms = self._normalize_cached_rooms(json.load(f))
         except Exception:
-            pass
+            self.rooms = {}
 
         self._sched_last_minute = {}  # parent_id -> minute_ts
         self._sched_last_slot = {}  # parent_id -> (y,m,d,hm)
+
+    def _normalize_cached_rooms(self, raw_rooms) -> dict[int, dict]:
+        """
+        json.load convierte las keys numéricas del dict en strings.
+        Si luego hacemos max(self.rooms.keys()) + 1, explota con:
+        TypeError: can only concatenate str (not "int") to str
+
+        Esta normalización evita eso y además sanea campos numéricos.
+        """
+        if not isinstance(raw_rooms, dict):
+            return {}
+
+        normalized: dict[int, dict] = {}
+
+        for raw_rid, raw_info in raw_rooms.items():
+            try:
+                rid = int(raw_rid)
+            except (TypeError, ValueError):
+                continue
+
+            if not isinstance(raw_info, dict):
+                continue
+
+            info = dict(raw_info)
+
+            for field in (
+                "thread",
+                "join_channel_id",
+                "created_ts",
+                "display_num",
+                "slot_start_ts",
+                "avg_mmr",
+                "started_at",
+            ):
+                value = info.get(field)
+                if value in (None, ""):
+                    continue
+                try:
+                    info[field] = int(value)
+                except (TypeError, ValueError):
+                    pass
+
+            # No se puede reconstruir discord.Member desde JSON.
+            # Dejamos players vacío para evitar estados corruptos tras reinicio.
+            info["players"] = []
+
+            info.setdefault("server", "en")
+            info.setdefault("phase", PHASE_FUTURE)
+            info.setdefault("locked_in_thread", False)
+            info["started"] = bool(info.get("started", False))
+            info["finished"] = bool(info.get("finished", False))
+
+            normalized[rid] = info
+
+        return normalized
+
+    def _next_room_id(self) -> int:
+        numeric_ids: list[int] = []
+        for rid in self.rooms.keys():
+            try:
+                numeric_ids.append(int(rid))
+            except (TypeError, ValueError):
+                continue
+
+        return (max(numeric_ids) + 1) if numeric_ids else 1
 
     def _need_players_window(self, dt_local: datetime) -> bool:
         return dt_local.minute in (1, 2, 3, 4, 31, 32, 33, 34)
