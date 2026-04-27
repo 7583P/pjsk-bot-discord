@@ -86,6 +86,32 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 JOIN_CHANNEL_NAME = "join"
 DATABASE_URL = os.getenv("DB_HOST")  # postgresql://user:pass@host:port/dbname
 
+# =========================
+# INFRA / STABILITY SETTINGS
+# =========================
+DB_POOL_MIN_SIZE = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+DB_COMMAND_TIMEOUT = float(os.getenv("DB_COMMAND_TIMEOUT", "30"))
+
+DISCORD_IO_CONCURRENCY = int(os.getenv("DISCORD_IO_CONCURRENCY", "5"))
+SONG_POLL_TIMEOUT_SEC = float(os.getenv("SONG_POLL_TIMEOUT_SEC", "25"))
+FORFEIT_TIMEOUT_SEC = float(os.getenv("FORFEIT_TIMEOUT_SEC", "30"))
+
+VALID_SONG_SERVERS = {"all", "en", "jp"}
+VALID_SONG_DIFFS = {"easy", "normal", "hard", "expert", "master", "append"}
+
+# Canciones baneadas por defecto de la queue.
+# Se filtran por title_key robusto y también queda soporte para song_id.
+DEFAULT_BANNED_QUEUE_SONGS = (
+    "What Sort of Ending Are You Wishing For?",
+    "A Sad Farewell at the Curtain Call",
+)
+
+ACCURACY_CARD_REMINDER = (
+    "Reminder: don't have an accuracy card on your lead card. "
+    "You can use a 1☆ card if you don't want to search."
+)
+
 ENTRY_RE = re.compile(
     r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
 )
@@ -1337,6 +1363,11 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
+        await self._send_accuracy_card_reminder_once(
+            info,
+            started_ts=int(info.get("started_at") or 0),
+        )
+
         self.bot.dispatch("room_updated", rid)
 
     async def _start_future_rooms_for_slot(self, join_channel_id: int, slot_ts: int):
@@ -1412,6 +1443,11 @@ class Matchmaking(commands.Cog):
                 ).send(" Match started, Good luck and have fun!")
             except Exception:
                 pass
+
+            await self._send_accuracy_card_reminder_once(
+                info,
+                started_ts=int(started_ts),
+            )
 
             self.bot.dispatch("room_updated", rid)
 
@@ -2160,6 +2196,174 @@ class Matchmaking(commands.Cog):
         avg_mmr = round(sum(mmrs) / len(mmrs)) if mmrs else 0
         return get_rank_from_mmr(avg_mmr)
 
+    @staticmethod
+    def _song_title_key(title: str) -> str:
+        """
+        Normaliza títulos para ban robusto:
+        - minúsculas
+        - elimina signos/puntuación
+        - colapsa espacios
+        Así "What Sort of Ending Are You Wishing For?" y variantes sin ? matchean igual.
+        """
+        raw = str(title or "").strip().lower()
+        raw = re.sub(r"[^0-9a-z]+", " ", raw)
+        return re.sub(r"\s+", " ", raw).strip()
+
+    @staticmethod
+    def _normalize_song_server(server: str | None) -> str:
+        value = str(server or "all").strip().lower()
+        return value if value in VALID_SONG_SERVERS else "all"
+
+    @staticmethod
+    def _normalize_song_diff(diff: str | None) -> str | None:
+        if diff is None:
+            return None
+        value = str(diff or "").strip().lower()
+        if value in ("", "all", "*", "any"):
+            return None
+        return value if value in VALID_SONG_DIFFS else None
+
+    @staticmethod
+    def _song_key_sql(alias: str = "s") -> str:
+        return (
+            "lower(trim(regexp_replace("
+            f"regexp_replace(coalesce({alias}.title, ''), '[^0-9A-Za-z]+', ' ', 'g'), "
+            "'\\s+', ' ', 'g')))"
+        )
+
+    def _banned_song_filter_sql(self, alias: str = "s") -> str:
+        key_expr = self._song_key_sql(alias)
+        return f"""
+        AND NOT EXISTS (
+            SELECT 1
+            FROM banned_songs bs
+            WHERE bs.active = true
+              AND (bs.server = 'all' OR bs.server = {alias}.server)
+              AND (bs.diff IS NULL OR bs.diff = {alias}.diff)
+              AND (
+                    (bs.song_id IS NOT NULL AND bs.song_id = {alias}.id)
+                    OR bs.title_key = {key_expr}
+              )
+        )
+        """
+
+    async def _seed_default_banned_songs(self, conn):
+        """
+        Persistencia real en DB. No depende de memoria.
+        Se ejecuta en cog_load y deja activos los bans requeridos por defecto.
+        """
+        for title in DEFAULT_BANNED_QUEUE_SONGS:
+            title_key = self._song_title_key(title)
+            existing = await conn.fetchrow(
+                """
+                SELECT id
+                FROM banned_songs
+                WHERE active = true
+                  AND server = 'all'
+                  AND title_key = $1
+                  AND diff IS NULL
+                LIMIT 1
+                """,
+                title_key,
+            )
+            if existing:
+                await conn.execute(
+                    """
+                    UPDATE banned_songs
+                    SET title = $1,
+                        reason = 'Default queue ban',
+                        active = true
+                    WHERE id = $2
+                    """,
+                    title,
+                    existing["id"],
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO banned_songs
+                        (song_id, title, title_key, diff, server, reason, created_by, active)
+                    VALUES
+                        (NULL, $1, $2, NULL, 'all', 'Default queue ban', NULL, true)
+                    """,
+                    title,
+                    title_key,
+                )
+
+    async def _safe_channel_send(self, channel, *args, **kwargs):
+        if channel is None:
+            return None
+        async with self._discord_io_sem:
+            try:
+                return await channel.send(*args, **kwargs)
+            except discord.HTTPException as e:
+                log.warning("Discord send failed: %s", e)
+                return None
+            except Exception:
+                log.exception("Unexpected Discord send failure")
+                return None
+
+    def _get_thread_for_room(self, room_info: dict) -> discord.Thread | None:
+        parent = self.bot.get_channel(room_info.get("join_channel_id"))
+        if not parent:
+            return None
+        try:
+            return parent.get_thread(int(room_info.get("thread") or 0))
+        except Exception:
+            return None
+
+    async def _safe_thread_send(self, room_info: dict, *args, **kwargs):
+        return await self._safe_channel_send(self._get_thread_for_room(room_info), *args, **kwargs)
+
+    def _room_player_ids(self, room_info: dict) -> set[int]:
+        ids: set[int] = set()
+        for p in room_info.get("players", []) or []:
+            uid = getattr(p, "id", None)
+            if uid is None and isinstance(p, int):
+                uid = p
+            if uid is None:
+                continue
+            try:
+                ids.add(int(uid))
+            except (TypeError, ValueError):
+                continue
+        return ids
+
+    def _room_members(self, guild: discord.Guild | None, room_info: dict) -> list[discord.Member]:
+        members: list[discord.Member] = []
+        for p in room_info.get("players", []) or []:
+            member = p if isinstance(p, discord.Member) else None
+            if member is None and guild is not None:
+                uid = getattr(p, "id", p if isinstance(p, int) else None)
+                if uid is not None:
+                    member = guild.get_member(int(uid))
+            if member and not member.bot and member.id not in {m.id for m in members}:
+                members.append(member)
+        return members
+
+    async def _send_accuracy_card_reminder_once(self, room_info: dict, started_ts: int | None = None):
+        """
+        Se manda solo al iniciar en minuto :00 o :30 y solo una vez por room.
+        El flag se marca antes del envío para evitar duplicados ante reintentos.
+        """
+        if room_info.get("accuracy_reminder_sent"):
+            return
+
+        ts = int(started_ts or room_info.get("started_at") or 0)
+        if ts <= 0:
+            return
+
+        try:
+            minute = dt.datetime.fromtimestamp(ts, tz=LIMA_TZ).minute
+        except Exception:
+            minute = self._now_lima().minute
+
+        if minute not in (0, 30):
+            return
+
+        room_info["accuracy_reminder_sent"] = True
+        await self._safe_thread_send(room_info, ACCURACY_CARD_REMINDER)
+
     async def _get_random_songs(
         self,
         low: int,
@@ -2172,46 +2376,55 @@ class Matchmaking(commands.Cog):
     ):
         """
         Devuelve hasta 'limit' canciones aleatorias (title, level, diff_capitalized, notes)
-        en [low, high] y diffs dadas, filtrando por server ('en' o 'jp').
+        en [low, high] y diffs dadas, filtrando por server y por banned_songs.
         """
-        exclude_titles = exclude_titles or set()
+        if limit <= 0 or not diffs:
+            return []
+
+        server = self._normalize_song_server(server)
+        if server == "all":
+            server = "en"
+
+        exclude_keys = [
+            self._song_title_key(t)
+            for t in (exclude_titles or set())
+            if self._song_title_key(t)
+        ] or ["__none__"]
+
+        key_expr = self._song_key_sql("s")
+        banned_filter = self._banned_song_filter_sql("s")
+
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
-                placeholders = ",".join(f"${i+4}" for i in range(len(diffs)))
-                params: list = [low, high, server, *diffs]
-                extra_where = ""
-                if exclude_titles:
-                    notin = ",".join(
-                        f"${len(params)+i+1}" for i in range(len(exclude_titles))
-                    )
-                    extra_where = f" AND title NOT IN ({notin})"
-                    params.extend(list(exclude_titles))
-
                 rows = await conn.fetch(
                     f"""
-                    SELECT title, level, diff, notes_count
-                    FROM songs
-                    WHERE level BETWEEN $1 AND $2
-                      AND server = $3
-                      AND diff IN ({placeholders})
-                      {extra_where}
+                    SELECT s.title, s.level, s.diff, s.notes_count
+                    FROM songs s
+                    WHERE s.level BETWEEN $1 AND $2
+                      AND s.server = $3
+                      AND s.diff = ANY($4::text[])
+                      AND {key_expr} <> ALL($5::text[])
+                      {banned_filter}
                     ORDER BY random()
-                    LIMIT {int(limit)}
+                    LIMIT $6
                     """,
-                    *params,
+                    int(low),
+                    int(high),
+                    server,
+                    list(diffs),
+                    exclude_keys,
+                    int(limit),
                 )
 
-        out = []
-        for r in rows:
-            out.append(
-                (
-                    r["title"],
-                    int(r["level"]),
-                    r["diff"].capitalize(),
-                    int(r["notes_count"]),
-                )
+        return [
+            (
+                r["title"],
+                int(r["level"]),
+                r["diff"].capitalize(),
+                int(r["notes_count"]),
             )
-        return out
+            for r in rows
+        ]
 
     async def _build_level_balanced_pool(
         self,
@@ -2225,39 +2438,52 @@ class Matchmaking(commands.Cog):
     ) -> list[tuple[str, int, str, int]]:
         """
         Construye un pool equilibrado por nivel:
-
         - Recorre cada nivel en [low, high].
-        - Intenta sacar hasta `per_level` canciones por nivel usando `diffs`
-          (por ejemplo: ('expert', 'master')).
-        - Respeta `exclude_titles` y nunca duplica títulos.
-        - Si en un nivel solo hay 1 canción, solo entra esa al pool.
+        - Intenta sacar hasta `per_level` canciones por nivel usando `diffs`.
+        - Respeta `exclude_titles`, banned_songs y nunca duplica títulos.
         """
         pool: list[tuple[str, int, str, int]] = []
-        used_titles: set[str] = set(exclude_titles or set())
+        used_keys: set[str] = {
+            self._song_title_key(t)
+            for t in (exclude_titles or set())
+            if self._song_title_key(t)
+        }
+
+        server = self._normalize_song_server(server)
+        if server == "all":
+            server = "en"
+
+        key_expr = self._song_key_sql("s")
+        banned_filter = self._banned_song_filter_sql("s")
 
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
-                for lvl in range(low, high + 1):
+                for lvl in range(int(low), int(high) + 1):
                     rows = await conn.fetch(
-                        """
-                        SELECT title, level, diff, notes_count
-                        FROM songs
-                        WHERE level = $1
-                          AND server = $2
-                          AND diff = ANY($3::text[])
-                          AND title <> ALL($4::text[])
+                        f"""
+                        SELECT s.title, s.level, s.diff, s.notes_count
+                        FROM songs s
+                        WHERE s.level = $1
+                          AND s.server = $2
+                          AND s.diff = ANY($3::text[])
+                          AND {key_expr} <> ALL($4::text[])
+                          {banned_filter}
                         ORDER BY random()
                         LIMIT $5
                         """,
                         lvl,
                         server,
                         list(diffs),
-                        list(used_titles) or ["__none__"],  # evitar array vacío
-                        per_level,
+                        list(used_keys) or ["__none__"],
+                        int(per_level),
                     )
 
                     for r in rows:
-                        title = r["title"]
+                        title = str(r["title"])
+                        title_key = self._song_title_key(title)
+                        if title_key in used_keys:
+                            continue
+
                         pool.append(
                             (
                                 title,
@@ -2266,7 +2492,7 @@ class Matchmaking(commands.Cog):
                                 int(r["notes_count"]),
                             )
                         )
-                        used_titles.add(title)
+                        used_keys.add(title_key)
 
         return pool
 
@@ -2278,56 +2504,68 @@ class Matchmaking(commands.Cog):
         - EXACTAMENTE 1 canción por nivel: 24, 25, 26, 27 y 28
         - Solo EXPERT
         - Evita repetir títulos
-        - Si un nivel no tiene canciones Expert en el catálogo, intenta fallback aleatorio dentro 24–28.
-        Filtra por server ('en' o 'jp').
+        - Respeta banned_songs.
         """
         levels = [24, 25, 26, 27, 28]
         picks: list[tuple[str, int, str, int]] = []
-        chosen_titles: set[str] = set()
+        chosen_keys: set[str] = set()
+
+        server = self._normalize_song_server(server)
+        if server == "all":
+            server = "en"
+
+        key_expr = self._song_key_sql("s")
+        banned_filter = self._banned_song_filter_sql("s")
 
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
                 for L in levels:
                     rows = await conn.fetch(
-                        """
-                        SELECT title, level, diff, notes_count
-                        FROM songs
-                        WHERE level = $1
-                          AND diff IN ('expert')
-                          AND server = $2
+                        f"""
+                        SELECT s.title, s.level, s.diff, s.notes_count
+                        FROM songs s
+                        WHERE s.level = $1
+                          AND s.diff = 'expert'
+                          AND s.server = $2
+                          AND {key_expr} <> ALL($3::text[])
+                          {banned_filter}
                         ORDER BY random()
                         LIMIT 5
                         """,
-                        L,
+                        int(L),
                         server,
+                        list(chosen_keys) or ["__none__"],
                     )
 
                     picked = None
                     for r in rows:
-                        if r["title"] not in chosen_titles:
+                        if self._song_title_key(r["title"]) not in chosen_keys:
                             picked = r
                             break
 
                     if picked is None:
                         fb = await conn.fetch(
-                            """
-                            SELECT title, level, diff, notes_count
-                            FROM songs
-                            WHERE level BETWEEN 24 AND 28
-                              AND diff IN ('expert')
-                              AND server = $1
+                            f"""
+                            SELECT s.title, s.level, s.diff, s.notes_count
+                            FROM songs s
+                            WHERE s.level BETWEEN 24 AND 28
+                              AND s.diff = 'expert'
+                              AND s.server = $1
+                              AND {key_expr} <> ALL($2::text[])
+                              {banned_filter}
                             ORDER BY random()
                             LIMIT 10
                             """,
                             server,
+                            list(chosen_keys) or ["__none__"],
                         )
                         for r in fb:
-                            if r["title"] not in chosen_titles:
+                            if self._song_title_key(r["title"]) not in chosen_keys:
                                 picked = r
                                 break
 
                     if picked:
-                        chosen_titles.add(picked["title"])
+                        chosen_keys.add(self._song_title_key(picked["title"]))
                         picks.append(
                             (
                                 picked["title"],
@@ -2704,6 +2942,10 @@ class Matchmaking(commands.Cog):
             cid: {} for cid in ALLOWED_JOIN_CHANNELS
         }
         self._join_lock = asyncio.Lock()
+        self._room_locks: dict[int, asyncio.Lock] = {}
+        self._forfeit_locks: dict[int, asyncio.Lock] = {}
+        self._discord_io_sem = asyncio.Semaphore(DISCORD_IO_CONCURRENCY)
+        self._closing_threads: set[int] = set()
 
         self.rooms: dict[int, dict] = {}
         try:
@@ -3128,7 +3370,12 @@ class Matchmaking(commands.Cog):
 
     async def cog_load(self):
         if self.db_pool is None:
-            self.db_pool = await asyncpg.create_pool(DATABASE_URL)
+            self.db_pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=DB_POOL_MIN_SIZE,
+                max_size=DB_POOL_MAX_SIZE,
+                command_timeout=DB_COMMAND_TIMEOUT,
+            )
 
         async with self.db_pool.acquire() as conn:
             # Jugadores
@@ -3288,6 +3535,58 @@ class Matchmaking(commands.Cog):
                 ADD COLUMN IF NOT EXISTS server TEXT NOT NULL DEFAULT 'en';
             """
             )
+
+            # Baneos persistentes de canciones de queue.
+            # Soporta ban por título normalizado, por song_id, por server y por dificultad.
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS banned_songs (
+                    id         BIGSERIAL PRIMARY KEY,
+                    song_id    INTEGER,
+                    title      TEXT NOT NULL,
+                    title_key  TEXT NOT NULL,
+                    diff       TEXT,
+                    server     TEXT NOT NULL DEFAULT 'all',
+                    reason     TEXT,
+                    created_by BIGINT,
+                    active     BOOLEAN NOT NULL DEFAULT true,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                );
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_banned_songs_lookup
+                ON banned_songs (server, title_key, diff)
+                WHERE active = true;
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_banned_songs_song_id
+                ON banned_songs (song_id, server, diff)
+                WHERE active = true AND song_id IS NOT NULL;
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_banned_songs_active
+                ON banned_songs (server, title_key, COALESCE(diff, '*'))
+                WHERE active = true;
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_songs_select_fast
+                ON songs (server, diff, level);
+                """
+            )
+
+            await self._seed_default_banned_songs(conn)
 
             # 2️⃣ Ahora sí puedo borrar duplicados por (id,diff,server)
             await conn.execute(
@@ -3490,27 +3789,33 @@ class Matchmaking(commands.Cog):
                 by_server[server_code] = rows_for_server
 
             async with self.db_pool.acquire() as conn:
-                # Solo tocamos los servidores que sí pudimos refrescar en este ciclo
-                for server_code, rows in by_server.items():
-                    # Limpiamos catálogo viejo de ese servidor
-                    await conn.execute(
-                        "DELETE FROM songs WHERE server = $1", server_code
-                    )
+                # Reemplazo atómico por servidor.
+                # Si un refresh falla o genera 0 rows, NO borramos el catálogo anterior.
+                async with conn.transaction():
+                    for server_code, rows in by_server.items():
+                        if not rows:
+                            log.warning(
+                                f"[songs] No hay canciones válidas para server={server_code} tras filtrar por release+1d. Se conserva el catálogo anterior."
+                            )
+                            continue
 
-                    if not rows:
-                        log.warning(
-                            f"[songs] No hay canciones válidas para server={server_code} tras filtrar por release+1d."
+                        await conn.execute(
+                            "DELETE FROM songs WHERE server = $1", server_code
                         )
-                        continue
 
-                    # Insertamos solo las canciones que YA cumplieron el día de gracia
-                    await conn.executemany(
-                        """
-                        INSERT INTO songs (id, title, diff, level, notes_count, server)
-                        VALUES ($1, $2, $3, $4, $5, $6)
-                        """,
-                        rows,
-                    )
+                        await conn.executemany(
+                            """
+                            INSERT INTO songs (id, title, diff, level, notes_count, server)
+                            VALUES ($1, $2, $3, $4, $5, $6)
+                            ON CONFLICT (id, diff, server) DO UPDATE SET
+                                title = EXCLUDED.title,
+                                level = EXCLUDED.level,
+                                notes_count = EXCLUDED.notes_count
+                            """,
+                            rows,
+                        )
+
+                    await self._seed_default_banned_songs(conn)
 
         print(
             "[songs] Catálogo EN/JP actualizado (reemplazo por servidor, con filtro release+1d)"
@@ -3524,20 +3829,24 @@ class Matchmaking(commands.Cog):
         if diffs is None:
             diffs = DIFFICULTY_PRIORITY
 
+        key_expr = self._song_key_sql("s")
+        banned_filter = self._banned_song_filter_sql("s")
+
         async with self._songs_lock:
             async with self.db_pool.acquire() as conn:
-                placeholder = ",".join(f"${i+3}" for i in range(len(diffs)))
                 rows = await conn.fetch(
-                    f"""SELECT title, level, diff, notes_count
-                        FROM songs
-                        WHERE level BETWEEN $1 AND $2
-                        AND diff IN ({placeholder})""",
-                    low,
-                    high,
-                    *diffs,
+                    f"""
+                    SELECT s.title, s.level, s.diff, s.notes_count
+                    FROM songs s
+                    WHERE s.level BETWEEN $1 AND $2
+                      AND s.diff = ANY($3::text[])
+                      {banned_filter}
+                    """,
+                    int(low),
+                    int(high),
+                    list(diffs),
                 )
 
-        # Agrupar por nivel
         songs_by_lvl = {}
         for r in rows:
             lvl = r["level"]
@@ -3546,7 +3855,6 @@ class Matchmaking(commands.Cog):
             )
 
         picks = []
-        # Recorre niveles de mayor a menor y toma hasta 3 al azar por nivel
         for lvl in range(high, low - 1, -1):
             pool = songs_by_lvl.get(lvl, [])
             if not pool:
@@ -3554,7 +3862,6 @@ class Matchmaking(commands.Cog):
             k = min(3, len(pool))
             picks.extend(random.sample(pool, k))
 
-        # Mezcla global y recorta a 10
         random.shuffle(picks)
         return picks[:10]
 
@@ -3598,6 +3905,32 @@ class Matchmaking(commands.Cog):
         return False
 
     async def launch_song_poll(self, room_info):
+        thread_id = int(room_info.get("thread") or 0)
+        if thread_id <= 0:
+            log.warning("launch_song_poll called without valid thread id")
+            return
+
+        lock = self._room_locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            try:
+                return await asyncio.wait_for(
+                    self._launch_song_poll_impl(room_info),
+                    timeout=SONG_POLL_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                log.exception("Song poll timed out for thread_id=%s", thread_id)
+                await self._safe_thread_send(
+                    room_info,
+                    "⚠️ Song selection timed out. Try reroll or contact staff.",
+                )
+            except Exception:
+                log.exception("Song poll failed for thread_id=%s", thread_id)
+                await self._safe_thread_send(
+                    room_info,
+                    "⚠️ Song selection failed safely. No MMR/result logic was changed.",
+                )
+
+    async def _launch_song_poll_impl(self, room_info):
         # Evitar re-selección si ya se postearon songs (más fuerte que started)
         if room_info.get("songs_posted") and not room_info.get("rerolling"):
             try:
@@ -5201,129 +5534,455 @@ class Matchmaking(commands.Cog):
 
 
 
+    @app_commands.command(name="songban", description="Ban song by title from queue.")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        title="Exact or display song title.",
+        server="all, en or jp.",
+        diff="Optional: easy, normal, hard, expert, master or append.",
+        reason="Optional reason.",
+    )
+    async def songban(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        server: str = "all",
+        diff: str | None = None,
+        reason: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        clean_title = re.sub(r"\s+", " ", str(title or "").strip())
+        title_key = self._song_title_key(clean_title)
+        if not title_key:
+            return await interaction.followup.send("❌ Invalid song title.", ephemeral=True)
+
+        server_norm = self._normalize_song_server(server)
+        diff_norm = self._normalize_song_diff(diff)
+
+        async with self.db_pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                """
+                SELECT id
+                FROM banned_songs
+                WHERE active = true
+                  AND server = $1
+                  AND title_key = $2
+                  AND COALESCE(diff, '*') = COALESCE($3, '*')
+                LIMIT 1
+                """,
+                server_norm,
+                title_key,
+                diff_norm,
+            )
+            if existing:
+                await conn.execute(
+                    """
+                    UPDATE banned_songs
+                    SET title = $1,
+                        reason = $2,
+                        created_by = $3,
+                        created_at = now()
+                    WHERE id = $4
+                    """,
+                    clean_title,
+                    reason,
+                    interaction.user.id,
+                    existing["id"],
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO banned_songs
+                        (song_id, title, title_key, diff, server, reason, created_by, active)
+                    VALUES
+                        (NULL, $1, $2, $3, $4, $5, $6, true)
+                    """,
+                    clean_title,
+                    title_key,
+                    diff_norm,
+                    server_norm,
+                    reason,
+                    interaction.user.id,
+                )
+
+        await interaction.followup.send(
+            f"✅ Banned song title: **{clean_title}** | server: `{server_norm}` | diff: `{diff_norm or 'all'}`",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="songbanid", description="Ban song by ID from queue.")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    @app_commands.describe(
+        song_id="Music ID from the catalog.",
+        server="all, en or jp.",
+        diff="Optional difficulty.",
+        reason="Optional reason.",
+    )
+    async def songbanid(
+        self,
+        interaction: discord.Interaction,
+        song_id: int,
+        server: str = "all",
+        diff: str | None = None,
+        reason: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+
+        server_norm = self._normalize_song_server(server)
+        diff_norm = self._normalize_song_diff(diff)
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT title
+                FROM songs
+                WHERE id = $1
+                  AND ($2 = 'all' OR server = $2)
+                ORDER BY server
+                LIMIT 1
+                """,
+                int(song_id),
+                server_norm,
+            )
+            title = str(row["title"]) if row else f"ID {song_id}"
+            title_key = self._song_title_key(title)
+
+            existing = await conn.fetchrow(
+                """
+                SELECT id
+                FROM banned_songs
+                WHERE active = true
+                  AND (song_id = $1 OR title_key = $4)
+                  AND server = $2
+                  AND COALESCE(diff, '*') = COALESCE($3, '*')
+                LIMIT 1
+                """,
+                int(song_id),
+                server_norm,
+                diff_norm,
+                title_key,
+            )
+            if existing:
+                await conn.execute(
+                    """
+                    UPDATE banned_songs
+                    SET title = $1,
+                        title_key = $2,
+                        reason = $3,
+                        created_by = $4,
+                        created_at = now()
+                    WHERE id = $5
+                    """,
+                    title,
+                    title_key,
+                    reason,
+                    interaction.user.id,
+                    existing["id"],
+                )
+            else:
+                await conn.execute(
+                    """
+                    INSERT INTO banned_songs
+                        (song_id, title, title_key, diff, server, reason, created_by, active)
+                    VALUES
+                        ($1, $2, $3, $4, $5, $6, $7, true)
+                    """,
+                    int(song_id),
+                    title,
+                    title_key,
+                    diff_norm,
+                    server_norm,
+                    reason,
+                    interaction.user.id,
+                )
+
+        await interaction.followup.send(
+            f"✅ Banned song ID: `{song_id}` | title: **{title}** | server: `{server_norm}` | diff: `{diff_norm or 'all'}`",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="songunban", description="Unban song by title.")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    async def songunban(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        server: str = "all",
+        diff: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        title_key = self._song_title_key(title)
+        server_norm = self._normalize_song_server(server)
+        diff_norm = self._normalize_song_diff(diff)
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE banned_songs
+                SET active = false
+                WHERE active = true
+                  AND title_key = $1
+                  AND ($2 = 'all' OR server = $2 OR server = 'all')
+                  AND ($3::text IS NULL OR diff = $3 OR diff IS NULL)
+                RETURNING id
+                """,
+                title_key,
+                server_norm,
+                diff_norm,
+            )
+
+        await interaction.followup.send(
+            f"✅ Unbanned {len(rows)} title ban(s)." if rows else "ℹ️ No active title ban found.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="songunbanid", description="Unban song by ID.")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    async def songunbanid(
+        self,
+        interaction: discord.Interaction,
+        song_id: int,
+        server: str = "all",
+        diff: str | None = None,
+    ):
+        await interaction.response.defer(ephemeral=True)
+        server_norm = self._normalize_song_server(server)
+        diff_norm = self._normalize_song_diff(diff)
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE banned_songs
+                SET active = false
+                WHERE active = true
+                  AND song_id = $1
+                  AND ($2 = 'all' OR server = $2 OR server = 'all')
+                  AND ($3::text IS NULL OR diff = $3 OR diff IS NULL)
+                RETURNING id
+                """,
+                int(song_id),
+                server_norm,
+                diff_norm,
+            )
+
+        await interaction.followup.send(
+            f"✅ Unbanned {len(rows)} ID ban(s)." if rows else "ℹ️ No active ID ban found.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="songbans", description="List active song bans.")
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    async def songbans(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT song_id, title, server, diff, reason, created_at
+                FROM banned_songs
+                WHERE active = true
+                ORDER BY created_at DESC
+                LIMIT 25
+                """
+            )
+
+        if not rows:
+            return await interaction.followup.send("No active song bans.", ephemeral=True)
+
+        lines = []
+        for r in rows:
+            id_part = f"ID {r['song_id']} · " if r["song_id"] is not None else ""
+            diff_part = r["diff"] or "all diffs"
+            reason_part = f" — {r['reason']}" if r["reason"] else ""
+            lines.append(
+                f"• {id_part}**{r['title']}** | `{r['server']}` | `{diff_part}`{reason_part}"
+            )
+
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
     @app_commands.command(
         name="forfeit", description="Vote to forfeit the current room."
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def forfeit(self, interaction: discord.Interaction):
-        # Debe ejecutarse dentro de un thread de room
         ch = interaction.channel
-        if not isinstance(ch, (discord.Thread, discord.TextChannel)):
-            await interaction.response.send_message(
+        if not isinstance(ch, discord.Thread):
+            return await interaction.response.send_message(
                 "This command must be used inside a room thread.", ephemeral=True
             )
-            return
 
-        # Encontrar room por thread
-        room_id = None
-        room = None
-
-        for rid, info in (self.rooms or {}).items():
-            thr_id = info.get("thread")
-
-            if thr_id is not None and thr_id == ch.id:
-                room_id = rid
-                room = info
-                break
-
-        if room is None:
-            await interaction.response.send_message(
+        room_id, room = self._find_room_by_thread_id(ch.id)
+        if room is None or room_id is None:
+            return await interaction.response.send_message(
                 "This does not look like an active room thread.", ephemeral=True
             )
-            return
 
         if room.get("finished") or room.get("closed"):
-            await interaction.response.send_message(
+            return await interaction.response.send_message(
                 "This room is already closed.", ephemeral=True
             )
-            return
 
-        # Resolver lista actual de jugadores (Members)
-        raw_players = room.get("players", []) or []
-        players_now: list[discord.Member] = []
-        for p in raw_players:
-            if isinstance(p, discord.Member):
-                if not p.bot:
-                    players_now.append(p)
-            elif isinstance(p, discord.User):
-                # best effort: convertir a Member si está en guild
-                if interaction.guild:
-                    m = interaction.guild.get_member(p.id)
-                    if m and not m.bot:
-                        players_now.append(m)
-            elif isinstance(p, int):
-                if interaction.guild:
-                    m = interaction.guild.get_member(p)
-                    if m and not m.bot:
-                        players_now.append(m)
+        valid_player_ids = self._room_player_ids(room)
+        if interaction.user.bot or interaction.user.id not in valid_player_ids:
+            return await interaction.response.send_message(
+                "Only valid players from this room can start a forfeit vote.",
+                ephemeral=True,
+            )
 
-        # Si no hay suficientes miembros, igual dejamos votar pero con umbral mínimo 1
-        n_players = len(players_now)
-        threshold = max(1, (n_players // 2) + 1)  # mayoría simple
+        lock = self._forfeit_locks.setdefault(ch.id, asyncio.Lock())
+        if lock.locked():
+            return await interaction.response.send_message(
+                "A forfeit vote is already in progress for this room.",
+                ephemeral=True,
+            )
 
-        # Estructura de votos
-        votes = room.setdefault("forfeit_votes", {})
-        uid = interaction.user.id
+        await interaction.response.defer(ephemeral=True)
 
-        # Registrar voto "YES"
-        votes[str(uid)] = True
+        async with lock:
+            if room.get("finished") or room.get("closed"):
+                return await interaction.followup.send(
+                    "This room is already closed.", ephemeral=True
+                )
 
-        yes_count = sum(1 for v in votes.values() if v is True)
+            if room.get("forfeit_in_progress"):
+                return await interaction.followup.send(
+                    "A forfeit vote is already in progress for this room.",
+                    ephemeral=True,
+                )
 
-        # Si no alcanza, solo reporta estado
-        if yes_count < threshold:
+            room["forfeit_in_progress"] = True
+            room["forfeit_votes"] = {}
+
+            vote_msg = None
             try:
-                await interaction.response.send_message(
-                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required.",
-                    ephemeral=False,
+                player_mentions = " ".join(f"<@{uid}>" for uid in sorted(valid_player_ids))
+                vote_msg = await self._safe_channel_send(
+                    ch,
+                    "🏳️ **Forfeit vote started.**\n"
+                    "React with ✅ to accept closing the room.\n"
+                    "React with ❌ to reject closing the room.\n"
+                    f"Rule: **3 or more ✅ closes the room**. Tie or more ❌ rejects it.\n"
+                    f"Only room players count. Timeout: **{int(FORFEIT_TIMEOUT_SEC)}s**.\n"
+                    f"Players: {player_mentions}",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
                 )
-            except discord.InteractionResponded:
+
+                if vote_msg is None:
+                    return await interaction.followup.send(
+                        "Could not start the forfeit vote because Discord did not accept the message.",
+                        ephemeral=True,
+                    )
+
+                for emoji in ("✅", "❌"):
+                    try:
+                        await vote_msg.add_reaction(emoji)
+                    except Exception:
+                        pass
+
                 await interaction.followup.send(
-                    f"🗳️ Forfeit vote registered. YES: {yes_count}/{threshold} required."
+                    "Forfeit vote started in this room.", ephemeral=True
                 )
-            return
 
-        # Aprobado: cerrar room
-        room["finished"] = True
-        room["closed"] = True
+                votes: dict[int, str] = {}
+                deadline = asyncio.get_running_loop().time() + float(FORFEIT_TIMEOUT_SEC)
 
-        # ✅ PUNTO 5: remover roles de queue a quienes siguen en la room
-        try:
-            await self._remove_queue_roles(players_now)
-        except Exception:
-            pass
+                def check(reaction: discord.Reaction, user: discord.User):
+                    if user.bot:
+                        return False
+                    if reaction.message.id != vote_msg.id:
+                        return False
+                    if str(reaction.emoji) not in ("✅", "❌"):
+                        return False
+                    return int(user.id) in valid_player_ids
 
-        # Notificar en el thread
-        try:
-            if isinstance(ch, discord.Thread):
-                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
-            else:
-                await ch.send("🏳️ Forfeit approved by vote. Closing room.")
-        except Exception:
-            pass
+                while True:
+                    yes_count = sum(1 for v in votes.values() if v == "✅")
+                    if yes_count >= 3:
+                        break
 
-        # Disparar evento para Rooms cog
-        try:
-            self.bot.dispatch("room_finished", room_id)
-        except Exception:
-            pass
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        break
 
-        # Cerrar hilo
-        try:
-            # Si tu close_room ya maneja delete/archive según flags
-            asyncio.create_task(self.close_room(ch, delay=5, delete=True))
-        except Exception:
-            pass
+                    try:
+                        reaction, user = await self.bot.wait_for(
+                            "reaction_add",
+                            timeout=remaining,
+                            check=check,
+                        )
+                    except asyncio.TimeoutError:
+                        break
+                    except Exception:
+                        log.exception("forfeit wait_for failed for thread=%s", ch.id)
+                        break
 
-        # Responder interacción
-        try:
-            await interaction.response.send_message(
-                "✅ Forfeit confirmed. Room will be closed.", ephemeral=True
-            )
-        except discord.InteractionResponded:
-            await interaction.followup.send(
-                "✅ Forfeit confirmed. Room will be closed.", ephemeral=True
-            )
+                    uid = int(user.id)
+                    if uid in votes:
+                        # Un usuario solo cuenta una vez. La primera reacción válida gana.
+                        continue
+
+                    votes[uid] = str(reaction.emoji)
+                    room["forfeit_votes"] = {str(k): v for k, v in votes.items()}
+
+                yes_count = sum(1 for v in votes.values() if v == "✅")
+                no_count = sum(1 for v in votes.values() if v == "❌")
+
+                approved = yes_count >= 3
+                if approved:
+                    room["finished"] = True
+                    room["closed"] = True
+                    room["forfeit_in_progress"] = False
+
+                    try:
+                        await self._remove_queue_roles(self._room_members(interaction.guild, room))
+                    except Exception:
+                        log.exception("Failed to remove queue roles after forfeit")
+
+                    await self._safe_channel_send(
+                        ch,
+                        f"✅ **Forfeit approved.** Closing room. (✅ {yes_count} / ❌ {no_count})",
+                    )
+
+                    try:
+                        self.bot.dispatch("room_finished", room_id)
+                    except Exception:
+                        pass
+
+                    try:
+                        asyncio.create_task(self.close_room(ch, delay=5, delete=True))
+                    except Exception:
+                        log.exception("Failed to schedule close_room after forfeit")
+
+                    return
+
+                if yes_count == no_count:
+                    result_text = (
+                        f"⚖️ **Forfeit rejected by tie.** Room stays open. "
+                        f"(✅ {yes_count} / ❌ {no_count})"
+                    )
+                elif no_count > yes_count:
+                    result_text = (
+                        f"❌ **Forfeit rejected.** Room stays open. "
+                        f"(✅ {yes_count} / ❌ {no_count})"
+                    )
+                else:
+                    result_text = (
+                        f"❌ **Forfeit failed.** Not enough ✅ votes to close the room. "
+                        f"Need 3 ✅. (✅ {yes_count} / ❌ {no_count})"
+                    )
+
+                await self._safe_channel_send(ch, result_text)
+
+            finally:
+                room["forfeit_in_progress"] = False
+                room.pop("forfeit_votes", None)
+                if vote_msg is not None:
+                    room["last_forfeit_vote_message_id"] = vote_msg.id
 
     @commands.command(name="calc", aliases=["calculate"])
     async def calc(self, ctx: commands.Context):
@@ -5559,22 +6218,31 @@ class Matchmaking(commands.Cog):
                 cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
+                # ISO2 tomado DIRECTAMENTE del mensaje !submit.
+                # Ejemplo de lÃ­nea: <@123> [PE] 1000,2,0,0,0
+                # La bandera del board debe salir de este ISO2, no del perfil guardado.
+                submit_cc = (cc or "").upper().strip()
+
                 profile_cc = (
                     await self.db_pool.fetchval(
                         "SELECT country FROM players WHERE user_id = $1",
                         uid,
                     )
                     or ""
-                )
-                if not profile_cc and cc:
-                    profile_cc = cc.upper()
+                ).upper().strip()
+
+                # Guardamos/actualizamos el paÃ­s para que la web tambiÃ©n quede alineada
+                # con el Ãºltimo ISO2 usado en !submit.
+                if submit_cc and profile_cc != submit_cc:
                     await self.db_pool.execute(
                         "UPDATE players SET country = $2 WHERE user_id = $1",
                         uid,
-                        profile_cc,
+                        submit_cc,
                     )
+                    profile_cc = submit_cc
 
-                display_flag = country_flag(profile_cc)
+                # Esta es la bandera que se mostrarÃ¡ a la derecha del nombre en results.png.
+                display_flag = country_flag(submit_cc)
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
 
                 is_season_placement = self._has_season_placement_role(member)
@@ -5585,7 +6253,7 @@ class Matchmaking(commands.Cog):
                 players_list.append(
                     {
                         "member": member,
-                        "cc": profile_cc,
+                        "cc": submit_cc,
                         "stats": stats,
                         "total": total_points,
                         "old": int(old),
@@ -5713,7 +6381,7 @@ class Matchmaking(commands.Cog):
                         mmr_delta,
                         mmr_final,
                         p["was_placement"],
-                        get_rank_from_mmr(mmr_prev),
+                        role_name,  # color del board basado en el rango FINAL
                     )
                 )
 
