@@ -511,7 +511,7 @@ SEASON_CHOICES = [
 
 class Top100View(View):
     def __init__(self, cog, db_pool, interaction, season_id, season_name):
-        super().__init__(timeout=None)
+        super().__init__(timeout=180)
         self.cog = cog
         self.db = db_pool
         self.inter = interaction
@@ -519,16 +519,28 @@ class Top100View(View):
         self.season_name = season_name
         self.page = 0
         self.per_page = 20
-        self._join_lock = asyncio.Lock()
+        self._rows_cache: list[dict] | None = None
+        self._cache_lock = asyncio.Lock()
+
+    async def _get_rows(self, force_refresh: bool = False) -> list[dict]:
+        """
+        Cachea el leaderboard para que /top100 y los botones no vuelvan a consultar
+        Discord/DB en cada página. Esto evita 429 y Unknown interaction.
+        """
+        async with self._cache_lock:
+            if force_refresh or self._rows_cache is None:
+                self._rows_cache = await self.cog._build_visible_leaderboard_rows(
+                    self.inter.guild,
+                    self.season_id,
+                )
+            return self._rows_cache
 
     async def build_embed(self) -> Embed:
-        all_rows = await self.cog._build_visible_leaderboard_rows(
-            self.inter.guild,
-            self.season_id,
-        )
+        all_rows = await self._get_rows()
 
         total = min(len(all_rows), 100)
         max_page = (total - 1) // self.per_page if total else 0
+        self.page = max(0, min(self.page, max_page))
 
         offset = self.page * self.per_page
         rows = all_rows[:100][offset : offset + self.per_page]
@@ -539,12 +551,7 @@ class Top100View(View):
         lines = []
 
         for idx, r in enumerate(rows, start=offset + 1):
-            member = r["member"]
-            name = (
-                member.display_name[:25]
-                if member is not None
-                else f"ID {r['user_id']}"
-            )
+            name = str(r.get("member_name") or f"ID {r['user_id']}")[:25]
             mmr = f"{int(r['visible_mmr']):,}"
             rank_label = f"{r['role']} [SP]" if r["is_unplayed_sp"] else r["role"]
 
@@ -555,7 +562,7 @@ class Top100View(View):
             + header
             + separator
             + ("\n".join(lines) if lines else "(no players)\n")
-            + f"\n```Página {self.page+1}/{max_page+1}"
+            + f"\n```Página {self.page + 1}/{max_page + 1}"
         )
         return embed
 
@@ -563,31 +570,27 @@ class Top100View(View):
     async def prev_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
+        await interaction.response.defer()
+
         if self.page > 0:
             self.page -= 1
 
-        total = min(len(await self.cog._build_visible_leaderboard_rows(
-            self.inter.guild,
-            self.season_id,
-        )), 100)
-
+        total = min(len(await self._get_rows()), 100)
         max_page = (total - 1) // self.per_page if total else 0
 
         self.prev_page.disabled = self.page == 0
         self.next_page.disabled = self.page == max_page
 
         new_embed = await self.build_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+        await interaction.edit_original_response(embed=new_embed, view=self)
 
     @button(emoji="▶️", style=ButtonStyle.secondary)
     async def next_page(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        total = min(len(await self.cog._build_visible_leaderboard_rows(
-            self.inter.guild,
-            self.season_id,
-        )), 100)
+        await interaction.response.defer()
 
+        total = min(len(await self._get_rows()), 100)
         max_page = (total - 1) // self.per_page if total else 0
 
         if self.page < max_page:
@@ -597,7 +600,7 @@ class Top100View(View):
         self.next_page.disabled = self.page == max_page
 
         new_embed = await self.build_embed()
-        await interaction.response.edit_message(embed=new_embed, view=self)
+        await interaction.edit_original_response(embed=new_embed, view=self)
 
 class Matchmaking(commands.Cog):
     RAW_EN = (
@@ -1162,12 +1165,13 @@ class Matchmaking(commands.Cog):
 
         out = []
         for r in rows:
-            member = guild.get_member(r["user_id"])
-            if member is None:
-                try:
-                    member = await guild.fetch_member(r["user_id"])
-                except Exception:
-                    member = None
+            user_id = int(r["user_id"])
+
+            # IMPORTANTE:
+            # No usar guild.fetch_member() dentro del leaderboard.
+            # En /top100 eran muchas llamadas REST a Discord y terminaban en 429 + Unknown interaction.
+            member = guild.get_member(user_id) if guild else None
+            member_name = member.display_name if member is not None else f"ID {user_id}"
 
             matches_played = int(r["matches_played"] or 0)
             mmr = int(r["mmr"] or 0)
@@ -1180,8 +1184,9 @@ class Matchmaking(commands.Cog):
 
             out.append(
                 {
-                    "user_id": int(r["user_id"]),
+                    "user_id": user_id,
                     "member": member,
+                    "member_name": member_name,
                     "role": str(r["role"]),
                     "mmr": mmr,
                     "visible_mmr": 0 if is_unplayed_sp else mmr,
@@ -4255,13 +4260,15 @@ class Matchmaking(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
+        await interaction.response.defer(ephemeral=True)
+
         member: discord.Member = interaction.user  # type: ignore
 
         async with self._join_lock:
             # Guard: ya estás en una sala activa (cualquier fase no-finished)
             already_room = self._find_player_room_id(member)
             if already_room is not None:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ You are already in a room. You cannot queue again until that room finishes.",
                     ephemeral=True,
                 )
@@ -4269,14 +4276,14 @@ class Matchmaking(commands.Cog):
             # Guard: ya estás en cola (EN o JP)
             for cid in ALLOWED_JOIN_CHANNELS:
                 if member.id in self.queues.get(cid, set()):
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "❌ You are already in the queue.", ephemeral=True
                     )
 
             # Lock-down: durante PREP se bloquea SOLO si need==0 (tu lógica actual)
             now = self._now_lima()
             if await self._is_join_locked(guild, ch.id, now):
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "⛔ Queue is locked down until the next slot.", ephemeral=True
                 )
 
@@ -4307,7 +4314,7 @@ class Matchmaking(commands.Cog):
             self.bot.dispatch("room_updated", None)
 
         # Respuesta (fuera del lock)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"Queued. Future room **{room_no}** ({pos_in_room}/5). "
             f"{'Room complete.' if need == 0 else f'Need {need} more to complete the next room.'}\n"
             f"Next slot: <t:{slot_ts}:T> (<t:{slot_ts}:R>).",
@@ -4333,6 +4340,8 @@ class Matchmaking(commands.Cog):
         if guild is None:
             return await interaction.response.send_message("Guild not found.", ephemeral=True)
 
+        await interaction.response.defer(ephemeral=True)
+
         member: discord.Member = interaction.user  # type: ignore
 
         # ------------------------------------------------------------
@@ -4342,18 +4351,18 @@ class Matchmaking(commands.Cog):
             async with self._join_lock:
                 rid, info = self._find_room_by_thread_id(ch.id)
                 if not info:
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "ℹ️ This thread is not an active room.", ephemeral=True
                     )
 
                 if member not in (info.get("players", []) or []):
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "ℹ️ You are not listed as a player in this room.", ephemeral=True
                     )
 
                 # Si ya empezó, no permitir /d (usa /forfeit según tu flujo)
                 if info.get("phase") == PHASE_STARTED or info.get("started", False):
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "❌ This match already started. Use `/forfeit` if everyone agrees to close the room.",
                         ephemeral=True,
                     )
@@ -4398,13 +4407,13 @@ class Matchmaking(commands.Cog):
                 except Exception:
                     pass
 
-            return await interaction.response.send_message("Removed from room.", ephemeral=True)
+            return await interaction.followup.send("Removed from room.", ephemeral=True)
 
         # ------------------------------------------------------------
         # CASO B: /d en #join / #jp-join -> salir SOLO de la queue
         # ------------------------------------------------------------
         if not isinstance(ch, discord.TextChannel) or ch.id not in ALLOWED_JOIN_CHANNELS:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "This command works in #join/#jp-join (drop queue) or inside a room thread (leave room).",
                 ephemeral=True,
             )
@@ -4412,7 +4421,7 @@ class Matchmaking(commands.Cog):
         async with self._join_lock:
             q = self.queues.get(ch.id, set())
             if member.id not in q:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "ℹ️ You are not in the queue.", ephemeral=True
                 )
 
@@ -4437,7 +4446,7 @@ class Matchmaking(commands.Cog):
             except Exception:
                 pass
 
-        return await interaction.response.send_message("Removed from queue.", ephemeral=True)
+        return await interaction.followup.send("Removed from queue.", ephemeral=True)
 
 
     @app_commands.command(
@@ -4681,10 +4690,12 @@ class Matchmaking(commands.Cog):
         interaction: discord.Interaction,
         season: app_commands.Choice[str] | None = None,
     ):
+        await interaction.response.defer()
+
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ Season not found", ephemeral=True
             )
 
@@ -4694,7 +4705,7 @@ class Matchmaking(commands.Cog):
             season_id,
         )
         if not data:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"You dont have register in **Season {season_name}**.", ephemeral=True
             )
 
@@ -4716,7 +4727,7 @@ class Matchmaking(commands.Cog):
             f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
             f"• **Peak MMR:** {data['peak_mmr']}\n"
         )
-        await interaction.response.send_message(msg)
+        await interaction.followup.send(msg)
 
     @app_commands.command(
         name="searchresult", description="Show a past results table by its global ID"
@@ -4726,6 +4737,8 @@ class Matchmaking(commands.Cog):
         result_id="Result ID shown under the season name in the results embed"
     )
     async def searchresult(self, interaction: discord.Interaction, result_id: int):
+        await interaction.response.defer()
+
         # Buscar el result en la tabla
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
@@ -4738,8 +4751,8 @@ class Matchmaking(commands.Cog):
             )
 
         if not row:
-            return await interaction.response.send_message(
-                f"⚠️ No result found with ID `{result_id}`."
+            return await interaction.followup.send(
+                f"⚠️ No result found with ID `{result_id}`.", ephemeral=True
             )
 
         channel = await self._resolve_channel(
@@ -4748,12 +4761,14 @@ class Matchmaking(commands.Cog):
         try:
             msg = await channel.fetch_message(row["message_id"])
         except discord.NotFound:
-            return await interaction.response.send_message(
-                "⚠️ The original result message could not be found (maybe deleted)."
+            return await interaction.followup.send(
+                "⚠️ The original result message could not be found (maybe deleted).",
+                ephemeral=True,
             )
         except discord.Forbidden:
-            return await interaction.response.send_message(
-                "⚠️ I don't have permissions to view the channel of that result."
+            return await interaction.followup.send(
+                "⚠️ I don't have permissions to view the channel of that result.",
+                ephemeral=True,
             )
 
         content = (
@@ -4762,9 +4777,9 @@ class Matchmaking(commands.Cog):
         )
 
         if msg.embeds:
-            await interaction.response.send_message(content, embed=msg.embeds[0])
+            await interaction.followup.send(content, embed=msg.embeds[0])
         else:
-            await interaction.response.send_message(content)
+            await interaction.followup.send(content)
 
     @app_commands.command(
         name="stats_user",
@@ -4783,17 +4798,19 @@ class Matchmaking(commands.Cog):
         user: discord.Member,
         season: app_commands.Choice[str] | None = None,
     ):
+        await interaction.response.defer()
+
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ No encontré la temporada seleccionada.", ephemeral=True
             )
 
         data = await self._fetch_user_stats(interaction.guild, user, season_id)
         if not data:
             player_name = await self.resolve_member_name(interaction.guild, user.id)
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 f"{player_name} doesn't have register in **Season {season_name}**.",
                 ephemeral=True,
             )
@@ -4822,7 +4839,7 @@ class Matchmaking(commands.Cog):
             f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
             f"• **Peak MMR:** {data['peak_mmr']}\n"
         )
-        await interaction.response.send_message(msg)
+        await interaction.followup.send(msg)
 
     @app_commands.command(
         name="cutoffs",
@@ -4837,10 +4854,12 @@ class Matchmaking(commands.Cog):
         interaction: discord.Interaction,
         season: app_commands.Choice[str] | None = None,
     ):
+        await interaction.response.defer()
+
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ No encontré la temporada seleccionada.", ephemeral=True
             )
 
@@ -4851,12 +4870,13 @@ class Matchmaking(commands.Cog):
             data[n] = await self._fetch_cutoff(season_id, n)
 
         board = self._format_cutoffs_board(season_name, data)
-        await interaction.response.send_message(board)
+        await interaction.followup.send(board)
 
-    
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
     async def mmr_self(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+
         mmr_val, role = await self.fetch_player(interaction.user.id)
         name = interaction.user.display_name
         season_status = self._season_status_label(interaction.user)
@@ -4870,11 +4890,11 @@ class Matchmaking(commands.Cog):
         )
 
         if role == "Placement" and not season_status:
-            await interaction.response.send_message(f"{name} is in Placement.")
+            await interaction.followup.send(f"{name} is in Placement.")
             return
 
         extra = f" {season_status}." if season_status else ""
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{name} has {visible_mmr} MMR and rank {role}.{extra}"
         )
 
@@ -4892,30 +4912,27 @@ class Matchmaking(commands.Cog):
         interaction: discord.Interaction,
         season: app_commands.Choice[str] | None = None,
     ):
+        await interaction.response.defer()
+
         # Resolver season (igual que en /stats, /cutoffs, etc.)
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
         if not season_id:
-            return await interaction.response.send_message(
+            return await interaction.followup.send(
                 "⚠️ Season not found.", ephemeral=True
             )
 
         view = Top100View(self, self.db_pool, interaction, season_id, season_name)
 
-        total = await self.db_pool.fetchval(
-            """
-            SELECT COUNT(*)
-            FROM seasonplayers
-            WHERE season_id = $1
-            """,
-            season_id,
-        )
+        # Carga una sola vez. El view usa cache para paginación.
+        rows = await view._get_rows()
+        total = min(len(rows), 100)
         max_page = (total - 1) // view.per_page if total else 0
         view.prev_page.disabled = True
         view.next_page.disabled = 0 == max_page
 
         embed = await view.build_embed()
-        await interaction.response.send_message(embed=embed, view=view)
+        await interaction.followup.send(embed=embed, view=view)
 
 # Pon esto DENTRO de class Matchmaking(commands.Cog):
 
