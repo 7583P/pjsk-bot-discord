@@ -1,4 +1,8 @@
-from fontTools.ttLib import TTFont
+try:
+    from fontTools.ttLib import TTFont
+except Exception:
+    TTFont = None
+
 from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageChops, ImageOps
 
 import io
@@ -8,9 +12,13 @@ from pathlib import Path
 from typing import Literal, List, Any
 
 
+# ============================================================
+# RESULTS IMAGE CONFIG
+# ============================================================
+
 rank_colors = {
     "Season Placement": ("#ff8519", "#ff8519"),
-    "Placement": ("#ff4600", "#ff7000"),
+    "Placement": ("#ff4600", "#ff4600"),
     "Iron": ("#8d7f79", "#5f514a"),
     "Iron ⬆": ("#917f76", "#775341"),
     "Bronze": ("#9f4600", "#752d00"),
@@ -48,6 +56,82 @@ REGIONAL_A = 0x1F1E6
 REGIONAL_Z = 0x1F1FF
 ISO2_RE = re.compile(r"^[A-Za-z]{2}$")
 
+
+# ============================================================
+# STATS IMAGE CONFIG
+# ============================================================
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+STATS_ASSETS_DIR = ROOT_DIR / "assets" / "stats"
+STATS_BACKGROUND_PATH = STATS_ASSETS_DIR / "stats_background.png"
+STATS_RANKS_DIR = STATS_ASSETS_DIR / "ranks"
+
+# Tu repo tiene esta fuente según tu estructura.
+# También aceptamos la variante con doble n por compatibilidad.
+STATS_FONT_CANDIDATES = [
+    ROOT_DIR / "assets" / "rodintlg_eb.otf",
+    ROOT_DIR / "assets" / "rodinntlg_eb.otf",
+    Path("assets/rodintlg_eb.otf"),
+    Path("assets/rodinntlg_eb.otf"),
+]
+
+RANK_LOGO_FILES = {
+    "Season Placement": "placement.png",
+    "Placement": "placement.png",
+    "Iron": "iron.png",
+    "Iron ⬆": "iron_up.png",
+    "Bronze": "bronze.png",
+    "Bronze ⬆": "bronze_up.png",
+    "Silver": "silver.png",
+    "Silver ⬆": "silver_up.png",
+    "Gold": "gold.png",
+    "Gold ⬆": "gold_up.png",
+    "Platinum": "platinum.png",
+    "Platinum ⬆": "platinum_up.png",
+    "Diamond": "diamond.png",
+    "Diamond ⬆": "diamond_up.png",
+    "Crystal": "crystal.png",
+    "Crystal ⬆": "crystal_up.png",
+    "Master": "master.png",
+    "Master ⬆": "master_up.png",
+    "Champion": "champion.png",
+    "Grand Champion": "grand_champion.png",
+    "Star": "star.png",
+    "Divine Star": "divine_star.png",
+    "Legend": "legend.png",
+}
+
+RANK_PROGRESS_RANGES = {
+    "Season Placement": (0, 50),
+    "Placement": (0, 50),
+    "Iron": (0, 50),
+    "Iron ⬆": (50, 100),
+    "Bronze": (100, 150),
+    "Bronze ⬆": (150, 200),
+    "Silver": (200, 250),
+    "Silver ⬆": (250, 300),
+    "Gold": (300, 350),
+    "Gold ⬆": (350, 400),
+    "Platinum": (400, 450),
+    "Platinum ⬆": (450, 500),
+    "Diamond": (500, 550),
+    "Diamond ⬆": (550, 600),
+    "Crystal": (600, 650),
+    "Crystal ⬆": (650, 700),
+    "Master": (700, 750),
+    "Master ⬆": (750, 800),
+    "Champion": (800, 850),
+    "Grand Champion": (850, 900),
+    "Star": (900, 950),
+    "Divine Star": (950, 1000),
+    "Legend": (1000, 1000),
+}
+
+
+# ============================================================
+# COMMON HELPERS
+# ============================================================
 
 def normalize_country_code(value: Any) -> str | None:
     if value is None:
@@ -104,8 +188,11 @@ def strip_unsupported_chars(text: str, font_path: str | Path) -> str:
     """
     text = str(text or "")
 
+    if TTFont is None:
+        return text.strip()
+
     try:
-        font = TTFont(font_path)
+        font = TTFont(str(font_path))
         cmaps = [table.cmap for table in font["cmap"].tables]
 
         def supported(char: str) -> bool:
@@ -214,6 +301,87 @@ def make_gradient_text_image(
 
     return out
 
+
+def _text_width(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont) -> int:
+    box = draw.textbbox((0, 0), str(text), font=font)
+    return int(box[2] - box[0])
+
+
+def _fit_text(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.ImageFont,
+    max_width: int,
+) -> str:
+    text = str(text or "")
+
+    if _text_width(draw, text, font) <= max_width:
+        return text
+
+    while len(text) > 1 and _text_width(draw, text + "...", font) > max_width:
+        text = text[:-1]
+
+    return text + "..."
+
+
+def _center_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill,
+    stroke_width: int = 0,
+    stroke_fill=(0, 0, 0, 255),
+):
+    x, y = xy
+    box = draw.textbbox((0, 0), str(text), font=font)
+    w = box[2] - box[0]
+    h = box[3] - box[1]
+
+    draw.text(
+        (x - w / 2, y - h / 2),
+        str(text),
+        font=font,
+        fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+    )
+
+
+def _draw_glow_text(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    fill=(255, 255, 255, 255),
+    glow=(55, 180, 255, 180),
+    stroke_width: int = 2,
+):
+    x, y = xy
+
+    for offset in (5, 3):
+        draw.text(
+            (x, y),
+            str(text),
+            font=font,
+            fill=glow,
+            stroke_width=offset,
+            stroke_fill=glow,
+        )
+
+    draw.text(
+        (x, y),
+        str(text),
+        font=font,
+        fill=fill,
+        stroke_width=stroke_width,
+        stroke_fill=(4, 8, 22, 255),
+    )
+
+
+# ============================================================
+# RANK / FLAG HELPERS
+# ============================================================
 
 def rank_from_mmr(mmr: int) -> str:
     mmr = int(mmr or 0)
@@ -359,6 +527,151 @@ def make_iso_badge(country_code: str, font: ImageFont.FreeTypeFont) -> Image.Ima
     return badge
 
 
+def _stats_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates: list[str | Path] = []
+
+    for p in STATS_FONT_CANDIDATES:
+        candidates.append(p)
+
+    candidates.extend(
+        [
+            "arialbd.ttf",
+            "arial.ttf",
+            "DejaVuSans-Bold.ttf",
+            "DejaVuSans.ttf",
+        ]
+    )
+
+    for p in candidates:
+        try:
+            if isinstance(p, Path) and not p.exists():
+                continue
+            return ImageFont.truetype(str(p), size=size)
+        except Exception:
+            continue
+
+    return ImageFont.load_default()
+
+
+def _rank_progress(rank: str, current_mmr: int) -> tuple[str, float]:
+    current_mmr = int(current_mmr or 0)
+
+    if rank == "Legend":
+        return f"{current_mmr}/1000+ MMR", 1.0
+
+    low, high = RANK_PROGRESS_RANGES.get(rank, (0, 50))
+
+    if high <= low:
+        return f"{current_mmr}/{high} MMR", 1.0
+
+    progress = (current_mmr - low) / float(high - low)
+    progress = max(0.0, min(1.0, progress))
+
+    return f"{current_mmr}/{high} MMR", progress
+
+
+def _build_alpha_mask_for_rank_logo(base_logo: Image.Image) -> Image.Image:
+    """
+    Crea la máscara del logo.
+
+    Si el PNG tiene transparencia real, usa el canal alpha.
+    Si el PNG viene blanco sobre fondo negro/opaco, usa luminancia para
+    evitar pintar todo el cuadrado.
+    """
+    base_logo = base_logo.convert("RGBA")
+    alpha = base_logo.getchannel("A")
+
+    try:
+        alpha_min, alpha_max = alpha.getextrema()
+    except Exception:
+        alpha_min, alpha_max = (255, 255)
+
+    # Si hay transparencia real, usamos alpha directamente.
+    if alpha_min < 250:
+        return alpha
+
+    # Fallback: logo blanco sobre fondo oscuro/opaco.
+    gray = ImageOps.grayscale(base_logo)
+    return gray.point(lambda v: 255 if v > 18 else 0)
+
+
+def _colorize_rank_logo(base_logo: Image.Image, rank: str) -> Image.Image:
+    """
+    Pinta un logo blanco/base usando el mismo gradiente de rank_colors
+    que ya se usa en la imagen de results.
+    """
+    rank = normalize_rank_name(rank, 0, False)
+    start_hex, end_hex = rank_colors.get(rank, rank_colors.get("Gold", ("#ffcf87", "#e2921c")))
+    start_rgb = hex_to_rgb(start_hex)
+    end_rgb = hex_to_rgb(end_hex)
+
+    base_logo = base_logo.convert("RGBA")
+    w, h = base_logo.size
+
+    gradient = Image.new("RGB", (w, h))
+    draw_gradient(gradient, start_rgb, end_rgb, direction="right")
+
+    mask = _build_alpha_mask_for_rank_logo(base_logo)
+
+    colored = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    colored.paste(gradient.convert("RGBA"), (0, 0), mask)
+
+    # Brillo suave para que se vea gamer/profesional sobre el panel oscuro.
+    glow_mask = mask.filter(ImageFilter.GaussianBlur(max(2, int(min(w, h) * 0.025))))
+    glow = Image.new("RGBA", (w, h), (*end_rgb, 95))
+    glow.putalpha(glow_mask)
+
+    return Image.alpha_composite(glow, colored)
+
+
+def _load_rank_logo(rank: str) -> Image.Image | None:
+    """
+    Carga el logo del rango.
+
+    Prioridad:
+    1. Logo específico ya coloreado, si existe: gold.png, master.png, champion.png, etc.
+    2. Logo base blanco que se colorea automáticamente:
+       assets/stats/ranks/ranks_base.png
+       o assets/stats/ranks/rank_base.png
+
+    Con esto puedes usar un solo PNG blanco para todos los rangos.
+    """
+    rank = normalize_rank_name(rank, 0, False)
+
+    specific_filename = RANK_LOGO_FILES.get(rank)
+    specific_path = STATS_RANKS_DIR / specific_filename if specific_filename else None
+
+    # Si existe un logo específico, se usa tal cual.
+    if specific_path and specific_path.exists():
+        try:
+            return Image.open(specific_path).convert("RGBA")
+        except Exception:
+            pass
+
+    # Tu archivo actual se llama ranks_base.png.
+    base_candidates = [
+        STATS_RANKS_DIR / "ranks_base.png",
+        STATS_RANKS_DIR / "rank_base.png",
+        STATS_RANKS_DIR / "base.png",
+    ]
+
+    for base_path in base_candidates:
+        if not base_path.exists():
+            continue
+
+        try:
+            base_logo = Image.open(base_path).convert("RGBA")
+            return _colorize_rank_logo(base_logo, rank)
+        except Exception:
+            continue
+
+    return None
+
+
+# ============================================================
+# RESULTS IMAGE GENERATOR
+# ============================================================
+
 def normalize_summary_row(row: tuple) -> dict:
     """
     Soporta 3 formatos:
@@ -487,6 +800,7 @@ def generate_results_image(
     summary_rows: List[tuple],
     font_path: str,
     side_image: Image.Image,
+    submitted_at_text: str | None = None,
 ) -> io.BytesIO:
     """
     Dibuja el board de results sobre assets/background.png.
@@ -525,6 +839,7 @@ def generate_results_image(
     row_font = ImageFont.truetype(font_path, 40)
     small_font = ImageFont.truetype(font_path, 28)
     smallist_font = ImageFont.truetype(font_path, 23)
+    meta_font = ImageFont.truetype(font_path, 24)
 
     TITLE_COLOR = (255, 255, 255)
 
@@ -533,6 +848,20 @@ def generate_results_image(
     # ======================
     im = Image.open("assets/background.png").convert("RGBA")
     draw = ImageDraw.Draw(im)
+
+    # ======================
+    # SUBMIT DATETIME
+    # BELOW "ROOM RESULT"
+    # ======================
+    if submitted_at_text:
+        draw.text(
+            (250, 180),
+            f"Submitted: {submitted_at_text}",
+            font=meta_font,
+            fill=(255, 255, 255),
+            stroke_width=2,
+            stroke_fill=(35, 45, 110),
+        )
 
     # ======================
     # AVERAGE MMR
@@ -606,7 +935,6 @@ def generate_results_image(
     FLAG_GAP = 12
     FLAG_SIZE = (42, 30)
 
-    # Espacio máximo para que nombre + bandera no choque con results
     NAME_MAX_PX = X_RESULTS - X_NAME - FLAG_SIZE[0] - FLAG_GAP - 35
 
     # ======================
@@ -744,3 +1072,396 @@ def generate_results_image(
     im.save(buf, "PNG")
     buf.seek(0)
     return buf
+
+
+# ============================================================
+# STATS IMAGE GENERATOR
+# ============================================================
+
+def generate_stats_image(
+    *,
+    player_name: str,
+    avatar_bytes: bytes | None,
+    rank: str,
+    position: int,
+    total_players: int,
+    matches_played: int,
+    last10_wins: int,
+    last10_losses: int,
+    peak_mmr: int,
+    current_mmr: int,
+    season_name: str,
+) -> io.BytesIO:
+    """
+    Genera la imagen de /stats y /stats_user.
+
+    No consulta PostgreSQL ni Discord.
+    Solo dibuja los datos recibidos sobre:
+        assets/stats/stats_background.png
+
+    El único asset gráfico variable por rango es:
+        assets/stats/ranks/{rank}.png
+    """
+
+    if not STATS_BACKGROUND_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing stats background: {STATS_BACKGROUND_PATH}"
+        )
+
+    rank = normalize_rank_name(rank, current_mmr, False)
+
+    img = Image.open(STATS_BACKGROUND_PATH).convert("RGBA")
+    draw = ImageDraw.Draw(img)
+
+    w, h = img.size
+
+    # La imagen base que estás usando está cerca de 1699x926.
+    # Estos helpers escalan posiciones aunque el PNG tenga otro tamaño.
+    def sx(x: float) -> int:
+        return int(x * w / 1699)
+
+    def sy(y: float) -> int:
+        return int(y * h / 926)
+
+    # Fuentes
+    title_font = _stats_font(sy(64))
+    username_font = _stats_font(sy(72))
+    label_font = _stats_font(sy(30))
+    number_font = _stats_font(sy(46))
+    small_font = _stats_font(sy(26))
+    mmr_font = _stats_font(sy(46))
+    rank_font = _stats_font(sy(50))
+
+    # ========================================================
+    # PANEL PRINCIPAL
+    # ========================================================
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+
+    panel = (
+        sx(220),
+        sy(105),
+        sx(1478),
+        sy(846),
+    )
+
+    od.rounded_rectangle(
+        panel,
+        radius=sy(34),
+        fill=(4, 8, 28, 190),
+        outline=(60, 185, 255, 210),
+        width=max(1, sy(2)),
+    )
+
+    # Líneas neon superiores/inferiores
+    od.line((sx(280), sy(124), sx(720), sy(124)), fill=(70, 190, 255, 190), width=max(1, sy(2)))
+    od.line((sx(980), sy(124), sx(1420), sy(124)), fill=(230, 80, 255, 180), width=max(1, sy(2)))
+    od.line((sx(280), sy(828), sx(720), sy(828)), fill=(70, 190, 255, 150), width=max(1, sy(2)))
+    od.line((sx(980), sy(828), sx(1420), sy(828)), fill=(230, 80, 255, 140), width=max(1, sy(2)))
+
+    img = Image.alpha_composite(img, overlay)
+    draw = ImageDraw.Draw(img)
+
+    # ========================================================
+    # TÍTULO
+    # ========================================================
+    _center_text(
+        draw,
+        (sx(850), sy(150)),
+        "PJSK LOUNGE STATS",
+        title_font,
+        fill=(245, 250, 255, 255),
+        stroke_width=max(1, sy(2)),
+        stroke_fill=(40, 120, 255, 200),
+    )
+
+    # ========================================================
+    # AVATAR
+    # ========================================================
+    avatar_size = sy(190)
+    avatar_x = sx(305)
+    avatar_y = sy(210)
+
+    avatar_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    ad = ImageDraw.Draw(avatar_layer)
+
+    ad.ellipse(
+        (
+            avatar_x - sy(8),
+            avatar_y - sy(8),
+            avatar_x + avatar_size + sy(8),
+            avatar_y + avatar_size + sy(8),
+        ),
+        fill=(50, 170, 255, 70),
+    )
+    ad.ellipse(
+        (avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size),
+        fill=(7, 11, 32, 230),
+        outline=(120, 210, 255, 255),
+        width=max(1, sy(5)),
+    )
+
+    img = Image.alpha_composite(img, avatar_layer)
+    draw = ImageDraw.Draw(img)
+
+    avatar_drawn = False
+
+    if avatar_bytes:
+        try:
+            avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
+            avatar = ImageOps.fit(
+                avatar,
+                (avatar_size, avatar_size),
+                method=Image.Resampling.LANCZOS,
+            )
+
+            mask = Image.new("L", (avatar_size, avatar_size), 0)
+            md = ImageDraw.Draw(mask)
+            md.ellipse((0, 0, avatar_size, avatar_size), fill=255)
+
+            img.paste(avatar, (avatar_x, avatar_y), mask)
+            avatar_drawn = True
+        except Exception:
+            avatar_drawn = False
+
+    if not avatar_drawn:
+        # Placeholder de usuario
+        draw.ellipse(
+            (
+                avatar_x + sy(65),
+                avatar_y + sy(45),
+                avatar_x + sy(125),
+                avatar_y + sy(105),
+            ),
+            fill=(115, 113, 155, 255),
+        )
+        draw.pieslice(
+            (
+                avatar_x + sy(45),
+                avatar_y + sy(105),
+                avatar_x + sy(145),
+                avatar_y + sy(205),
+            ),
+            start=180,
+            end=360,
+            fill=(115, 113, 155, 255),
+        )
+
+    # ========================================================
+    # USERNAME
+    # ========================================================
+    safe_name = _fit_text(draw, player_name or "Unknown", username_font, sx(540))
+    _draw_glow_text(
+        draw,
+        (sx(560), sy(250)),
+        safe_name,
+        username_font,
+        fill=(255, 255, 255, 255),
+        glow=(80, 150, 255, 120),
+        stroke_width=max(1, sy(2)),
+    )
+
+    # ========================================================
+    # RANK BOX
+    # ========================================================
+    rank_box = (sx(1120), sy(220), sx(1375), sy(440))
+    draw.rounded_rectangle(
+        rank_box,
+        radius=sy(18),
+        fill=(7, 10, 26, 205),
+        outline=(255, 203, 75, 140),
+        width=max(1, sy(2)),
+    )
+
+    _center_text(
+        draw,
+        (sx(1248), sy(250)),
+        "RANK",
+        label_font,
+        fill=(180, 215, 255, 255),
+        stroke_width=1,
+        stroke_fill=(0, 0, 0, 255),
+    )
+
+    rank_logo = _load_rank_logo(rank)
+    if rank_logo:
+        rank_logo = ImageOps.contain(
+            rank_logo,
+            (sx(135), sy(110)),
+            method=Image.Resampling.LANCZOS,
+        )
+        lx = sx(1248) - rank_logo.size[0] // 2
+        ly = sy(275)
+        img.paste(rank_logo, (lx, ly), rank_logo)
+
+    _center_text(
+        draw,
+        (sx(1248), sy(405)),
+        str(rank).upper(),
+        rank_font,
+        fill=(255, 210, 80, 255),
+        stroke_width=max(1, sy(2)),
+        stroke_fill=(35, 15, 0, 255),
+    )
+
+    # ========================================================
+    # STATS FILA MEDIA
+    # ========================================================
+    y_mid_label = sy(495)
+    y_mid_value = sy(535)
+
+    draw.line((sx(640), sy(480), sx(640), sy(570)), fill=(150, 90, 255, 120), width=max(1, sy(2)))
+    draw.line((sx(1015), sy(480), sx(1015), sy(570)), fill=(150, 90, 255, 120), width=max(1, sy(2)))
+
+    _center_text(draw, (sx(500), y_mid_label), "POSITION", label_font, fill=(190, 150, 255, 255))
+    _center_text(
+        draw,
+        (sx(500), y_mid_value),
+        f"#{int(position)} / {int(total_players)}",
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    _center_text(draw, (sx(825), y_mid_label), "MATCHES PLAYED", label_font, fill=(190, 150, 255, 255))
+    _center_text(
+        draw,
+        (sx(825), y_mid_value),
+        str(int(matches_played)),
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    _center_text(draw, (sx(1195), y_mid_label), "LAST 10", label_font, fill=(190, 150, 255, 255))
+    _center_text(
+        draw,
+        (sx(1195), y_mid_value),
+        f"{int(last10_wins)}W - {int(last10_losses)}L",
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    # ========================================================
+    # MMR PROGRESS
+    # ========================================================
+    bar_panel = (sx(260), sy(595), sx(1410), sy(715))
+    draw.rounded_rectangle(
+        bar_panel,
+        radius=sy(14),
+        fill=(5, 8, 24, 215),
+        outline=(245, 180, 50, 170),
+        width=max(1, sy(2)),
+    )
+
+    _center_text(
+        draw,
+        (sx(835), sy(622)),
+        "MMR PROGRESS",
+        label_font,
+        fill=(255, 210, 90, 255),
+        stroke_width=1,
+        stroke_fill=(40, 20, 0, 255),
+    )
+
+    bar_x1 = sx(385)
+    bar_y1 = sy(650)
+    bar_x2 = sx(1285)
+    bar_y2 = sy(700)
+
+    draw.rounded_rectangle(
+        (bar_x1, bar_y1, bar_x2, bar_y2),
+        radius=sy(18),
+        fill=(4, 9, 26, 245),
+        outline=(255, 205, 80, 220),
+        width=max(1, sy(3)),
+    )
+
+    progress_text, progress = _rank_progress(rank, current_mmr)
+    fill_x2 = bar_x1 + int((bar_x2 - bar_x1) * progress)
+
+    if fill_x2 > bar_x1 + sy(10):
+        draw.rounded_rectangle(
+            (bar_x1 + sy(5), bar_y1 + sy(5), fill_x2 - sy(5), bar_y2 - sy(5)),
+            radius=sy(14),
+            fill=(230, 166, 25, 255),
+        )
+
+        # Brillo dorado
+        draw.rectangle(
+            (
+                bar_x1 + sy(12),
+                bar_y1 + sy(7),
+                max(bar_x1 + sy(12), fill_x2 - sy(12)),
+                bar_y1 + sy(18),
+            ),
+            fill=(255, 232, 135, 120),
+        )
+
+    _center_text(
+        draw,
+        (sx(835), sy(674)),
+        progress_text,
+        mmr_font,
+        fill=(255, 245, 210, 255),
+        stroke_width=max(1, sy(2)),
+        stroke_fill=(80, 45, 0, 255),
+    )
+
+    # ========================================================
+    # FILA INFERIOR
+    # ========================================================
+    bottom_y_label = sy(765)
+    bottom_y_value = sy(810)
+
+    draw.line((sx(620), sy(755), sx(620), sy(825)), fill=(90, 160, 255, 120), width=max(1, sy(2)))
+    draw.line((sx(1000), sy(755), sx(1000), sy(825)), fill=(190, 90, 255, 120), width=max(1, sy(2)))
+
+    _center_text(draw, (sx(430), bottom_y_label), "PEAK MMR", label_font, fill=(105, 185, 255, 255))
+    _center_text(
+        draw,
+        (sx(430), bottom_y_value),
+        str(int(peak_mmr)),
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    _center_text(draw, (sx(810), bottom_y_label), "CURRENT MMR", label_font, fill=(105, 185, 255, 255))
+    _center_text(
+        draw,
+        (sx(810), bottom_y_value),
+        str(int(current_mmr)),
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    _center_text(draw, (sx(1195), bottom_y_label), "CURRENT SEASON", label_font, fill=(190, 140, 255, 255))
+    _center_text(
+        draw,
+        (sx(1195), bottom_y_value),
+        str(season_name).upper(),
+        number_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=1,
+    )
+
+    # ========================================================
+    # FOOTER
+    # ========================================================
+    _center_text(
+        draw,
+        (sx(850), sy(860)),
+        "STAY SHARP. PLAY HARD. RISE HIGH.",
+        small_font,
+        fill=(110, 190, 255, 220),
+        stroke_width=1,
+        stroke_fill=(0, 0, 0, 255),
+    )
+
+    out = io.BytesIO()
+    img.save(out, format="PNG")
+    out.seek(0)
+    return out

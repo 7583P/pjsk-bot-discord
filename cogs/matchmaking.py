@@ -14,7 +14,7 @@ from discord.ext import commands, tasks  # loops periódicos
 from discord.ui import View, button
 from zoneinfo import ZoneInfo
 
-from helpers.image import generate_results_image
+from helpers.image import generate_results_image, generate_stats_image
 from PIL import Image
 
 
@@ -112,8 +112,14 @@ ACCURACY_CARD_REMINDER = (
     "You can use a 1☆ card if you don't want to search."
 )
 
+# !submit ya NO exige bandera.
+# Formato nuevo:
+#   <@USER_ID> perfect,great,good,bad,miss
+# Compatibilidad opcional con formato antiguo:
+#   <@USER_ID> [PE] perfect,great,good,bad,miss
+# La bandera del results se lee desde players.country. Si no hay country, se muestra WW.
 ENTRY_RE = re.compile(
-    r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
+    r"^<@!?(?P<id>\d+)>\s*(?:\[(?P<cc>[A-Za-z]{2})\]\s*)?(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
 )
 
 
@@ -137,6 +143,27 @@ def flagify_iso2_suffix(text: str) -> str:
     if not m:
         return t
     return t[: m.start(1)] + country_flag(m.group(1).upper())
+
+
+def normalize_submit_country_code(value: str | None) -> str:
+    """
+    Normaliza el country guardado en DB para el board de results.
+    Si el usuario no tiene bandera/país guardado, se usa WW.
+    WW no es una bandera real: el generador de imagen lo dibuja como badge de texto.
+    """
+    cc = (value or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{2}", cc):
+        return cc
+    return "WW"
+
+
+def format_submit_pdt_now() -> str:
+    """
+    Hora del submit en Pacific Daylight/Los Angeles time.
+    Formato solicitado: dd/mm/yyyy HH:MMpm, ejemplo 08/06/2026 19:05pm.
+    """
+    now_pdt = datetime.datetime.now(PDT_TZ)
+    return now_pdt.strftime("%d/%m/%Y %H:%M%p").lower()
 
 
 # ————— Append: solo limita el rango de selección para canciones 'append' —————
@@ -386,6 +413,7 @@ ROOM_CAPACITY = 5
 VOTE_TIMEOUT_SUBMIT = 30
 VOTE_TIMEOUT_FORFEIT = 30
 LIMA_TZ = ZoneInfo("America/Lima")
+PDT_TZ = ZoneInfo("America/Los_Angeles")
 
 PHASE_FUTURE = "FUTURE"  # en cola (sin hilo)
 PHASE_PREPARED = "PREPARED"  # hilo creado + canciones posteadas (locked-in)
@@ -4678,6 +4706,54 @@ class Matchmaking(commands.Cog):
         )
 
 
+
+    async def _send_stats_image(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        season_id: int,
+        season_name: str,
+    ):
+        """
+        Genera y envía la imagen de /stats y /stats_user.
+        No cambia MMR, DB, rooms ni submit. Solo usa la data ya calculada por _fetch_user_stats.
+        """
+        data = await self._fetch_user_stats(interaction.guild, user, season_id)
+
+        if not data:
+            player_name = await self.resolve_member_name(interaction.guild, user.id)
+            return await interaction.followup.send(
+                f"{player_name} doesn't have register in **Season {season_name}**.",
+                ephemeral=True,
+            )
+
+        try:
+            avatar_asset = user.display_avatar.with_size(256)
+            avatar_bytes = await avatar_asset.read()
+        except Exception:
+            avatar_bytes = None
+
+        image_buffer = generate_stats_image(
+            player_name=user.display_name,
+            avatar_bytes=avatar_bytes,
+            rank=str(data["role"]),
+            position=int(data["pos"]),
+            total_players=int(data["total"]),
+            matches_played=int(data["matches_played"]),
+            last10_wins=int(data["last10_wins"]),
+            last10_losses=int(data["last10_losses"]),
+            peak_mmr=int(data["peak_mmr"]),
+            current_mmr=int(data["mmr"]),
+            season_name=str(season_name),
+        )
+
+        file = discord.File(
+            image_buffer,
+            filename=f"stats_{user.id}_{season_id}.png",
+        )
+
+        await interaction.followup.send(file=file)
+
     @app_commands.command(
         name="stats",
         description="Shows your position, mmr and rank in the selected season",
@@ -4694,40 +4770,19 @@ class Matchmaking(commands.Cog):
 
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
+
         if not season_id:
             return await interaction.followup.send(
-                "⚠️ Season not found", ephemeral=True
+                "⚠️ Season not found.",
+                ephemeral=True,
             )
 
-        data = await self._fetch_user_stats(
-            interaction.guild,
-            interaction.user,
-            season_id,
+        await self._send_stats_image(
+            interaction=interaction,
+            user=interaction.user,
+            season_id=int(season_id),
+            season_name=str(season_name),
         )
-        if not data:
-            return await interaction.followup.send(
-                f"You dont have register in **Season {season_name}**.", ephemeral=True
-            )
-
-        mmr_delta_last10 = data["last10_mmr_delta"]
-        mmr_delta_str = f"{mmr_delta_last10:+d}"
-
-        season_status = self._season_status_label(interaction.user)
-        status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
-
-        msg = (
-            f"**Stats — Season {season_name}**\n"
-            f"• **Player:** {interaction.user.mention}\n"
-            f"• **Position:** #{data['pos']} of {data['total']}\n"
-            f"• **MMR:** {data['mmr']}\n"
-            f"• **Rank:** {data['role']}\n"
-            f"{status_line}"
-            f"• **Matches Played:** {data['matches_played']}\n"
-            f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
-            f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
-            f"• **Peak MMR:** {data['peak_mmr']}\n"
-        )
-        await interaction.followup.send(msg)
 
     @app_commands.command(
         name="searchresult", description="Show a past results table by its global ID"
@@ -4788,10 +4843,9 @@ class Matchmaking(commands.Cog):
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(
         user="Player",
-        season="Select a season."
+        season="Select a season.",
     )
     @app_commands.choices(season=SEASON_CHOICES)
-
     async def stats_user(
         self,
         interaction: discord.Interaction,
@@ -4802,44 +4856,19 @@ class Matchmaking(commands.Cog):
 
         season_val = season.value if season else None
         season_id, season_name = await self._resolve_season_id(season_val)
+
         if not season_id:
             return await interaction.followup.send(
-                "⚠️ No encontré la temporada seleccionada.", ephemeral=True
-            )
-
-        data = await self._fetch_user_stats(interaction.guild, user, season_id)
-        if not data:
-            player_name = await self.resolve_member_name(interaction.guild, user.id)
-            return await interaction.followup.send(
-                f"{player_name} doesn't have register in **Season {season_name}**.",
+                "⚠️ No encontré la temporada seleccionada.",
                 ephemeral=True,
             )
 
-        mmr_delta_last10 = data["last10_mmr_delta"]
-        mmr_delta_str = f"{mmr_delta_last10:+d}"
-
-        season_status = self._season_status_label(user)
-        status_line = f"• **Season Status:** {season_status}\n" if season_status else ""
-
-        visible_mmr = await self._display_mmr_for_member(
-            user,
-            int(data["mmr"]),
-            season_id,
+        await self._send_stats_image(
+            interaction=interaction,
+            user=user,
+            season_id=int(season_id),
+            season_name=str(season_name),
         )
-
-        msg = (
-            f"**Stats — Season {season_name}**\n"
-            f"• **Player:** {user.mention}\n"
-            f"• **Position:** #{data['pos']} of {data['total']}\n"
-            f"• **MMR:** {visible_mmr}\n"
-            f"• **Rank:** {data['role']}\n"
-            f"{status_line}"
-            f"• **Matches Played:** {data['matches_played']}\n"
-            f"• **W-L Last 10:** {data['last10_wins']}-{data['last10_losses']}\n"
-            f"• **W-L Last 10 (±MMR):** {mmr_delta_str}\n"
-            f"• **Peak MMR:** {data['peak_mmr']}\n"
-        )
-        await interaction.followup.send(msg)
 
     @app_commands.command(
         name="cutoffs",
@@ -6094,7 +6123,9 @@ class Matchmaking(commands.Cog):
         expected = room.get("total_notes")
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if len(lines) != n:
-            return await ctx.send(f"You should send {n} lines")
+            return await ctx.send(
+                f"You should send {n} lines. Format per line: <@user> perfect,great,good,bad,miss"
+            )
 
         players_set = {m.id for m in players}
         ids_in_lines = []
@@ -6103,7 +6134,10 @@ class Matchmaking(commands.Cog):
         for idx, ln in enumerate(lines, start=1):
             mobj = ENTRY_RE.match(ln)
             if not mobj:
-                return await ctx.send(f"Incorrect format for: {ln}")
+                return await ctx.send(
+                    f"Incorrect format for: {ln}\n"
+                    "Use: <@user> perfect,great,good,bad,miss"
+                )
 
             stats = list(map(int, mobj.group("stats").split(",")))
             if expected is not None:
@@ -6232,34 +6266,17 @@ class Matchmaking(commands.Cog):
             players_list = []
             for member in players:
                 uid = member.id
-                cc, stats = by_id[uid]
+                _submit_cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
-                # ISO2 tomado DIRECTAMENTE del mensaje !submit.
-                # Ejemplo de lÃ­nea: <@123> [PE] 1000,2,0,0,0
-                # La bandera del board debe salir de este ISO2, no del perfil guardado.
-                submit_cc = (cc or "").upper().strip()
+                # La bandera YA NO se pide en !submit.
+                # Se lee desde players.country. Si no hay valor guardado, se usa WW.
+                profile_cc_raw = await self.db_pool.fetchval(
+                    "SELECT country FROM players WHERE user_id = $1",
+                    uid,
+                )
+                display_cc = normalize_submit_country_code(profile_cc_raw)
 
-                profile_cc = (
-                    await self.db_pool.fetchval(
-                        "SELECT country FROM players WHERE user_id = $1",
-                        uid,
-                    )
-                    or ""
-                ).upper().strip()
-
-                # Guardamos/actualizamos el paÃ­s para que la web tambiÃ©n quede alineada
-                # con el Ãºltimo ISO2 usado en !submit.
-                if submit_cc and profile_cc != submit_cc:
-                    await self.db_pool.execute(
-                        "UPDATE players SET country = $2 WHERE user_id = $1",
-                        uid,
-                        submit_cc,
-                    )
-                    profile_cc = submit_cc
-
-                # Esta es la bandera que se mostrarÃ¡ a la derecha del nombre en results.png.
-                display_flag = country_flag(submit_cc)
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
 
                 is_season_placement = self._has_season_placement_role(member)
@@ -6270,13 +6287,13 @@ class Matchmaking(commands.Cog):
                 players_list.append(
                     {
                         "member": member,
-                        "cc": submit_cc,
+                        "cc": display_cc,
                         "stats": stats,
                         "total": total_points,
                         "old": int(old),
                         "mmr_actual": int(old),  # base; se sobreescribe si es placement
                         "role": current_role,
-                        "display_flag": display_flag,
+                        "display_cc": display_cc,
                         "was_placement": bool(is_season_placement or is_rank_placement),
                         "is_season_placement": bool(is_season_placement),
                         "prev_season_mmr": prev_season_mmr,
@@ -6387,11 +6404,10 @@ class Matchmaking(commands.Cog):
                     reason=f"Submit result #{result_id}",
                 )
 
-                name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append(
                     (
                         idx,
-                        name_with_flag,
+                        p["member"].display_name,
                         p["total"],
                         p["stats"],
                         mmr_prev,
@@ -6399,6 +6415,7 @@ class Matchmaking(commands.Cog):
                         mmr_final,
                         p["was_placement"],
                         role_name,  # color del board basado en el rango FINAL
+                        p.get("display_cc") or "WW",
                     )
                 )
 
@@ -6445,11 +6462,14 @@ class Matchmaking(commands.Cog):
 
             header_line = f"ID: {result_id}{gap_text}{songs_block}"
 
+            submit_pdt_text = format_submit_pdt_now()
+
             with Image.open("assets/logo.png") as logo_img:
                 buf = generate_results_image(
                     summary,
                     font_path="assets/rodinntlg_eb.otf",
                     side_image=logo_img.copy(),
+                    submitted_at_text=submit_pdt_text,
                 )
 
             image_bytes = buf.read()
