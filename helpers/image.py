@@ -18,7 +18,7 @@ from typing import Literal, List, Any
 
 rank_colors = {
     "Season Placement": ("#ff8519", "#ff8519"),
-    "Placement": ("#ff4600", "#ff4600"),
+    "Placement": ("#ff4600", "#ff7000"),
     "Iron": ("#8d7f79", "#5f514a"),
     "Iron ⬆": ("#917f76", "#775341"),
     "Bronze": ("#9f4600", "#752d00"),
@@ -570,6 +570,154 @@ def _rank_progress(rank: str, current_mmr: int) -> tuple[str, float]:
     return f"{current_mmr}/{high} MMR", progress
 
 
+def _rank_theme(rank: str) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    rank = normalize_rank_name(rank, 0, False)
+    start_hex, end_hex = rank_colors.get(rank, rank_colors.get("Gold", ("#ffcf87", "#e2921c")))
+    return hex_to_rgb(start_hex), hex_to_rgb(end_hex)
+
+
+def _rank_display_text(rank: str) -> str:
+    rank = normalize_rank_name(rank, 0, False)
+    return str(rank).replace(" ⬆", " Up")
+
+
+def _paste_centered(base: Image.Image, overlay: Image.Image, center_xy: tuple[int, int]):
+    x, y = center_xy
+    ox = int(x - overlay.size[0] / 2)
+    oy = int(y - overlay.size[1] / 2)
+    base.paste(overlay, (ox, oy), overlay)
+
+
+def _draw_gradient_text_centered(
+    base: Image.Image,
+    center_xy: tuple[int, int],
+    text: str,
+    font: ImageFont.ImageFont,
+    start_rgb: tuple[int, int, int],
+    end_rgb: tuple[int, int, int],
+    stroke_fill=(10, 10, 20, 255),
+    stroke_width: int = 2,
+):
+    text_img = make_gradient_text_image(
+        str(text),
+        font,
+        start_rgb,
+        end_rgb,
+        padding=max(2, stroke_width + 2),
+        direction="right",
+    )
+
+    if stroke_width > 0:
+        stroke_layer = Image.new("RGBA", text_img.size, (0, 0, 0, 0))
+        d = ImageDraw.Draw(stroke_layer)
+        x0, y0, x1, y1 = font.getbbox(str(text))
+        pad = max(2, stroke_width + 2)
+        pos = (pad - x0, pad - y0)
+        d.text(
+            pos,
+            str(text),
+            font=font,
+            fill=(255, 255, 255, 255),
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+        # keep only stroke around alpha edges under text_img
+        out = Image.new("RGBA", text_img.size, (0, 0, 0, 0))
+        out.alpha_composite(stroke_layer)
+        out.alpha_composite(text_img)
+        text_img = out
+
+    _paste_centered(base, text_img, center_xy)
+
+
+def _make_horizontal_gradient(size: tuple[int, int], start_rgb: tuple[int, int, int], end_rgb: tuple[int, int, int]) -> Image.Image:
+    grad = Image.new("RGB", size)
+    draw_gradient(grad, start_rgb, end_rgb, direction="right")
+    return grad.convert("RGBA")
+
+
+def _make_ellipse_ring(size: int, thickness: int, start_rgb: tuple[int, int, int], end_rgb: tuple[int, int, int]) -> Image.Image:
+    ring = _make_horizontal_gradient((size, size), start_rgb, end_rgb)
+    mask = Image.new("L", (size, size), 0)
+    d = ImageDraw.Draw(mask)
+    d.ellipse((0, 0, size - 1, size - 1), fill=255)
+    inner = max(0, thickness)
+    d.ellipse((inner, inner, size - 1 - inner, size - 1 - inner), fill=0)
+    out = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    out.paste(ring, (0, 0), mask)
+    return out
+
+
+
+def _draw_centered_segments(
+    draw: ImageDraw.ImageDraw,
+    center_xy: tuple[int, int],
+    segments: list[tuple[str, tuple[int, int, int, int] | tuple[int, int, int]]],
+    font: ImageFont.ImageFont,
+    gap: int = 0,
+    stroke_width: int = 1,
+    stroke_fill=(0, 0, 0, 255),
+):
+    widths = []
+    heights = []
+    normalized = []
+    for text, fill in segments:
+        text = str(text)
+        bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
+        if len(fill) == 3:
+            fill = (*fill, 255)
+        normalized.append((text, fill))
+
+    total_width = sum(widths) + gap * max(0, len(widths) - 1)
+    max_h = max(heights) if heights else 0
+    x = int(center_xy[0] - total_width / 2)
+    y = int(center_xy[1] - max_h / 2)
+
+    for (text, fill), seg_w in zip(normalized, widths):
+        draw.text(
+            (x, y),
+            text,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
+        x += seg_w + gap
+
+
+def _draw_stat_group(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[int, int, int, int],
+    outline_rgb: tuple[int, int, int],
+    fill=(5, 8, 24, 170),
+    radius: int = 12,
+    width: int = 2,
+):
+    draw.rounded_rectangle(
+        rect,
+        radius=radius,
+        fill=fill,
+        outline=(*outline_rgb, 135),
+        width=width,
+    )
+
+
+
+def _fit_font_size_for_text(text: str, max_width: int, start_size: int, min_size: int = 18):
+    size = int(start_size)
+    dummy = Image.new("RGBA", (10, 10), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(dummy)
+    while size >= min_size:
+        font = _stats_font(size)
+        bbox = draw.textbbox((0, 0), str(text), font=font, stroke_width=2)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            return font
+        size -= 2
+    return _stats_font(min_size)
+
 def _build_alpha_mask_for_rank_logo(base_logo: Image.Image) -> Image.Image:
     """
     Crea la máscara del logo.
@@ -1091,375 +1239,191 @@ def generate_stats_image(
     peak_mmr: int,
     current_mmr: int,
     season_name: str,
+    last10_mmr_delta: int = 0,
 ) -> io.BytesIO:
-    """
-    Genera la imagen de /stats y /stats_user.
-
-    No consulta PostgreSQL ni Discord.
-    Solo dibuja los datos recibidos sobre:
-        assets/stats/stats_background.png
-
-    El único asset gráfico variable por rango es:
-        assets/stats/ranks/{rank}.png
-    """
+    """Genera la imagen de /stats y /stats_user."""
 
     if not STATS_BACKGROUND_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing stats background: {STATS_BACKGROUND_PATH}"
-        )
+        raise FileNotFoundError(f"Missing stats background: {STATS_BACKGROUND_PATH}")
 
     rank = normalize_rank_name(rank, current_mmr, False)
+    rank_display = _rank_display_text(rank).upper()
+    start_rgb, end_rgb = _rank_theme(rank)
+    rank_stroke = (*end_rgb, 255)
+    white = (255, 255, 255, 255)
+    green = (58, 231, 125, 255)
+    red = (255, 92, 92, 255)
 
     img = Image.open(STATS_BACKGROUND_PATH).convert("RGBA")
     draw = ImageDraw.Draw(img)
-
     w, h = img.size
 
-    # La imagen base que estás usando está cerca de 1699x926.
-    # Estos helpers escalan posiciones aunque el PNG tenga otro tamaño.
     def sx(x: float) -> int:
         return int(x * w / 1699)
 
     def sy(y: float) -> int:
         return int(y * h / 926)
 
-    # Fuentes
-    title_font = _stats_font(sy(64))
-    username_font = _stats_font(sy(72))
-    label_font = _stats_font(sy(30))
-    number_font = _stats_font(sy(46))
-    small_font = _stats_font(sy(26))
-    mmr_font = _stats_font(sy(46))
-    rank_font = _stats_font(sy(50))
+    title_font = _stats_font(sy(56))
+    username_size = sy(66)
+    username_font = _fit_font_size_for_text(player_name or "Unknown", sx(520), username_size, min_size=sy(34))
+    label_font = _stats_font(sy(22))
+    top_value_font = _stats_font(sy(30))
+    top_small_value_font = _stats_font(sy(26))
+    bottom_label_font = _stats_font(sy(24))
+    value_font = _stats_font(sy(40))
+    mmr_font = _stats_font(sy(40))
+    rank_font = _stats_font(sy(42))
 
-    # ========================================================
-    # PANEL PRINCIPAL
-    # ========================================================
+    # Main panel with border style closer to reference
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
-
-    panel = (
-        sx(220),
-        sy(105),
-        sx(1478),
-        sy(846),
-    )
-
+    panel = (sx(225), sy(106), sx(1474), sy(844))
     od.rounded_rectangle(
         panel,
         radius=sy(34),
-        fill=(4, 8, 28, 190),
-        outline=(60, 185, 255, 210),
+        fill=(5, 8, 28, 198),
+        outline=(*end_rgb, 205),
+        width=max(2, sy(3)),
+    )
+    inner = (sx(240), sy(121), sx(1459), sy(829))
+    od.rounded_rectangle(
+        inner,
+        radius=sy(28),
+        outline=(*start_rgb, 95),
         width=max(1, sy(2)),
     )
-
-    # Líneas neon superiores/inferiores
-    od.line((sx(280), sy(124), sx(720), sy(124)), fill=(70, 190, 255, 190), width=max(1, sy(2)))
-    od.line((sx(980), sy(124), sx(1420), sy(124)), fill=(230, 80, 255, 180), width=max(1, sy(2)))
-    od.line((sx(280), sy(828), sx(720), sy(828)), fill=(70, 190, 255, 150), width=max(1, sy(2)))
-    od.line((sx(980), sy(828), sx(1420), sy(828)), fill=(230, 80, 255, 140), width=max(1, sy(2)))
-
+    # header decorative side lines
+    od.line((sx(323), sy(130), sx(718), sy(130)), fill=(*start_rgb, 230), width=max(2, sy(3)))
+    od.line((sx(983), sy(130), sx(1378), sy(130)), fill=(*end_rgb, 230), width=max(2, sy(3)))
+    od.line((sx(760), sy(130), sx(812), sy(130)), fill=(*start_rgb, 190), width=max(1, sy(2)))
+    od.line((sx(888), sy(130), sx(940), sy(130)), fill=(*end_rgb, 190), width=max(1, sy(2)))
     img = Image.alpha_composite(img, overlay)
     draw = ImageDraw.Draw(img)
 
-    # ========================================================
-    # TÍTULO
-    # ========================================================
-    _center_text(
-        draw,
-        (sx(850), sy(150)),
-        "PJSK LOUNGE STATS",
-        title_font,
-        fill=(245, 250, 255, 255),
-        stroke_width=max(1, sy(2)),
-        stroke_fill=(40, 120, 255, 200),
-    )
+    _center_text(draw, (sx(850), sy(150)), "PJSK LOUNGE STATS", title_font, fill=white, stroke_width=max(2, sy(3)), stroke_fill=rank_stroke)
 
-    # ========================================================
-    # AVATAR
-    # ========================================================
+    # Avatar + name
     avatar_size = sy(190)
     avatar_x = sx(305)
-    avatar_y = sy(210)
-
-    avatar_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    ad = ImageDraw.Draw(avatar_layer)
-
-    ad.ellipse(
-        (
-            avatar_x - sy(8),
-            avatar_y - sy(8),
-            avatar_x + avatar_size + sy(8),
-            avatar_y + avatar_size + sy(8),
-        ),
-        fill=(50, 170, 255, 70),
-    )
-    ad.ellipse(
-        (avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size),
-        fill=(7, 11, 32, 230),
-        outline=(120, 210, 255, 255),
-        width=max(1, sy(5)),
-    )
-
-    img = Image.alpha_composite(img, avatar_layer)
-    draw = ImageDraw.Draw(img)
+    avatar_y = sy(215)
+    glow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow_layer)
+    gd.ellipse((avatar_x - sy(16), avatar_y - sy(16), avatar_x + avatar_size + sy(16), avatar_y + avatar_size + sy(16)), fill=(*start_rgb, 46))
+    img = Image.alpha_composite(img, glow_layer)
+    ring = _make_ellipse_ring(avatar_size + sy(16), max(6, sy(10)), start_rgb, end_rgb)
+    img.paste(ring, (avatar_x - sy(8), avatar_y - sy(8)), ring)
 
     avatar_drawn = False
-
     if avatar_bytes:
         try:
             avatar = Image.open(io.BytesIO(avatar_bytes)).convert("RGBA")
-            avatar = ImageOps.fit(
-                avatar,
-                (avatar_size, avatar_size),
-                method=Image.Resampling.LANCZOS,
-            )
-
+            avatar = ImageOps.fit(avatar, (avatar_size, avatar_size), method=Image.Resampling.LANCZOS)
             mask = Image.new("L", (avatar_size, avatar_size), 0)
             md = ImageDraw.Draw(mask)
             md.ellipse((0, 0, avatar_size, avatar_size), fill=255)
-
             img.paste(avatar, (avatar_x, avatar_y), mask)
             avatar_drawn = True
         except Exception:
             avatar_drawn = False
 
+    draw = ImageDraw.Draw(img)
     if not avatar_drawn:
-        # Placeholder de usuario
-        draw.ellipse(
-            (
-                avatar_x + sy(65),
-                avatar_y + sy(45),
-                avatar_x + sy(125),
-                avatar_y + sy(105),
-            ),
-            fill=(115, 113, 155, 255),
-        )
-        draw.pieslice(
-            (
-                avatar_x + sy(45),
-                avatar_y + sy(105),
-                avatar_x + sy(145),
-                avatar_y + sy(205),
-            ),
-            start=180,
-            end=360,
-            fill=(115, 113, 155, 255),
-        )
+        draw.ellipse((avatar_x + sy(65), avatar_y + sy(45), avatar_x + sy(125), avatar_y + sy(105)), fill=(115, 113, 155, 255))
+        draw.pieslice((avatar_x + sy(45), avatar_y + sy(105), avatar_x + sy(145), avatar_y + sy(205)), start=180, end=360, fill=(115, 113, 155, 255))
 
-    # ========================================================
-    # USERNAME
-    # ========================================================
-    safe_name = _fit_text(draw, player_name or "Unknown", username_font, sx(540))
-    _draw_glow_text(
-        draw,
-        (sx(560), sy(250)),
-        safe_name,
-        username_font,
-        fill=(255, 255, 255, 255),
-        glow=(80, 150, 255, 120),
-        stroke_width=max(1, sy(2)),
-    )
+    safe_name = player_name or "Unknown"
+    _draw_glow_text(draw, (sx(560), sy(250)), safe_name, username_font, fill=white, glow=(*start_rgb, 120), stroke_width=max(2, sy(3)))
+    draw.line((sx(555), sy(330), sx(1030), sy(330)), fill=(*end_rgb, 115), width=max(1, sy(2)))
 
-    # ========================================================
-    # RANK BOX
-    # ========================================================
-    rank_box = (sx(1120), sy(220), sx(1375), sy(440))
-    draw.rounded_rectangle(
-        rank_box,
-        radius=sy(18),
-        fill=(7, 10, 26, 205),
-        outline=(255, 203, 75, 140),
-        width=max(1, sy(2)),
-    )
-
-    _center_text(
-        draw,
-        (sx(1248), sy(250)),
-        "RANK",
-        label_font,
-        fill=(180, 215, 255, 255),
-        stroke_width=1,
-        stroke_fill=(0, 0, 0, 255),
-    )
+    # Rank box
+    rank_box = (sx(1120), sy(212), sx(1378), sy(445))
+    draw.rounded_rectangle(rank_box, radius=sy(20), fill=(7, 10, 26, 225), outline=(*end_rgb, 205), width=max(2, sy(3)))
+    inner_rank = (sx(1132), sy(224), sx(1366), sy(433))
+    draw.rounded_rectangle(inner_rank, radius=sy(16), outline=(*start_rgb, 90), width=max(1, sy(2)))
+    _center_text(draw, (sx(1248), sy(245)), "RANK", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     rank_logo = _load_rank_logo(rank)
     if rank_logo:
-        rank_logo = ImageOps.contain(
-            rank_logo,
-            (sx(135), sy(110)),
-            method=Image.Resampling.LANCZOS,
-        )
-        lx = sx(1248) - rank_logo.size[0] // 2
-        ly = sy(275)
-        img.paste(rank_logo, (lx, ly), rank_logo)
+        rank_logo = ImageOps.contain(rank_logo, (sx(145), sy(116)), method=Image.Resampling.LANCZOS)
+        _paste_centered(img, rank_logo, (sx(1248), sy(320)))
 
-    _center_text(
-        draw,
-        (sx(1248), sy(405)),
-        str(rank).upper(),
-        rank_font,
-        fill=(255, 210, 80, 255),
-        stroke_width=max(1, sy(2)),
-        stroke_fill=(35, 15, 0, 255),
-    )
+    _draw_gradient_text_centered(img, (sx(1248), sy(405)), rank_display, rank_font, start_rgb, end_rgb, stroke_fill=rank_stroke, stroke_width=max(2, sy(3)))
+    draw = ImageDraw.Draw(img)
 
-    # ========================================================
-    # STATS FILA MEDIA
-    # ========================================================
-    y_mid_label = sy(495)
-    y_mid_value = sy(535)
+    # Top stat cards - smaller text and cleaner spacing
+    cards = [
+        (sx(330), sy(455), sx(558), sy(572)),
+        (sx(585), sy(455), sx(813), sy(572)),
+        (sx(840), sy(455), sx(1068), sy(572)),
+        (sx(1095), sy(455), sx(1323), sy(572)),
+    ]
+    for rect in cards:
+        _draw_stat_group(draw, rect, end_rgb, radius=sy(14), width=max(1, sy(2)), fill=(5, 8, 24, 150))
 
-    draw.line((sx(640), sy(480), sx(640), sy(570)), fill=(150, 90, 255, 120), width=max(1, sy(2)))
-    draw.line((sx(1015), sy(480), sx(1015), sy(570)), fill=(150, 90, 255, 120), width=max(1, sy(2)))
+    _center_text(draw, (sx(444), sy(488)), "POSITION", label_font, fill=white)
+    _center_text(draw, (sx(444), sy(529)), f"{int(position)} / {int(total_players)}", top_value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
 
-    _center_text(draw, (sx(500), y_mid_label), "POSITION", label_font, fill=(190, 150, 255, 255))
-    _center_text(
-        draw,
-        (sx(500), y_mid_value),
-        f"#{int(position)} / {int(total_players)}",
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
+    _center_text(draw, (sx(699), sy(488)), "MATCHES PLAYED", label_font, fill=white)
+    _center_text(draw, (sx(699), sy(529)), str(int(matches_played)), top_value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
 
-    _center_text(draw, (sx(825), y_mid_label), "MATCHES PLAYED", label_font, fill=(190, 150, 255, 255))
-    _center_text(
-        draw,
-        (sx(825), y_mid_value),
-        str(int(matches_played)),
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
+    _center_text(draw, (sx(954), sy(488)), "LAST 10", label_font, fill=white)
+    _draw_centered_segments(draw, (sx(954), sy(529)), [(f"{int(last10_wins)}W", green), (" - ", white), (f"{int(last10_losses)}L", red)], top_value_font, gap=0, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
 
-    _center_text(draw, (sx(1195), y_mid_label), "LAST 10", label_font, fill=(190, 150, 255, 255))
-    _center_text(
-        draw,
-        (sx(1195), y_mid_value),
-        f"{int(last10_wins)}W - {int(last10_losses)}L",
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
+    _center_text(draw, (sx(1209), sy(488)), "LAST 10 ± MMR", label_font, fill=white)
+    delta_value = int(last10_mmr_delta or 0)
+    if delta_value > 0:
+        segs = [(f"+{delta_value}", green), (" MMR", green)]
+    elif delta_value < 0:
+        segs = [(str(delta_value), red), (" MMR", red)]
+    else:
+        segs = [("0", white), (" MMR", white)]
+    _draw_centered_segments(draw, (sx(1209), sy(529)), segs, top_small_value_font, gap=0, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
 
-    # ========================================================
-    # MMR PROGRESS
-    # ========================================================
-    bar_panel = (sx(260), sy(595), sx(1410), sy(715))
-    draw.rounded_rectangle(
-        bar_panel,
-        radius=sy(14),
-        fill=(5, 8, 24, 215),
-        outline=(245, 180, 50, 170),
-        width=max(1, sy(2)),
-    )
+    # MMR progress panel
+    bar_panel = (sx(275), sy(602), sx(1424), sy(718))
+    draw.rounded_rectangle(bar_panel, radius=sy(18), fill=(5, 8, 24, 228), outline=(*end_rgb, 200), width=max(2, sy(3)))
+    inner_bar_panel = (sx(288), sy(614), sx(1411), sy(706))
+    draw.rounded_rectangle(inner_bar_panel, radius=sy(14), outline=(*start_rgb, 88), width=max(1, sy(2)))
+    _center_text(draw, (sx(850), sy(626)), "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
 
-    _center_text(
-        draw,
-        (sx(835), sy(622)),
-        "MMR PROGRESS",
-        label_font,
-        fill=(255, 210, 90, 255),
-        stroke_width=1,
-        stroke_fill=(40, 20, 0, 255),
-    )
-
-    bar_x1 = sx(385)
-    bar_y1 = sy(650)
-    bar_x2 = sx(1285)
-    bar_y2 = sy(700)
-
-    draw.rounded_rectangle(
-        (bar_x1, bar_y1, bar_x2, bar_y2),
-        radius=sy(18),
-        fill=(4, 9, 26, 245),
-        outline=(255, 205, 80, 220),
-        width=max(1, sy(3)),
-    )
-
+    bar_x1, bar_y1, bar_x2, bar_y2 = sx(370), sy(652), sx(1330), sy(704)
+    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(20), fill=(4, 9, 26, 248), outline=(*end_rgb, 230), width=max(2, sy(3)))
     progress_text, progress = _rank_progress(rank, current_mmr)
     fill_x2 = bar_x1 + int((bar_x2 - bar_x1) * progress)
-
     if fill_x2 > bar_x1 + sy(10):
-        draw.rounded_rectangle(
-            (bar_x1 + sy(5), bar_y1 + sy(5), fill_x2 - sy(5), bar_y2 - sy(5)),
-            radius=sy(14),
-            fill=(230, 166, 25, 255),
-        )
+        fill_w = max(1, fill_x2 - (bar_x1 + sy(6)))
+        fill_h = max(1, (bar_y2 - sy(6)) - (bar_y1 + sy(6)))
+        fill_grad = _make_horizontal_gradient((fill_w, fill_h), start_rgb, end_rgb)
+        fill_mask = Image.new("L", (fill_w, fill_h), 0)
+        fmd = ImageDraw.Draw(fill_mask)
+        fmd.rounded_rectangle((0, 0, fill_w - 1, fill_h - 1), radius=sy(16), fill=255)
+        img.paste(fill_grad, (bar_x1 + sy(6), bar_y1 + sy(6)), fill_mask)
+        shine = Image.new("RGBA", (fill_w, max(1, sy(12))), (255, 255, 255, 0))
+        sd = ImageDraw.Draw(shine)
+        sd.rectangle((0, 0, fill_w, max(1, sy(12))), fill=(255, 255, 255, 65))
+        img.paste(shine, (bar_x1 + sy(6), bar_y1 + sy(8)), shine)
 
-        # Brillo dorado
-        draw.rectangle(
-            (
-                bar_x1 + sy(12),
-                bar_y1 + sy(7),
-                max(bar_x1 + sy(12), fill_x2 - sy(12)),
-                bar_y1 + sy(18),
-            ),
-            fill=(255, 232, 135, 120),
-        )
+    draw = ImageDraw.Draw(img)
+    _center_text(draw, (sx(850), sy(678)), progress_text, mmr_font, fill=white, stroke_width=max(2, sy(3)), stroke_fill=rank_stroke)
 
-    _center_text(
-        draw,
-        (sx(835), sy(674)),
-        progress_text,
-        mmr_font,
-        fill=(255, 245, 210, 255),
-        stroke_width=max(1, sy(2)),
-        stroke_fill=(80, 45, 0, 255),
-    )
+    # Bottom cards
+    bottom_cards = [
+        (sx(300), sy(742), sx(630), sy(830)),
+        (sx(685), sy(742), sx(1015), sy(830)),
+        (sx(1070), sy(742), sx(1400), sy(830)),
+    ]
+    for rect in bottom_cards:
+        _draw_stat_group(draw, rect, end_rgb, radius=sy(14), width=max(1, sy(2)), fill=(5, 8, 24, 150))
 
-    # ========================================================
-    # FILA INFERIOR
-    # ========================================================
-    bottom_y_label = sy(765)
-    bottom_y_value = sy(810)
+    _center_text(draw, (sx(465), sy(770)), "PEAK MMR", bottom_label_font, fill=white)
+    _center_text(draw, (sx(465), sy(810)), str(int(peak_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
 
-    draw.line((sx(620), sy(755), sx(620), sy(825)), fill=(90, 160, 255, 120), width=max(1, sy(2)))
-    draw.line((sx(1000), sy(755), sx(1000), sy(825)), fill=(190, 90, 255, 120), width=max(1, sy(2)))
+    _center_text(draw, (sx(850), sy(770)), "CURRENT MMR", bottom_label_font, fill=white)
+    _center_text(draw, (sx(850), sy(810)), str(int(current_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
 
-    _center_text(draw, (sx(430), bottom_y_label), "PEAK MMR", label_font, fill=(105, 185, 255, 255))
-    _center_text(
-        draw,
-        (sx(430), bottom_y_value),
-        str(int(peak_mmr)),
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
-
-    _center_text(draw, (sx(810), bottom_y_label), "CURRENT MMR", label_font, fill=(105, 185, 255, 255))
-    _center_text(
-        draw,
-        (sx(810), bottom_y_value),
-        str(int(current_mmr)),
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
-
-    _center_text(draw, (sx(1195), bottom_y_label), "CURRENT SEASON", label_font, fill=(190, 140, 255, 255))
-    _center_text(
-        draw,
-        (sx(1195), bottom_y_value),
-        str(season_name).upper(),
-        number_font,
-        fill=(255, 255, 255, 255),
-        stroke_width=1,
-    )
-
-    # ========================================================
-    # FOOTER
-    # ========================================================
-    _center_text(
-        draw,
-        (sx(850), sy(860)),
-        "STAY SHARP. PLAY HARD. RISE HIGH.",
-        small_font,
-        fill=(110, 190, 255, 220),
-        stroke_width=1,
-        stroke_fill=(0, 0, 0, 255),
-    )
+    _center_text(draw, (sx(1235), sy(770)), "CURRENT SEASON", bottom_label_font, fill=white)
+    _center_text(draw, (sx(1235), sy(810)), str(season_name).upper(), value_font, fill=white, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
 
     out = io.BytesIO()
     img.save(out, format="PNG")

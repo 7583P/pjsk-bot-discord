@@ -112,14 +112,8 @@ ACCURACY_CARD_REMINDER = (
     "You can use a 1☆ card if you don't want to search."
 )
 
-# !submit ya NO exige bandera.
-# Formato nuevo:
-#   <@USER_ID> perfect,great,good,bad,miss
-# Compatibilidad opcional con formato antiguo:
-#   <@USER_ID> [PE] perfect,great,good,bad,miss
-# La bandera del results se lee desde players.country. Si no hay country, se muestra WW.
 ENTRY_RE = re.compile(
-    r"^<@!?(?P<id>\d+)>\s*(?:\[(?P<cc>[A-Za-z]{2})\]\s*)?(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
+    r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
 )
 
 
@@ -143,27 +137,6 @@ def flagify_iso2_suffix(text: str) -> str:
     if not m:
         return t
     return t[: m.start(1)] + country_flag(m.group(1).upper())
-
-
-def normalize_submit_country_code(value: str | None) -> str:
-    """
-    Normaliza el country guardado en DB para el board de results.
-    Si el usuario no tiene bandera/país guardado, se usa WW.
-    WW no es una bandera real: el generador de imagen lo dibuja como badge de texto.
-    """
-    cc = (value or "").strip().upper()
-    if re.fullmatch(r"[A-Z]{2}", cc):
-        return cc
-    return "WW"
-
-
-def format_submit_pdt_now() -> str:
-    """
-    Hora del submit en Pacific Daylight/Los Angeles time.
-    Formato solicitado: dd/mm/yyyy HH:MMpm, ejemplo 08/06/2026 19:05pm.
-    """
-    now_pdt = datetime.datetime.now(PDT_TZ)
-    return now_pdt.strftime("%d/%m/%Y %H:%M%p").lower()
 
 
 # ————— Append: solo limita el rango de selección para canciones 'append' —————
@@ -413,7 +386,6 @@ ROOM_CAPACITY = 5
 VOTE_TIMEOUT_SUBMIT = 30
 VOTE_TIMEOUT_FORFEIT = 30
 LIMA_TZ = ZoneInfo("America/Lima")
-PDT_TZ = ZoneInfo("America/Los_Angeles")
 
 PHASE_FUTURE = "FUTURE"  # en cola (sin hilo)
 PHASE_PREPARED = "PREPARED"  # hilo creado + canciones posteadas (locked-in)
@@ -4745,6 +4717,7 @@ class Matchmaking(commands.Cog):
             peak_mmr=int(data["peak_mmr"]),
             current_mmr=int(data["mmr"]),
             season_name=str(season_name),
+            last10_mmr_delta=int(data.get("last10_mmr_delta", 0)),
         )
 
         file = discord.File(
@@ -6123,9 +6096,7 @@ class Matchmaking(commands.Cog):
         expected = room.get("total_notes")
         lines = [l.strip() for l in block.split("\n") if l.strip()]
         if len(lines) != n:
-            return await ctx.send(
-                f"You should send {n} lines. Format per line: <@user> perfect,great,good,bad,miss"
-            )
+            return await ctx.send(f"You should send {n} lines")
 
         players_set = {m.id for m in players}
         ids_in_lines = []
@@ -6134,10 +6105,7 @@ class Matchmaking(commands.Cog):
         for idx, ln in enumerate(lines, start=1):
             mobj = ENTRY_RE.match(ln)
             if not mobj:
-                return await ctx.send(
-                    f"Incorrect format for: {ln}\n"
-                    "Use: <@user> perfect,great,good,bad,miss"
-                )
+                return await ctx.send(f"Incorrect format for: {ln}")
 
             stats = list(map(int, mobj.group("stats").split(",")))
             if expected is not None:
@@ -6266,17 +6234,34 @@ class Matchmaking(commands.Cog):
             players_list = []
             for member in players:
                 uid = member.id
-                _submit_cc, stats = by_id[uid]
+                cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
-                # La bandera YA NO se pide en !submit.
-                # Se lee desde players.country. Si no hay valor guardado, se usa WW.
-                profile_cc_raw = await self.db_pool.fetchval(
-                    "SELECT country FROM players WHERE user_id = $1",
-                    uid,
-                )
-                display_cc = normalize_submit_country_code(profile_cc_raw)
+                # ISO2 tomado DIRECTAMENTE del mensaje !submit.
+                # Ejemplo de lÃ­nea: <@123> [PE] 1000,2,0,0,0
+                # La bandera del board debe salir de este ISO2, no del perfil guardado.
+                submit_cc = (cc or "").upper().strip()
 
+                profile_cc = (
+                    await self.db_pool.fetchval(
+                        "SELECT country FROM players WHERE user_id = $1",
+                        uid,
+                    )
+                    or ""
+                ).upper().strip()
+
+                # Guardamos/actualizamos el paÃ­s para que la web tambiÃ©n quede alineada
+                # con el Ãºltimo ISO2 usado en !submit.
+                if submit_cc and profile_cc != submit_cc:
+                    await self.db_pool.execute(
+                        "UPDATE players SET country = $2 WHERE user_id = $1",
+                        uid,
+                        submit_cc,
+                    )
+                    profile_cc = submit_cc
+
+                # Esta es la bandera que se mostrarÃ¡ a la derecha del nombre en results.png.
+                display_flag = country_flag(submit_cc)
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
 
                 is_season_placement = self._has_season_placement_role(member)
@@ -6287,13 +6272,13 @@ class Matchmaking(commands.Cog):
                 players_list.append(
                     {
                         "member": member,
-                        "cc": display_cc,
+                        "cc": submit_cc,
                         "stats": stats,
                         "total": total_points,
                         "old": int(old),
                         "mmr_actual": int(old),  # base; se sobreescribe si es placement
                         "role": current_role,
-                        "display_cc": display_cc,
+                        "display_flag": display_flag,
                         "was_placement": bool(is_season_placement or is_rank_placement),
                         "is_season_placement": bool(is_season_placement),
                         "prev_season_mmr": prev_season_mmr,
@@ -6404,10 +6389,11 @@ class Matchmaking(commands.Cog):
                     reason=f"Submit result #{result_id}",
                 )
 
+                name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append(
                     (
                         idx,
-                        p["member"].display_name,
+                        name_with_flag,
                         p["total"],
                         p["stats"],
                         mmr_prev,
@@ -6415,7 +6401,6 @@ class Matchmaking(commands.Cog):
                         mmr_final,
                         p["was_placement"],
                         role_name,  # color del board basado en el rango FINAL
-                        p.get("display_cc") or "WW",
                     )
                 )
 
@@ -6462,14 +6447,11 @@ class Matchmaking(commands.Cog):
 
             header_line = f"ID: {result_id}{gap_text}{songs_block}"
 
-            submit_pdt_text = format_submit_pdt_now()
-
             with Image.open("assets/logo.png") as logo_img:
                 buf = generate_results_image(
                     summary,
                     font_path="assets/rodinntlg_eb.otf",
                     side_image=logo_img.copy(),
-                    submitted_at_text=submit_pdt_text,
                 )
 
             image_bytes = buf.read()
