@@ -56,6 +56,21 @@ REGIONAL_A = 0x1F1E6
 REGIONAL_Z = 0x1F1FF
 ISO2_RE = re.compile(r"^[A-Za-z]{2}$")
 
+UNKNOWN_FLAG_CODE = "__UNKNOWN_FLAG__"
+UNKNOWN_COUNTRY_CODES = {
+    "",
+    "WW",
+    "XX",
+    "ZZ",
+    "UN",
+    "??",
+    "--",
+    "NONE",
+    "NULL",
+    "UNKNOWN",
+    UNKNOWN_FLAG_CODE,
+}
+
 
 # ============================================================
 # STATS IMAGE CONFIG
@@ -133,6 +148,10 @@ RANK_PROGRESS_RANGES = {
 # COMMON HELPERS
 # ============================================================
 
+def is_unknown_country_code(value: Any) -> bool:
+    return str(value or "").strip().upper() in UNKNOWN_COUNTRY_CODES
+
+
 def normalize_country_code(value: Any) -> str | None:
     if value is None:
         return None
@@ -142,6 +161,13 @@ def normalize_country_code(value: Any) -> str | None:
         return None
 
     return code
+
+
+def normalize_results_country_code(value: Any) -> str | None:
+    if is_unknown_country_code(value):
+        return UNKNOWN_FLAG_CODE
+
+    return normalize_country_code(value)
 
 
 def flag_emoji_to_iso2(text: str) -> tuple[str, str | None]:
@@ -458,12 +484,44 @@ def normalize_rank_name(rank_name: Any, mmr_new: int, was_placement: bool) -> st
     return rank_from_mmr(mmr_new)
 
 
-def get_flag_image(country_code: str, target_size=(42, 30)) -> Image.Image | None:
+def get_unknown_flag_image(
+    target_size=(42, 30),
+    unknown_flag_path: str | Path = "assets/flags/unknown.jpg",
+) -> Image.Image | None:
+    """
+    Carga la bandera visual para usuarios sin país.
+    Se fuerza al mismo tamaño que las banderas normales.
+    """
+    path = Path(unknown_flag_path)
+    if not path.exists():
+        return None
+
+    try:
+        flag = Image.open(path).convert("RGBA")
+        flag = ImageOps.fit(
+            flag,
+            target_size,
+            method=Image.Resampling.LANCZOS,
+        )
+        return flag
+    except Exception:
+        return None
+
+
+def get_flag_image(
+    country_code: str,
+    target_size=(42, 30),
+    unknown_flag_path: str | Path = "assets/flags/unknown.jpg",
+) -> Image.Image | None:
     """
     Intenta cargar assets/flags/{iso2}.png.
-    Si no existe, intenta descargar desde flagcdn y cachearlo.
+    Si country_code es unknown, carga assets/flags/unknown.jpg.
+    Si no existe una bandera ISO2, intenta descargar desde flagcdn y cachearla.
     Si falla, devuelve None y se dibuja un badge ISO2.
     """
+    if is_unknown_country_code(country_code):
+        return get_unknown_flag_image(target_size, unknown_flag_path)
+
     cc = normalize_country_code(country_code)
     if not cc:
         return None
@@ -921,7 +979,7 @@ def normalize_summary_row(row: tuple) -> dict:
     if not country_code and iso_from_emoji:
         country_code = iso_from_emoji
 
-    country_code = normalize_country_code(country_code)
+    country_code = normalize_results_country_code(country_code)
 
     mmr_old = int(mmr_old or 0)
     mmr_delta = int(mmr_delta or 0)
@@ -949,6 +1007,8 @@ def generate_results_image(
     font_path: str,
     side_image: Image.Image,
     submitted_at_text: str | None = None,
+    unknown_flag_path: str | Path = "assets/flags/unknown.jpg",
+    unknown_flag_code: str = UNKNOWN_FLAG_CODE,
 ) -> io.BytesIO:
     """
     Dibuja el board de results sobre assets/background.png.
@@ -972,7 +1032,8 @@ def generate_results_image(
     ]
 
     Importante:
-    - country_code debe venir del ISO2 de !submit: [PE], [US], [JP], etc.
+    - country_code puede venir como ISO2 ([PE], [US], [JP]) o como __UNKNOWN_FLAG__.
+    - Si country_code es unknown, se dibuja assets/flags/unknown.jpg.
     - final_rank_name debe ser el rango DESPUÉS del cálculo de MMR.
     """
 
@@ -1151,15 +1212,20 @@ def generate_results_image(
 
         # Bandera a la derecha del nombre
         if country_code:
-            flag_img = get_flag_image(country_code, target_size=FLAG_SIZE)
+            flag_img = get_flag_image(
+                country_code,
+                target_size=FLAG_SIZE,
+                unknown_flag_path=unknown_flag_path,
+            )
 
-            if flag_img is None:
+            if flag_img is None and not is_unknown_country_code(country_code):
                 flag_img = make_iso_badge(country_code, smallist_font)
 
-            flag_x = X_NAME + name_img.width + FLAG_GAP
-            flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
+            if flag_img is not None:
+                flag_x = X_NAME + name_img.width + FLAG_GAP
+                flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
 
-            im.paste(flag_img, (flag_x, flag_y), flag_img)
+                im.paste(flag_img, (flag_x, flag_y), flag_img)
 
         # Results tuple
         draw.text(

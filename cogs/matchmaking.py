@@ -6,6 +6,7 @@ import aiohttp  # descarga catálogo canciones
 import asyncpg  # PostgreSQL asíncrono
 import discord
 import logging
+import inspect
 import datetime as dt
 from discord import app_commands, Embed
 from discord import ui, ButtonStyle
@@ -15,7 +16,7 @@ from discord.ui import View, button
 from zoneinfo import ZoneInfo
 
 from helpers.image import generate_results_image, generate_stats_image
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 log = logging.getLogger(__name__)
@@ -113,7 +114,7 @@ ACCURACY_CARD_REMINDER = (
 )
 
 ENTRY_RE = re.compile(
-    r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
+    r"^<@!?(?P<id>\d+)>\s*(?:\[(?P<cc>[A-Za-z]{2}|\?\?|--)\])?\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
 )
 
 
@@ -122,6 +123,62 @@ def country_flag(code: str) -> str:
     if len(code) != 2:
         return ""
     return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
+
+
+UNKNOWN_FLAG_CODE = "__UNKNOWN_FLAG__"
+UNKNOWN_FLAG_IMAGE_PATH = "assets/flags/unknown.jpg"
+
+UNKNOWN_COUNTRY_CODES = {
+    "",
+    "WW",
+    "XX",
+    "ZZ",
+    "UN",
+    "??",
+    "--",
+    "NONE",
+    "NULL",
+    "UNKNOWN",
+    UNKNOWN_FLAG_CODE,
+}
+
+ISO2_CODE_RE = re.compile(r"^[A-Za-z]{2}$")
+
+
+def is_unknown_country_code(code: str | None) -> bool:
+    return (code or "").upper().strip() in UNKNOWN_COUNTRY_CODES
+
+
+def normalize_submit_country_code(code: str | None) -> str:
+    cc = (code or "").upper().strip()
+
+    if is_unknown_country_code(cc):
+        return ""
+
+    if not ISO2_CODE_RE.match(cc):
+        return ""
+
+    return cc
+
+
+def country_code_for_results(stored_code: str | None, submit_code: str | None) -> str:
+    """
+    Devuelve el código que se usará SOLO para dibujar results.png.
+    No modifica players.country en PostgreSQL.
+    Prioridad:
+    1) players.country guardado en DB.
+    2) [CC] enviado opcionalmente en !submit.
+    3) assets/flags/unknown.jpg.
+    """
+    stored_cc = normalize_submit_country_code(stored_code)
+    if stored_cc:
+        return stored_cc
+
+    submit_cc = normalize_submit_country_code(submit_code)
+    if submit_cc:
+        return submit_cc
+
+    return UNKNOWN_FLAG_CODE
 
 
 ISO2_SUFFIX_RE = re.compile(r"\b([A-Za-z]{2})$")
@@ -781,6 +838,47 @@ class Matchmaking(commands.Cog):
     def _now_lima(self) -> dt.datetime:
         return dt.datetime.now(tz=LIMA_TZ)
 
+    @staticmethod
+    def _overlay_submitted_at_text_on_results_image(
+        buf: io.BytesIO,
+        submitted_at_text: str,
+        font_path: str = "assets/rodinntlg_eb.otf",
+    ) -> io.BytesIO:
+        """
+        Fallback visual: si helpers.image.generate_results_image todavía no soporta
+        submitted_at_text, dibuja la fecha/hora en la imagen sin romper el submit.
+        """
+        try:
+            buf.seek(0)
+            img = Image.open(buf).convert("RGBA")
+            draw = ImageDraw.Draw(img)
+            w, h = img.size
+
+            font_size = max(24, int(h * 0.032))
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+            except Exception:
+                font = ImageFont.load_default()
+
+            text = f"SUBMITTED: {submitted_at_text}"
+            bbox = draw.textbbox((0, 0), text, font=font)
+            tw = bbox[2] - bbox[0]
+            th = bbox[3] - bbox[1]
+            x = max(0, (w - tw) // 2)
+            y = max(70, int(h * 0.115))
+
+            # sombra suave para que se lea sobre fondos claros u oscuros
+            draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 190))
+            draw.text((x, y), text, font=font, fill=(255, 255, 255, 255))
+
+            out = io.BytesIO()
+            img.convert("RGB").save(out, format="PNG")
+            out.seek(0)
+            return out
+        except Exception:
+            buf.seek(0)
+            return buf
+
     # Nuevo schedule:
     # Nuevo schedule (Lima):
     # PREP:  :25–:29 y :55–:59
@@ -826,6 +924,44 @@ class Matchmaking(commands.Cog):
             if int(info.get("thread", 0) or 0) == int(thread_id):
                 return rid, info
         return None, None
+
+
+    def _current_prep_slot_ts(self, now: dt.datetime) -> int | None:
+        """
+        Si estamos en PREP (:25-:29 o :55-:59), devuelve el timestamp
+        del slot que se está preparando.
+        Ejemplo: :25-:29 -> :30, :55-:59 -> siguiente :00.
+        """
+        prep_start = self._in_prep_window(now)
+        if prep_start is None:
+            return None
+
+        slot_dt = self._slot_start_from_prep_start(now, prep_start)
+        return int(slot_dt.timestamp())
+
+    def _count_locked_rooms_for_slot(self, join_id: int, slot_ts: int) -> int:
+        """
+        Cuenta rooms ya creadas/locked para un join channel y slot específico.
+        Sirve para bloquear /c durante los 5 minutos PREP cuando la queue
+        ya quedó exacta en salas completas de 5.
+        """
+        count = 0
+        for _rid, info in self.rooms.items():
+            if info.get("finished", False):
+                continue
+            if int(info.get("join_channel_id") or 0) != int(join_id):
+                continue
+            if int(info.get("slot_start_ts") or 0) != int(slot_ts):
+                continue
+
+            phase = info.get("phase")
+            if phase in (PHASE_FUTURE, PHASE_PREPARED, PHASE_STARTED):
+                count += 1
+                continue
+            if bool(info.get("locked_in_thread", False)):
+                count += 1
+
+        return count
 
 
     async def _effective_display_mmrs(self, members: list[discord.Member]) -> dict[int, int]:
@@ -878,22 +1014,30 @@ class Matchmaking(commands.Cog):
             return
 
         join_id = join_channel.id
+        slot_ts = int(slot_dt.timestamp())
         ordered = await self._get_ordered_queue_members(guild, join_id)
         qlen = len(ordered)
+        locked_rooms = self._count_locked_rooms_for_slot(join_id, slot_ts)
 
-        # Need incluso si no hay nadie
+        # Si ya se crearon rooms exactas para este slot, no se permite nueva queue.
+        if locked_rooms > 0 and qlen == 0:
+            try:
+                await join_channel.send(
+                    f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
+                    f"✅ Room queue for this slot is full. Queue is locked until the next slot."
+                )
+            except Exception:
+                pass
+            return
+
+        # Need se calcula sobre la queue completa que todavía NO fue convertida a rooms.
+        # Ej: 6 => falta 4 para la segunda room; 9 => falta 1; 10 => completo.
         if qlen == 0:
             need = ROOM_CAPACITY
         else:
             rem = qlen % ROOM_CAPACITY
             need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
 
-        slot_ts = int(slot_dt.timestamp())
-
-        # Ping seguro (sin KeyError) — solo si:
-        # - hay gente en cola (qlen > 0)
-        # - el siguiente room NO está lleno todavía (need > 0)
-        # - es el aviso de 5 minutos
         ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(join_id)
         do_ping = (
             ping_role_id is not None
@@ -903,17 +1047,23 @@ class Matchmaking(commands.Cog):
         )
         ping_part = f"<@&{ping_role_id}> " if do_ping else ""
 
-        # Texto cuando ya está completo
-        if need == 0:
-            need_txt = "Next room is already full."
+        if qlen > 0 and need == 0:
+            full_rooms = qlen // ROOM_CAPACITY
+            plural = "s" if full_rooms != 1 else ""
+            need_txt = f"✅ {full_rooms} room{plural} full. Queue is locked until the next slot."
         else:
-            need_txt = f"Need ({need}) player(s) to fill the next room."
+            need_txt = f"Need {need} more player(s) to fill the next room."
 
         try:
             await join_channel.send(
                 f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
                 f"{ping_part}{need_txt} "
-                f"Type `/c` to join the queue or `/d` to drop the queue."
+                f"Type `/c` to join the queue or `/d` to drop the queue.",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=True,
+                    everyone=False,
+                ),
             )
         except Exception:
             pass
@@ -923,44 +1073,23 @@ class Matchmaking(commands.Cog):
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
-        En el minuto exacto del slot (:00 / :30):
-        Si la queue no completa el siguiente grupo de 5, NO crea thread "unfilled".
-        Solo anuncia y deja a esos jugadores en la queue.
+        Compatibilidad: no crea threads incompletos.
+        La lógica final usa _prepare_rooms_for_join_channel() en START para crear
+        rooms completas y _purge_unfilled_queue_on_slot() para dropear sobrantes.
         """
-        join_id = join_channel.id
-        ordered = await self._get_ordered_queue_members(guild, join_id)
-        if not ordered:
-            return
-
-        rem = len(ordered) % ROOM_CAPACITY
-        if rem == 0:
-            return  # no hay grupo incompleto
-
-        leftovers = ordered[-rem:]
-        need = ROOM_CAPACITY - rem
-
-        mentions = " ".join(m.mention for m in leftovers)
-        try:
-            await join_channel.send(
-                f"⛔ Slot reached and the next room did not fill. "
-                f"Waiting for **{need}** player(s) to complete the room. {mentions}\n"
-                f"Type `/c` to join the queue or `/d` to drop the queue."
-            )
-        except Exception:
-            pass
-
-        # ✅ IMPORTANTE:
-        # - NO crear thread
-        # - NO mover jugadores fuera de self.queues
-        # - NO tocar queue_join_order
-        # Se quedan esperando para el siguiente PREP/slot.
+        return
 
     async def _purge_unfilled_queue_on_slot(
         self, guild: discord.Guild, join_channel: discord.TextChannel, now: dt.datetime
     ):
         """
-        En el minuto exacto del slot (:00 / :20 / :40):
-        si la cola NO completó el siguiente grupo de 5, elimina a esos jugadores de la queue.
+        En el minuto exacto del slot (:00 / :30), elimina a los jugadores
+        que quedaron en una room incompleta.
+
+        Ejemplos:
+        - 6 jugadores al slot: se crea room 1 con 5 y se dropea room 2 con 1.
+        - 9 jugadores al slot: se crea room 1 con 5 y se dropea room 2 con 4.
+        - 14 jugadores al slot: se crean rooms 1-2 y se dropea room 3 con 4.
         """
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
@@ -969,30 +1098,43 @@ class Matchmaking(commands.Cog):
 
         rem = len(ordered) % ROOM_CAPACITY
         if rem == 0:
-            return  # no hay grupo incompleto
+            return
 
-        leftovers = ordered[-rem:]  # los que quedaron “en la sala que no se llenó”
+        leftovers = ordered[-rem:]
+
+        start_base = self._in_start_window(now)
+        if start_base is not None:
+            slot_dt = now.replace(second=0, microsecond=0, minute=start_base)
+        else:
+            slot_dt = now.replace(second=0, microsecond=0)
+        slot_ts = int(slot_dt.timestamp())
+
+        locked_rooms = self._count_locked_rooms_for_slot(join_id, slot_ts)
+        dropped_room_no = locked_rooms + 1
+
         for m in leftovers:
             self.queues.get(join_id, set()).discard(m.id)
             self.queue_join_order.get(join_id, {}).pop(m.id, None)
 
-        # remover roles de queue
         try:
             await self._remove_queue_roles(leftovers)
         except Exception:
             pass
 
-        # mensaje público con quiénes salieron
         mentions = " ".join(m.mention for m in leftovers)
         try:
             await join_channel.send(
-                f"Not enough players to start the room, Dropping **{len(leftovers)}** player(s) from queue: {mentions}\n"
-                f"Type `/c` to re-join for the next slot."
+                f"⛔ Dropping players from room {dropped_room_no}: not enough players. {mentions}\n"
+                f"Type `/c` to re-join for the next slot.",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=False,
+                    everyone=False,
+                ),
             )
         except Exception:
             pass
 
-        # refrescar #rooms
         try:
             self.bot.dispatch("room_updated", None)
         except Exception:
@@ -1216,16 +1358,36 @@ class Matchmaking(commands.Cog):
         return out
 
     async def _prepare_rooms_for_join_channel(
-        self, guild: discord.Guild, join_channel: discord.TextChannel
+        self,
+        guild: discord.Guild,
+        join_channel: discord.TextChannel,
+        *,
+        slot_dt: dt.datetime | None = None,
+        require_exact_multiple: bool = True,
     ):
         """
-        PREP (:55/:25 windows) -> crea threads y mueve jugadores,
-        PERO NO postea canciones. Las canciones se postean en el slot (:00/:20/:40).
+        Crea rooms completas de 5 jugadores.
+
+        Regla durante PREP (:25-:29 / :55-:59):
+        - Si la queue está exactamente en múltiplos de 5 (5, 10, 15...),
+          crea todas esas rooms y deja el slot locked.
+        - Si hay sobrantes (6-9, 11-14...), NO crea ninguna room todavía;
+          se sigue pidiendo gente para completar la siguiente room.
+
+        Regla al llegar START (:00 / :30):
+        - Crea solo las rooms completas de 5.
+        - Los sobrantes se dropean después en _purge_unfilled_queue_on_slot().
         """
         join_id = join_channel.id
         ordered = await self._get_ordered_queue_members(guild, join_id)
+        qlen = len(ordered)
 
-        # grupos completos
+        if qlen < ROOM_CAPACITY:
+            return
+
+        if require_exact_multiple and (qlen % ROOM_CAPACITY != 0):
+            return
+
         groups = [
             ordered[i : i + ROOM_CAPACITY]
             for i in range(0, len(ordered), ROOM_CAPACITY)
@@ -1236,41 +1398,36 @@ class Matchmaking(commands.Cog):
 
         now = self._now_lima()
 
-        # slot real al que corresponde este PREP (55->00, 15->20, 35->40)
-        prep_start = self._in_prep_window(now)  # 55/15/35
-        if prep_start is None:
-            return
-        slot_dt = self._slot_start_from_prep_start(now, prep_start)
+        if slot_dt is None:
+            prep_start = self._in_prep_window(now)
+            if prep_start is None:
+                return
+            slot_dt = self._slot_start_from_prep_start(now, prep_start)
+        else:
+            slot_dt = slot_dt.replace(second=0, microsecond=0)
+
         slot_ts = int(slot_dt.timestamp())
-
         server_code = JOIN_CHANNEL_CFG.get(join_id, {}).get("server", "en")
+        existing_slot_room_count = self._count_locked_rooms_for_slot(join_id, slot_ts)
 
-        for i, group in enumerate(full_groups, start=1):
-            # calcular avg mmr para naming (en base al grupo)
-            season_row = await self.get_current_season()
-            prev_row = await self._get_previous_season(int(season_row["id"])) if season_row else None
-            prev_season_id = int(prev_row["id"]) if prev_row else None
-
+        for i, group in enumerate(full_groups, start=existing_slot_room_count + 1):
             mmr_map = await self._effective_display_mmrs([m for m in group if not m.bot])
             mmr_vals = [int(mmr_map.get(m.id, 0)) for m in group]
 
             avg = (sum(mmr_vals) // len(mmr_vals)) if mmr_vals else 0
             rank = self._rank_label_from_mmr(avg)
 
-            # IMPORTANTE: usar slot_dt (no now) para nombre del thread
             thread_name = self._build_thread_name(i, slot_dt, avg, rank)
 
             rid, info = await self._create_room(
                 join_channel, server_code=server_code, thread_name=thread_name
             )
 
-            # mover de cola a room
             for m in group:
                 self.queues[join_id].discard(m.id)
                 await self._add_member_to_room(m, rid, info)
                 self.queue_join_order.get(join_id, {}).pop(m.id, None)
 
-            # marcar como FUTURE (espera al slot para postear songs)
             info["phase"] = PHASE_FUTURE
             info["locked_in_thread"] = True
             info["slot_start_ts"] = slot_ts
@@ -1281,7 +1438,6 @@ class Matchmaking(commands.Cog):
 
             mentions = " ".join(m.mention for m in group)
 
-            # Ping + aviso de cuándo se publican songs
             allowed = discord.AllowedMentions(users=True, roles=False, everyone=False)
             await self.bot.get_channel(info["join_channel_id"]).get_thread(
                 info["thread"]
@@ -1292,13 +1448,11 @@ class Matchmaking(commands.Cog):
                 allowed_mentions=allowed,
             )
 
-            # quitar rol cola
             try:
                 await self._remove_queue_roles(group)
             except Exception:
                 pass
 
-            # notificar a Rooms cog
             self.bot.dispatch("room_updated", rid)
 
     async def _start_pending_room(self, rid: int):
@@ -1483,6 +1637,35 @@ class Matchmaking(commands.Cog):
         for uid in user_ids:
             out.setdefault(uid, 0)
         return out
+
+    async def _fetch_country_codes_batch(self, user_ids: list[int]) -> dict[int, str]:
+        """
+        Lee players.country en batch para mostrar la bandera en results.png.
+        Missing / vacío / WW / ?? / -- se tratan como unknown.jpg.
+        """
+        if not user_ids:
+            return {}
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, COALESCE(country, '') AS country
+                FROM players
+                WHERE user_id = ANY($1::bigint[])
+                """,
+                user_ids,
+            )
+
+        out = {
+            int(r["user_id"]): str(r["country"] or "").upper().strip()
+            for r in rows
+        }
+
+        for uid in user_ids:
+            out.setdefault(int(uid), "")
+
+        return out
+
 
     async def _assign_queue_role_for_join(
         self, member: discord.Member, join_channel_id: int
@@ -3057,9 +3240,15 @@ class Matchmaking(commands.Cog):
                 # ---------- PREP (ventana :x5..:x9) ----------
                 prep_start = self._in_prep_window(now)
                 if prep_start is not None:
-                    # ✅ NUEVO: intentar preparar rooms en cada tick (cada 1s)
-                    # Esto evita que quien entra en :x9:50 se quede en future queue.
-                    await self._prepare_rooms_for_join_channel(guild, join_channel)
+                    # Durante PREP solo se crean rooms si TODA la queue está completa
+                    # en múltiplos exactos de 5: 5, 10, 15...
+                    # Si hay 6-9, 11-14, etc., NO se crea room todavía;
+                    # se espera hasta el slot para crear solo las completas y dropear sobrantes.
+                    await self._prepare_rooms_for_join_channel(
+                        guild,
+                        join_channel,
+                        require_exact_multiple=True,
+                    )
 
                     # ✅ Mantener anuncios 1 vez por minuto (anti-spam)
                     minute_key = (now.year, now.month, now.day, now.hour, now.minute)
@@ -3084,13 +3273,24 @@ class Matchmaking(commands.Cog):
                             second=0, microsecond=0, minute=start_base
                         )
                         slot_ts = int(slot_dt.timestamp())
-                        # (1) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
+
+                        # (1) Al llegar :00/:30, crea SOLO las rooms completas.
+                        # Ej: 6 => crea 1 room y deja 1 en queue para dropearlo abajo.
+                        # Ej: 9 => crea 1 room y deja 4 en queue para dropearlos abajo.
+                        await self._prepare_rooms_for_join_channel(
+                            guild,
+                            join_channel,
+                            slot_dt=slot_dt,
+                            require_exact_multiple=False,
+                        )
+
+                        # (2) PURGE: saca a los que quedaron en grupo incompleto al llegar el slot
                         await self._purge_unfilled_queue_on_slot(guild, join_channel, now)
 
-                        # (2) START: inicia rooms FUTURE programadas para este slot
+                        # (3) START: inicia rooms FUTURE programadas para este slot
                         await self._start_future_rooms_for_slot(join_id, slot_ts)
 
-                        # (3) ANNOUNCE: publica los próximos horarios (con timestamps)
+                        # (4) ANNOUNCE: publica los próximos horarios (con timestamps)
                         await self._announce_next_queue_windows_on_00(join_channel, now)
 
     @room_slot_scheduler.before_loop
@@ -3887,26 +4087,28 @@ class Matchmaking(commands.Cog):
         self, guild: discord.Guild, join_id: int, now: dt.datetime
     ) -> bool:
         """
-        Regla pedida:
-        - Solo durante PREP (:x5..:x9)
-        - Si en :x5 ya están las salas completas (>= 1 grupo full)
-        y NO hay otra sala que necesite jugadores (need==0),
-        entonces se bloquea el join.
-        - Si falta gente para completar (need>0), se permite entrar.
+        Lockdown durante PREP (:25-:29 / :55-:59).
+
+        Regla final:
+        - Si ya existen rooms locked para el slot actual, nadie más puede usar /c.
+        - Si todavía no se crearon rooms, pero la queue está exactamente completa
+          en múltiplos de 5 (5, 10, 15...), se bloquea el siguiente /c.
+        - Si hay sobrantes (6-9, 11-14...), se permite /c para intentar
+          completar la siguiente room antes del slot.
         """
         if not self._lockdown_window(now):
             return False
 
-        ordered = await self._get_ordered_queue_members(guild, join_id)
-        full_groups = len(ordered) // ROOM_CAPACITY
-        rem = len(ordered) % ROOM_CAPACITY
-        need = 0 if rem == 0 else (ROOM_CAPACITY - rem)
-
-        # Caso clave: ya hay al menos 1 sala completa y no se necesita nadie -> LOCK
-        if full_groups >= 1 and need == 0:
+        slot_ts = self._current_prep_slot_ts(now)
+        if slot_ts is not None and self._count_locked_rooms_for_slot(join_id, slot_ts) > 0:
             return True
 
-        # Si falta gente para completar la siguiente, permitir
+        ordered = await self._get_ordered_queue_members(guild, join_id)
+        qlen = len(ordered)
+
+        if qlen >= ROOM_CAPACITY and qlen % ROOM_CAPACITY == 0:
+            return True
+
         return False
 
     async def launch_song_poll(self, room_info):
@@ -6230,6 +6432,10 @@ class Matchmaking(commands.Cog):
             if prev_season_id and sp_ids:
                 prev_mmr_map = await self._fetch_mmrs_batch_for_season(prev_season_id, sp_ids)
 
+            # --- map countries para mostrar flags en results.png ---
+            # Esto NO escribe ni modifica players.country en PostgreSQL.
+            country_map = await self._fetch_country_codes_batch([m.id for m in players])
+
             # --- construir players_list ---
             players_list = []
             for member in players:
@@ -6237,31 +6443,14 @@ class Matchmaking(commands.Cog):
                 cc, stats = by_id[uid]
                 old, current_role = await self.fetch_player(uid)
 
-                # ISO2 tomado DIRECTAMENTE del mensaje !submit.
-                # Ejemplo de lÃ­nea: <@123> [PE] 1000,2,0,0,0
-                # La bandera del board debe salir de este ISO2, no del perfil guardado.
+                # Bandera visual para results.png:
+                # 1) Primero usa players.country guardado en PostgreSQL.
+                # 2) Si no hay bandera guardada, usa [CC] del submit si fue enviado.
+                # 3) Si tampoco hay bandera válida, usa assets/flags/unknown.jpg.
+                # IMPORTANTE: esto NO actualiza players.country ni cambia la bandera guardada.
                 submit_cc = (cc or "").upper().strip()
-
-                profile_cc = (
-                    await self.db_pool.fetchval(
-                        "SELECT country FROM players WHERE user_id = $1",
-                        uid,
-                    )
-                    or ""
-                ).upper().strip()
-
-                # Guardamos/actualizamos el paÃ­s para que la web tambiÃ©n quede alineada
-                # con el Ãºltimo ISO2 usado en !submit.
-                if submit_cc and profile_cc != submit_cc:
-                    await self.db_pool.execute(
-                        "UPDATE players SET country = $2 WHERE user_id = $1",
-                        uid,
-                        submit_cc,
-                    )
-                    profile_cc = submit_cc
-
-                # Esta es la bandera que se mostrarÃ¡ a la derecha del nombre en results.png.
-                display_flag = country_flag(submit_cc)
+                stored_cc = (country_map.get(uid) or "").upper().strip()
+                display_cc = country_code_for_results(stored_cc, submit_cc)
                 total_points = sum(s * w for s, w in zip(stats, [4, 3, 2, 1, 0]))
 
                 is_season_placement = self._has_season_placement_role(member)
@@ -6272,13 +6461,13 @@ class Matchmaking(commands.Cog):
                 players_list.append(
                     {
                         "member": member,
-                        "cc": submit_cc,
+                        "cc": display_cc,
                         "stats": stats,
                         "total": total_points,
                         "old": int(old),
                         "mmr_actual": int(old),  # base; se sobreescribe si es placement
                         "role": current_role,
-                        "display_flag": display_flag,
+                        "country_code": display_cc,
                         "was_placement": bool(is_season_placement or is_rank_placement),
                         "is_season_placement": bool(is_season_placement),
                         "prev_season_mmr": prev_season_mmr,
@@ -6389,11 +6578,10 @@ class Matchmaking(commands.Cog):
                     reason=f"Submit result #{result_id}",
                 )
 
-                name_with_flag = f"{p['member'].display_name} {p['display_flag']}".rstrip()
                 summary.append(
                     (
                         idx,
-                        name_with_flag,
+                        p["member"].display_name,
                         p["total"],
                         p["stats"],
                         mmr_prev,
@@ -6401,6 +6589,7 @@ class Matchmaking(commands.Cog):
                         mmr_final,
                         p["was_placement"],
                         role_name,  # color del board basado en el rango FINAL
+                        p["country_code"],  # ISO2 o __UNKNOWN_FLAG__ para assets/flags/unknown.jpg
                     )
                 )
 
@@ -6447,13 +6636,40 @@ class Matchmaking(commands.Cog):
 
             header_line = f"ID: {result_id}{gap_text}{songs_block}"
 
-            with Image.open("assets/logo.png") as logo_img:
-                buf = generate_results_image(
-                    summary,
-                    font_path="assets/rodinntlg_eb.otf",
-                    side_image=logo_img.copy(),
-                )
+            submitted_at_dt = self._now_lima()
+            submitted_at_text = submitted_at_dt.strftime("%d/%m/%Y %H:%M") + " PET"
 
+            with Image.open("assets/logo.png") as logo_img:
+                image_kwargs = {
+                    "font_path": "assets/rodinntlg_eb.otf",
+                    "side_image": logo_img.copy(),
+                }
+
+                passed_submitted_at_text = False
+                try:
+                    sig = inspect.signature(generate_results_image)
+                    if "submitted_at_text" in sig.parameters:
+                        image_kwargs["submitted_at_text"] = submitted_at_text
+                        passed_submitted_at_text = True
+
+                    if "unknown_flag_path" in sig.parameters:
+                        image_kwargs["unknown_flag_path"] = UNKNOWN_FLAG_IMAGE_PATH
+
+                    if "unknown_flag_code" in sig.parameters:
+                        image_kwargs["unknown_flag_code"] = UNKNOWN_FLAG_CODE
+                except (TypeError, ValueError):
+                    pass
+
+                buf = generate_results_image(summary, **image_kwargs)
+
+                if not passed_submitted_at_text:
+                    buf = self._overlay_submitted_at_text_on_results_image(
+                        buf,
+                        submitted_at_text,
+                        font_path="assets/rodinntlg_eb.otf",
+                    )
+
+            buf.seek(0)
             image_bytes = buf.read()
 
             embed = discord.Embed(
