@@ -269,6 +269,11 @@ async def startup():
           url        TEXT NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        CREATE TABLE IF NOT EXISTS public.player_titles(
+          user_id    {uid_type_sql} PRIMARY KEY,
+          title_key  TEXT NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         DO $$
         BEGIN
           IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_https_pfp') THEN
@@ -477,6 +482,156 @@ def _uid_for_sql(user_id_like: Optional[str]):
             raise HTTPException(400, "userId debe ser numérico")
         return int(s)
     return s  # TEXT
+
+
+def _place_suffix(place: int) -> str:
+    place = int(place or 0)
+    if place == 1:
+        return "1st"
+    if place == 2:
+        return "2nd"
+    if place == 3:
+        return "3rd"
+    return str(place)
+
+
+def _season_title_key(season_id: Any, place: Any) -> str:
+    return f"season:{season_id}:{int(place)}"
+
+
+def _season_title_color(place: Any) -> str:
+    p = int(place or 0)
+    if p == 1:
+        return "gold"
+    if p == 2:
+        return "silver"
+    if p == 3:
+        return "bronze"
+    return "gold"
+
+
+def _season_display_label(season_id: Any, season_name: Optional[str]) -> str:
+    raw = str(season_name or "").strip()
+    if not raw:
+        return str(season_id)
+
+    low = raw.lower()
+    if low in ("current", "preseason", "pre-season"):
+        return str(season_id)
+
+    if low.startswith("season "):
+        return raw.split(" ", 1)[1].strip() or str(season_id)
+
+    return raw
+
+
+def _season_title_payload(season_id: Any, season_name: Optional[str], place: Any) -> Dict[str, Any]:
+    p = int(place)
+    season_label = _season_display_label(season_id, season_name)
+    return {
+        "key": _season_title_key(season_id, p),
+        "titleKey": _season_title_key(season_id, p),
+        "label": f"Season {season_label} {_place_suffix(p)} Place",
+        "seasonId": season_id,
+        "season_id": season_id,
+        "seasonName": season_name,
+        "season_name": season_name,
+        "place": p,
+        "color": _season_title_color(p),
+    }
+
+
+def _parse_season_title_key(title_key: Optional[str]) -> Optional[Tuple[str, int]]:
+    if not title_key:
+        return None
+    m = re.fullmatch(r"season:([^:]+):(1|2|3)", str(title_key).strip())
+    if not m:
+        return None
+    return m.group(1), int(m.group(2))
+
+
+async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    parsed = _parse_season_title_key(title_key)
+    if not parsed:
+        return None
+    season_id, place = parsed
+    season_name = None
+    try:
+        row = await conn.fetchrow(
+            "SELECT name FROM public.seasons WHERE id::text = $1 LIMIT 1",
+            str(season_id),
+        )
+        if row:
+            season_name = row["name"]
+    except Exception:
+        season_name = None
+    return _season_title_payload(season_id, season_name, place)
+
+
+async def _resolved_auth_user_id(session: Dict[str, Any]) -> Optional[str]:
+    discord_id = str(session.get("id") or "")
+    resolved = session.get("resolvedUserId")
+    if not resolved and discord_id:
+        resolved = await _resolve_user_id_from_discord(discord_id)
+    return str(resolved or discord_id or "") or None
+
+
+async def _eligible_titles_for_user_id(conn: asyncpg.Connection, user_id: str) -> List[Dict[str, Any]]:
+    if not user_id:
+        return []
+
+    name_expr = "s.name" if SEASONS_HAS_NAME else "NULL::text"
+    filters = []
+    if SEASONS_HAS_ACTIVE:
+        filters.append("(s.active IS DISTINCT FROM TRUE)")
+    if SEASONS_HAS_NAME:
+        filters.append("(s.name IS NULL OR lower(s.name) NOT IN ('current','preseason','pre-season'))")
+
+    where_sql = ""
+    if filters:
+        where_sql = "WHERE " + " AND ".join(filters)
+
+    rows = await conn.fetch(
+        f"""
+        WITH ranked AS (
+            SELECT
+                sp.season_id,
+                {name_expr} AS season_name,
+                sp.user_id,
+                sp.mmr,
+                row_number() OVER (
+                    PARTITION BY sp.season_id
+                    ORDER BY sp.mmr DESC, sp.user_id::text ASC
+                ) AS rn
+            FROM public.seasonplayers sp
+            LEFT JOIN public.seasons s ON s.id = sp.season_id
+            {where_sql}
+        )
+        SELECT season_id, season_name, rn AS place
+        FROM ranked
+        WHERE user_id::text = $1
+          AND rn <= 3
+        ORDER BY season_id DESC, rn ASC
+        """,
+        str(user_id),
+    )
+
+    return [
+        _season_title_payload(r["season_id"], r["season_name"], r["place"])
+        for r in rows
+    ]
+
+
+async def _selected_title_for_user_id(conn: asyncpg.Connection, user_id: str) -> Optional[Dict[str, Any]]:
+    if not user_id:
+        return None
+    row = await conn.fetchrow(
+        "SELECT title_key FROM public.player_titles WHERE user_id::text = $1 LIMIT 1",
+        str(user_id),
+    )
+    if not row:
+        return None
+    return await _title_payload_from_key(conn, row["title_key"])
 
 
 @app.get("/health")
@@ -710,6 +865,85 @@ async def list_pfps():
     )
 
 
+class TitleSelectIn(BaseModel):
+    titleKey: Optional[str] = None
+
+
+@app.get("/auth02/titles")
+async def get_auth_titles(request: Request):
+    """
+    Devuelve los titles disponibles para el usuario autenticado.
+    Un title se desbloquea si el usuario terminó Top 1, 2 o 3 en una season cerrada.
+    """
+    sid = request.cookies.get(COOKIE_NAME)
+    if not sid or sid not in SESSIONS:
+        raise HTTPException(status_code=401, detail="no-session")
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    session = SESSIONS.get(sid or "", {})
+    user_id = await _resolved_auth_user_id(session)
+    if not user_id:
+        return {"available": [], "selected": None}
+
+    async with db_pool.acquire() as conn:
+        available = await _eligible_titles_for_user_id(conn, user_id)
+        selected = await _selected_title_for_user_id(conn, user_id)
+
+    available_keys = {t["key"] for t in available}
+    if selected and selected.get("key") not in available_keys:
+        selected = None
+
+    return {"available": available, "selected": selected}
+
+
+@app.post("/auth02/title")
+async def set_auth_title(request: Request, body: TitleSelectIn):
+    """
+    Guarda el title activo del usuario autenticado.
+    Solo permite guardar titles que el usuario realmente desbloqueó.
+    """
+    sid = request.cookies.get(COOKIE_NAME)
+    if not sid or sid not in SESSIONS:
+        raise HTTPException(status_code=401, detail="no-session")
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    session = SESSIONS.get(sid or "", {})
+    user_id = await _resolved_auth_user_id(session)
+    if not user_id:
+        raise HTTPException(400, "could not resolve user id")
+
+    title_key = (body.titleKey or "").strip()
+
+    async with db_pool.acquire() as conn:
+        if title_key == "":
+            await conn.execute(
+                "DELETE FROM public.player_titles WHERE user_id = $1",
+                _uid_for_sql(user_id),
+            )
+            return {"ok": True, "selected": None}
+
+        available = await _eligible_titles_for_user_id(conn, user_id)
+        allowed = {t["key"]: t for t in available}
+        if title_key not in allowed:
+            raise HTTPException(403, "title not unlocked")
+
+        await conn.execute(
+            """
+            INSERT INTO public.player_titles(user_id, title_key, updated_at)
+            VALUES ($1, $2, now())
+            ON CONFLICT (user_id) DO UPDATE
+              SET title_key = EXCLUDED.title_key,
+                  updated_at = now()
+            """,
+            _uid_for_sql(user_id),
+            title_key,
+        )
+
+        return {"ok": True, "selected": allowed[title_key]}
+
+
 # ======================= API: Players =======================
 @app.get("/api/players")
 async def get_players(
@@ -747,6 +981,8 @@ async def get_players(
                 "sp.role    AS rank",
                 "pp.url     AS pfp_url",
                 "pp.updated_at AS pfp_updated_at",
+                "pt.title_key AS title_key",
+                "ts.name AS title_season_name",
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -767,6 +1003,8 @@ async def get_players(
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
                 LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
+                LEFT JOIN public.player_titles pt ON pt.user_id::text = p.user_id::text
+                LEFT JOIN public.seasons ts ON ts.id::text = split_part(pt.title_key, ':', 2)
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -910,6 +1148,17 @@ async def get_players(
             last10_losses = s.get("losses")
             last10_mmr_delta = s.get("mmr_delta")
 
+        selected_title = None
+        title_key = _rget(r, "title_key")
+        parsed_title = _parse_season_title_key(title_key)
+        if parsed_title:
+            title_season_id, title_place = parsed_title
+            selected_title = _season_title_payload(
+                title_season_id,
+                _rget(r, "title_season_name"),
+                title_place,
+            )
+
         out.append(
             {
                 "id": user_id,
@@ -921,6 +1170,12 @@ async def get_players(
                 "country": _rget(r, "country"),
                 "rank": _rget(r, "rank"),
                 "pfp": pfp_url,
+                "seasonTitle": selected_title,
+                "season_title": selected_title,
+                "selectedTitle": selected_title,
+                "selected_title": selected_title,
+                "activeTitle": selected_title,
+                "active_title": selected_title,
                 "in_guild": _rget(r, "in_guild") if PLAYERS_HAS_IN_GUILD else None,
                 "wins": wins,
                 "losses": losses,
