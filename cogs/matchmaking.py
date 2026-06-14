@@ -6637,7 +6637,7 @@ class Matchmaking(commands.Cog):
             header_line = f"ID: {result_id}{gap_text}{songs_block}"
 
             submitted_at_dt = self._now_lima()
-            submitted_at_text = submitted_at_dt.strftime("%d/%m/%Y %H:%M") + " PET"
+            submitted_at_text = submitted_at_dt.strftime("%d/%m/%Y %H:%M") + " UTC-5"
 
             with Image.open("assets/logo.png") as logo_img:
                 image_kwargs = {
