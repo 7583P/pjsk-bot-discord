@@ -62,7 +62,17 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_V8_2026_06_16"
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_SECURE_V10_DIRECT_ID_2026_06_16"
+
+# SECURITY DEFAULTS:
+# - Do not allow users to freely claim an unlinked leaderboard player from the web.
+# - Do not auto-link by Discord display name because names can be spoofed/changed.
+# To temporarily restore old behavior, set these env vars to 1, true, yes, or on.
+ALLOW_PUBLIC_PLAYER_CLAIM = str(os.getenv("ALLOW_PUBLIC_PLAYER_CLAIM", "0")).lower() in ("1", "true", "yes", "on")
+ALLOW_AUTO_LINK_BY_NAME = str(os.getenv("ALLOW_AUTO_LINK_BY_NAME", "0")).lower() in ("1", "true", "yes", "on")
+# Safe auto-link: if public.players.user_id is exactly the Discord snowflake from OAuth,
+# ownership is already proven by Discord OAuth. This avoids the insecure name dropdown.
+ALLOW_DIRECT_USER_ID_LINK = str(os.getenv("ALLOW_DIRECT_USER_ID_LINK", "1")).lower() in ("1", "true", "yes", "on")
 
 print("======================================================")
 print("[PJSK DEPLOY CHECK] app.py loaded")
@@ -86,6 +96,10 @@ async def auth02_debug_version():
         "has_link_candidates": True,
         "has_link_player": True,
         "has_player_not_linked": True,
+        "allow_public_player_claim": ALLOW_PUBLIC_PLAYER_CLAIM,
+        "allow_auto_link_by_name": ALLOW_AUTO_LINK_BY_NAME,
+        "allow_direct_user_id_link": ALLOW_DIRECT_USER_ID_LINK,
+        "security_mode": "verified-link-only-with-direct-user-id",
     }
 
 
@@ -95,6 +109,10 @@ async def api_debug_version():
         "version": PJSK_DEPLOY_VERSION,
         "file": os.path.abspath(__file__),
         "api_rewrite_ok": True,
+        "security_mode": "verified-link-only",
+        "allow_public_player_claim": ALLOW_PUBLIC_PLAYER_CLAIM,
+        "allow_auto_link_by_name": ALLOW_AUTO_LINK_BY_NAME,
+        "allow_direct_user_id_link": ALLOW_DIRECT_USER_ID_LINK,
     }
 
 
@@ -722,16 +740,93 @@ def _discord_name_candidates(username: Optional[str], global_name: Optional[str]
 
 
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
-    if not (db_pool and HAS_DISCORD_ID_COL and discord_id):
+    """
+    Resolve the public leaderboard player for a Discord OAuth user.
+
+    Secure resolution order:
+      1) Existing verified mapping: public.players.discord_id == Discord OAuth ID.
+      2) Safe direct mapping: public.players.user_id == Discord OAuth ID.
+
+    The second rule is safe only because the value comes from Discord OAuth, not
+    from a typed search box. If your bot created players.user_id from Discord IDs,
+    users will link automatically without selecting a name.
+    """
+    did = str(discord_id or "").strip()
+    if not (db_pool and did):
         return None
+
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT user_id FROM public.players WHERE discord_id::text = $1 LIMIT 1",
-            str(discord_id),
+        if HAS_DISCORD_ID_COL:
+            row = await conn.fetchrow(
+                "SELECT user_id FROM public.players WHERE discord_id::text = $1 LIMIT 1",
+                did,
+            )
+            if row:
+                return str(row["user_id"])
+
+        if not ALLOW_DIRECT_USER_ID_LINK:
+            return None
+
+        # Safe auto-link: the leaderboard user_id itself is the Discord snowflake.
+        # This prevents the insecure flow where users choose arbitrary names.
+        target = await conn.fetchrow(
+            """
+            SELECT user_id::text AS user_id, name, discord_id::text AS discord_id
+            FROM public.players
+            WHERE user_id::text = $1
+            LIMIT 1
+            """,
+            did,
         )
-        if row:
-            return str(row["user_id"])
-    return None
+        if not target:
+            return None
+
+        if not HAS_DISCORD_ID_COL:
+            return str(target["user_id"])
+
+        target_discord = str(target["discord_id"] or "").strip()
+        if target_discord and target_discord != did:
+            logger.warning(
+                "Direct user_id link blocked because target has different discord_id: oauth_discord_id=%s user_id=%s target_discord_id=%s",
+                did, target["user_id"], target_discord,
+            )
+            return None
+
+        # Avoid duplicate mapping if the same Discord ID is already linked elsewhere.
+        used_by_other = await conn.fetchrow(
+            """
+            SELECT user_id::text AS user_id, name
+            FROM public.players
+            WHERE discord_id::text = $1
+              AND user_id::text <> $1
+            LIMIT 1
+            """,
+            did,
+        )
+        if used_by_other:
+            logger.warning(
+                "Direct user_id link blocked because Discord ID is already linked to another player: oauth_discord_id=%s other_user_id=%s other_name=%s",
+                did, used_by_other["user_id"], used_by_other["name"],
+            )
+            return None
+
+        if not target_discord:
+            await conn.execute(
+                """
+                UPDATE public.players
+                SET discord_id = $2
+                WHERE user_id::text = $1
+                  AND (discord_id IS NULL OR discord_id::text = '')
+                """,
+                did,
+                _discord_id_for_sql(did),
+            )
+            logger.info(
+                "Safe direct-linked Discord OAuth user to player by user_id: discord_id=%s user_id=%s player_name=%s",
+                did, target["user_id"], target["name"],
+            )
+
+        return str(target["user_id"])
 
 
 async def _resolve_or_link_user_id_from_discord(
@@ -756,6 +851,13 @@ async def _resolve_or_link_user_id_from_discord(
     existing = await _resolve_user_id_from_discord(did)
     if existing:
         return existing
+
+    if not ALLOW_AUTO_LINK_BY_NAME:
+        logger.info(
+            "No verified player found after direct user_id lookup; auto-link by name disabled. discord_id=%s username=%s global_name=%s requires bot/admin verification",
+            did, username, global_name,
+        )
+        return None
 
     candidates = _discord_name_candidates(username, global_name)
     if not candidates:
@@ -1401,7 +1503,12 @@ async def auth02_link_candidates(
         linked_user_id = linked_row["user_id"] if linked_row else None
 
         params: List[Any] = [discord_id]
-        where = ["(p.discord_id IS NULL OR p.discord_id::text = '' OR p.discord_id::text = $1)"]
+        if ALLOW_PUBLIC_PLAYER_CLAIM:
+            where = ["(p.discord_id IS NULL OR p.discord_id::text = '' OR p.discord_id::text = $1)"]
+        else:
+            # Security: do not expose unclaimed players as selectable candidates.
+            # A player can only appear here if it is already linked to the same Discord ID.
+            where = ["p.discord_id::text = $1"]
         if search:
             params.append(f"%{search}%")
             where.append(f"p.name ILIKE ${len(params)}")
@@ -1501,6 +1608,8 @@ async def auth02_link_candidates(
                 "discordId": discord_id,
                 "linkedUserId": linked_user_id,
                 "needsPlayerLink": not bool(linked_user_id),
+                "claimRequiresVerification": not ALLOW_PUBLIC_PLAYER_CLAIM,
+                "allowPublicPlayerClaim": ALLOW_PUBLIC_PLAYER_CLAIM,
                 "candidates": candidates,
             }
         )
@@ -1582,6 +1691,21 @@ async def auth02_link_player(request: Request):
                     "error": "player-already-linked",
                     "message": "This leaderboard player is already linked to another Discord account.",
                     "linkedDiscordId": target_discord,
+                },
+            )
+
+        if not target_discord and not ALLOW_PUBLIC_PLAYER_CLAIM:
+            logger.warning(
+                "Blocked unverified player claim: discord_id=%s attempted user_id=%s player_name=%s",
+                discord_id, user_id, target["name"],
+            )
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "claim-requires-verification",
+                    "message": "This leaderboard player is not verified for your Discord account yet. Ask an admin or use the Discord bot verification flow.",
+                    "userId": user_id,
+                    "playerName": target["name"],
                 },
             )
 
