@@ -151,7 +151,7 @@ def set_session_cookie(resp, session_user: Dict[str, Any]):
         value=token,
         httponly=True,
         secure=True,
-        samesite="lax",
+        samesite="none",
         path="/",
         max_age=SESSION_MAX_AGE,
     )
@@ -2586,9 +2586,7 @@ async def auth02_cards(
     """
     force = bool(force)
     if force:
-        sid = request.cookies.get(COOKIE_NAME)
-        if not sid or sid not in SESSIONS:
-            raise HTTPException(status_code=401, detail="no-session")
+        require_auth_session(request)
 
     now = datetime.now(timezone.utc)
 
