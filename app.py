@@ -1,5 +1,9 @@
 import os
 import re
+import json
+import hmac
+import base64
+import hashlib
 import secrets
 import traceback
 import asyncio
@@ -31,22 +35,35 @@ logger = logging.getLogger("app")
 # ========================= ENV =========================
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "")
+
+# IMPORTANTE:
+# Después del proxy de Vercel, Discord debe volver a Vercel, no directo a Railway.
 DISCORD_REDIRECT_URI = os.getenv(
     "DISCORD_REDIRECT_URI",
-    "https://unique-education-production.up.railway.app/auth02/callback",
+    "https://pjsk-page.vercel.app/auth02/callback",
 )
-FRONT_URL = os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
+
+# Soporta FRONTEND_URL y mantiene FRONT_URL por compatibilidad con tu env anterior.
+FRONT_URL = os.getenv("FRONTEND_URL") or os.getenv("FRONT_URL", "https://pjsk-page.vercel.app")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", FRONT_URL)
-COOKIE_NAME = os.getenv("COOKIE_NAME", "sid")
+
+# Cookie firmada. Ya no dependemos de SESSIONS en memoria.
+COOKIE_NAME = os.getenv("COOKIE_NAME", "pjsk_session")
+SESSION_COOKIE_NAME = COOKIE_NAME
+SESSION_MAX_AGE = int(os.getenv("SESSION_MAX_AGE_SECONDS", str(60 * 60 * 24 * 30)))  # 30 días
+SESSION_SECRET = os.getenv("SESSION_SECRET") or DISCORD_CLIENT_SECRET
+
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 # ===================== FastAPI =====================
 app = FastAPI()
 
 _allowed_origins = []
-for o in [FRONT_URL, CORS_ORIGIN]:
-    if o and o not in _allowed_origins:
-        _allowed_origins.append(o)
+for raw in [FRONT_URL, CORS_ORIGIN]:
+    for o in str(raw or "").split(","):
+        o = o.strip()
+        if o and o not in _allowed_origins:
+            _allowed_origins.append(o)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,20 +73,114 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================ Sesiones simples en memoria ================
-SESSIONS: Dict[str, Dict] = {}  # sid -> {"id": "<discord_id>", "username": "..."}
+# ================ Sesión firmada en cookie ================
+# Antes esto usaba SESSIONS en memoria. Eso falla en Railway porque el proceso puede
+# reiniciar, usar otro worker o perder memoria. Ahora /auth02/me lee la sesión desde
+# una cookie firmada, persistente y verificable.
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
 
-def set_session_cookie(resp, sid: str):
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def make_session_token(user: Dict[str, Any]) -> str:
+    if not SESSION_SECRET:
+        raise HTTPException(500, "SESSION_SECRET or DISCORD_CLIENT_SECRET is not configured")
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    payload = {
+        "iat": now,
+        "exp": now + SESSION_MAX_AGE,
+        "user": user,
+    }
+
+    payload_raw = json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    payload_b64 = _b64url_encode(payload_raw)
+    signature = hmac.new(
+        SESSION_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+    return f"{payload_b64}.{_b64url_encode(signature)}"
+
+
+def read_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not token or "." not in token or not SESSION_SECRET:
+        return None
+
+    try:
+        payload_b64, signature_b64 = token.split(".", 1)
+
+        expected_signature = hmac.new(
+            SESSION_SECRET.encode("utf-8"),
+            payload_b64.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
+        received_signature = _b64url_decode(signature_b64)
+
+        if not hmac.compare_digest(expected_signature, received_signature):
+            return None
+
+        payload = json.loads(_b64url_decode(payload_b64).decode("utf-8"))
+
+        if int(payload.get("exp", 0)) < int(datetime.now(timezone.utc).timestamp()):
+            return None
+
+        user = payload.get("user")
+        return user if isinstance(user, dict) else None
+
+    except Exception:
+        return None
+
+
+def set_session_cookie(resp, session_user: Dict[str, Any]):
+    token = make_session_token(session_user)
     resp.set_cookie(
-        key=COOKIE_NAME,
-        value=sid,
+        key=SESSION_COOKIE_NAME,
+        value=token,
         httponly=True,
         secure=True,
-        samesite="none",
+        samesite="lax",
         path="/",
-        max_age=60 * 60 * 24 * 7,  # 7 días
+        max_age=SESSION_MAX_AGE,
     )
+
+
+def clear_session_cookie(resp):
+    resp.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+    )
+
+
+def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    return read_session_token(token)
+
+
+def require_auth_session(request: Request) -> Dict[str, Any]:
+    session = get_session_from_request(request)
+    if not session:
+        raise HTTPException(status_code=401, detail="no-session")
+    return session
+
+
+def _no_store(resp: JSONResponse) -> JSONResponse:
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 def _rget(rec: Any, key: str, default=None):
@@ -715,9 +826,9 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     resolved_user_id = await _resolve_user_id_from_discord(discord_id)
 
-    sid = secrets.token_hex(24)
-    SESSIONS[sid] = {
+    session_user = {
         "id": discord_id,
+        "discordId": discord_id,
         "username": username,
         "globalName": global_name,
         "global_name": global_name,
@@ -725,50 +836,51 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
         "avatarUrl": avatar_url,
         "avatar_url": avatar_url,
         "resolvedUserId": resolved_user_id,
+        "resolved_user_id": resolved_user_id,
     }
 
     resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=303)
-    set_session_cookie(resp, sid)
+    set_session_cookie(resp, session_user)
     return resp
 
 @app.get("/auth02/me")
 async def auth02_me(request: Request):
-    sid = request.cookies.get(COOKIE_NAME)
-    if not sid or sid not in SESSIONS:
-        raise HTTPException(status_code=401, detail="no-session")
+    payload = require_auth_session(request)
 
-    payload = dict(SESSIONS[sid])
-
-    discord_id = str(payload.get("id") or "")
+    discord_id = str(payload.get("id") or payload.get("discordId") or payload.get("discord_id") or "")
     avatar_hash = payload.get("avatar")
     avatar_url = payload.get("avatarUrl") or payload.get("avatar_url")
 
     if not avatar_url and avatar_hash:
         avatar_url = _discord_avatar_url(discord_id, avatar_hash)
 
-    resolved_user_id = payload.get("resolvedUserId")
+    resolved_user_id = payload.get("resolvedUserId") or payload.get("resolved_user_id")
     if not resolved_user_id:
         resolved_user_id = await _resolve_user_id_from_discord(discord_id)
 
-    return {
-        "id": discord_id,
-        "username": payload.get("username"),
-        "globalName": payload.get("globalName") or payload.get("global_name"),
-        "global_name": payload.get("global_name") or payload.get("globalName"),
-        "avatar": avatar_hash,
-        "avatarUrl": avatar_url,
-        "avatar_url": avatar_url,
-        "resolvedUserId": resolved_user_id,
-    }
+    response = JSONResponse(
+        {
+            "id": discord_id,
+            "discordId": discord_id,
+            "discord_id": discord_id,
+            "username": payload.get("username"),
+            "globalName": payload.get("globalName") or payload.get("global_name"),
+            "global_name": payload.get("global_name") or payload.get("globalName"),
+            "avatar": avatar_hash,
+            "avatarUrl": avatar_url,
+            "avatar_url": avatar_url,
+            "resolvedUserId": resolved_user_id,
+            "resolved_user_id": resolved_user_id,
+        }
+    )
+    return _no_store(response)
+
 
 @app.post("/auth02/logout")
 async def auth02_logout(request: Request):
-    sid = request.cookies.get(COOKIE_NAME)
-    if sid:
-        SESSIONS.pop(sid, None)
     resp = JSONResponse({"ok": True})
-    resp.delete_cookie(COOKIE_NAME, path="/")
-    return resp
+    clear_session_cookie(resp)
+    return _no_store(resp)
 
 
 # =================== /auth02/pfps ===================
@@ -778,91 +890,169 @@ MAX_PFPS = 5000
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Guarda/actualiza el PFP global del usuario.
+    Guarda/actualiza el PFP global del usuario autenticado.
+    Ahora usa cookie firmada y persiste por user_id público para que el leaderboard
+    lo pueda ver desde otros navegadores/usuarios.
     """
+    session = require_auth_session(request)
     body = await request.json()
+
     url = (body.get("url") or "").strip()
-    name_lower = (body.get("nameLower") or "").strip().lower()
-    user_id = (body.get("userId") or "").strip()
 
-    sid = request.cookies.get(COOKIE_NAME)
-    session = SESSIONS.get(sid or "", {})
-    discord_id = str(session.get("id") or "")
+    discord_id = str(
+        session.get("id")
+        or session.get("discordId")
+        or session.get("discord_id")
+        or body.get("discordId")
+        or body.get("discord_id")
+        or ""
+    ).strip()
 
-    if not user_id:
-        resolved = await _resolve_user_id_from_discord(discord_id)
-        if resolved:
-            user_id = resolved
+    resolved_user_id = (
+        session.get("resolvedUserId")
+        or session.get("resolved_user_id")
+        or None
+    )
 
-    if not name_lower and session:
-        name_lower = (session.get("username") or "").lower()
+    if not resolved_user_id and discord_id:
+        resolved_user_id = await _resolve_user_id_from_discord(discord_id)
 
-    # Borrado
+    # Preferimos el user_id público real. userId del frontend puede ser Discord ID,
+    # así que sólo se usa como fallback.
+    user_id = str(
+        resolved_user_id
+        or body.get("playerUserId")
+        or body.get("player_user_id")
+        or body.get("playerId")
+        or body.get("player_id")
+        or body.get("resolvedUserId")
+        or body.get("resolved_user_id")
+        or body.get("userId")
+        or body.get("user_id")
+        or ""
+    ).strip()
+
+    player_name = str(
+        body.get("playerName")
+        or body.get("player_name")
+        or body.get("nameLower")
+        or session.get("playerName")
+        or session.get("username")
+        or ""
+    ).strip()
+
+    name_lower = player_name.lower()
+
+    if not user_id and not discord_id and not name_lower:
+        raise HTTPException(400, "missing public player identity")
+
+    # Borrado público
     if url == "":
         if user_id:
-            PFP_BY_ID.pop(user_id, None)
+            PFP_BY_ID.pop(str(user_id), None)
         if discord_id:
-            PFP_BY_DISCORD.pop(discord_id, None)
+            PFP_BY_DISCORD.pop(str(discord_id), None)
         if name_lower:
             PFP_BY_NAME.pop(name_lower, None)
+
         if db_pool and user_id:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM public.player_pfps WHERE user_id = $1",
                     _uid_for_sql(user_id),
                 )
-        return {"ok": True, "deleted": True}
+
+        return _no_store(JSONResponse({"ok": True, "deleted": True}))
 
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
 
-    if not (user_id or discord_id or name_lower):
-        raise HTTPException(400, "missing userId or discordId or nameLower")
-
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    # Guardar en memoria
+    # Memoria local inmediata
     if user_id:
-        PFP_BY_ID[user_id] = url
+        PFP_BY_ID[str(user_id)] = url
     if discord_id:
-        PFP_BY_DISCORD[discord_id] = url
+        PFP_BY_DISCORD[str(discord_id)] = url
     if name_lower:
         PFP_BY_NAME[name_lower] = url
 
-    # Persistir en BD
-    if db_pool:
-        if not user_id and discord_id:
-            resolved = await _resolve_user_id_from_discord(discord_id)
-            if resolved:
-                user_id = resolved
-        if user_id:
-            async with db_pool.acquire() as conn:
-                await conn.execute(
-                    """
-                    INSERT INTO public.player_pfps(user_id, url, updated_at)
-                    VALUES ($1, $2, now())
-                    ON CONFLICT (user_id) DO UPDATE
-                      SET url = EXCLUDED.url,
-                          updated_at = now()
+    # Persistencia real para otros usuarios/leaderboard.
+    if db_pool and user_id:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfps(user_id, url, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (user_id) DO UPDATE
+                  SET url = EXCLUDED.url,
+                      updated_at = now()
                 """,
-                    _uid_for_sql(user_id),
-                    url,
-                )
+                _uid_for_sql(user_id),
+                url,
+            )
 
-    return {
-        "ok": True,
-        "byId": bool(user_id),
-        "byDiscord": bool(discord_id),
-        "byName": bool(name_lower),
-    }
+    return _no_store(
+        JSONResponse(
+            {
+                "ok": True,
+                "userId": user_id or None,
+                "discordId": discord_id or None,
+                "nameLower": name_lower or None,
+                "byId": bool(user_id),
+                "byDiscord": bool(discord_id),
+                "byName": bool(name_lower),
+            }
+        )
+    )
 
 
 @app.get("/auth02/pfps")
 async def list_pfps():
-    return JSONResponse(
-        {"byId": PFP_BY_ID, "byDiscord": PFP_BY_DISCORD, "byName": PFP_BY_NAME}
-    )
+    """
+    Mapa público de PFPs. Devuelve memoria + DB.
+    Esto evita que otro usuario/incógnito no vea el PFP después de un redeploy.
+    """
+    by_id = dict(PFP_BY_ID)
+    by_discord = dict(PFP_BY_DISCORD)
+    by_name = dict(PFP_BY_NAME)
+
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                discord_select = "p.discord_id" if HAS_DISCORD_ID_COL else "NULL::text AS discord_id"
+                rows = await conn.fetch(
+                    f"""
+                    SELECT
+                        pp.user_id::text AS user_id,
+                        pp.url AS url,
+                        p.name AS name,
+                        {discord_select}
+                    FROM public.player_pfps pp
+                    LEFT JOIN public.players p ON p.user_id::text = pp.user_id::text
+                    ORDER BY pp.updated_at DESC
+                    LIMIT $1
+                    """,
+                    MAX_PFPS,
+                )
+
+                for r in rows:
+                    uid = str(r["user_id"]) if r["user_id"] is not None else ""
+                    url = r["url"]
+                    name = (r["name"] or "").strip().lower()
+                    did = str(r["discord_id"] or "").strip()
+
+                    if uid:
+                        by_id[uid] = url
+                    if did:
+                        by_discord[did] = url
+                    if name:
+                        by_name[name] = url
+        except Exception:
+            traceback.print_exc()
+
+    return _no_store(JSONResponse({"byId": by_id, "byDiscord": by_discord, "byName": by_name}))
 
 
 class TitleSelectIn(BaseModel):
@@ -875,13 +1065,10 @@ async def get_auth_titles(request: Request):
     Devuelve los titles disponibles para el usuario autenticado.
     Un title se desbloquea si el usuario terminó Top 1, 2 o 3 en una season cerrada.
     """
-    sid = request.cookies.get(COOKIE_NAME)
-    if not sid or sid not in SESSIONS:
-        raise HTTPException(status_code=401, detail="no-session")
+    session = require_auth_session(request)
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    session = SESSIONS.get(sid or "", {})
     user_id = await _resolved_auth_user_id(session)
     if not user_id:
         return {"available": [], "selected": None}
@@ -903,13 +1090,10 @@ async def set_auth_title(request: Request, body: TitleSelectIn):
     Guarda el title activo del usuario autenticado.
     Solo permite guardar titles que el usuario realmente desbloqueó.
     """
-    sid = request.cookies.get(COOKIE_NAME)
-    if not sid or sid not in SESSIONS:
-        raise HTTPException(status_code=401, detail="no-session")
+    session = require_auth_session(request)
     if not db_pool:
         raise HTTPException(500, "DB pool not initialized")
 
-    session = SESSIONS.get(sid or "", {})
     user_id = await _resolved_auth_user_id(session)
     if not user_id:
         raise HTTPException(400, "could not resolve user id")
