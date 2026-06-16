@@ -213,8 +213,9 @@ HAS_MATCHPLAYERS_TABLE: bool = False  # legacy, no se usa ya
 # results: columna de texto donde está el bloque con songs/diffs
 RESULTS_TEXT_COL: Optional[str] = None
 
-# Tipo SQL efectivo del user_id ("text" o "bigint")
+# Tipo SQL efectivo del user_id / discord_id ("text" o "bigint")
 USER_ID_SQLTYPE: str = "text"  # default seguro
+DISCORD_ID_SQLTYPE: str = "text"  # default seguro
 
 
 async def _has_col(conn: asyncpg.Connection, table: str, column: str) -> bool:
@@ -252,13 +253,14 @@ async def _col_type(conn: asyncpg.Connection, table: str, column: str) -> Option
 async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, PLAYERS_HAS_IN_GUILD
     global SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
-    global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE
+    global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE, DISCORD_ID_SQLTYPE
     global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED
     global HAS_MATCHES_TABLE, HAS_MATCHPLAYERS_TABLE, RESULTS_TEXT_COL
 
     try:
         # players / seasons
         HAS_DISCORD_ID_COL = await _has_col(conn, "players", "discord_id")
+        DISCORD_ID_SQLTYPE = (await _col_type(conn, "players", "discord_id")) or "text"
         PLAYERS_HAS_IN_GUILD = await _has_col(conn, "players", "in_guild")
         SEASONS_HAS_ACTIVE = await _has_col(conn, "seasons", "active")
         SEASONS_HAS_NAME = await _has_col(conn, "seasons", "name")
@@ -302,7 +304,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
 
         logger.info(
             "🔎 Schema: players.discord_id=%s players.in_guild=%s | seasons.active=%s name=%s starts_at=%s ends_at=%s | "
-            "seasonplayers.wins=%s losses=%s games_played=%s | matches_table=%s matchplayers_table=%s | user_id_type=%s | results_text_col=%s",
+            "seasonplayers.wins=%s losses=%s games_played=%s | matches_table=%s matchplayers_table=%s | user_id_type=%s discord_id_type=%s | results_text_col=%s",
             HAS_DISCORD_ID_COL,
             PLAYERS_HAS_IN_GUILD,
             SEASONS_HAS_ACTIVE,
@@ -315,6 +317,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
             HAS_MATCHES_TABLE,
             HAS_MATCHPLAYERS_TABLE,
             USER_ID_SQLTYPE,
+            DISCORD_ID_SQLTYPE,
             RESULTS_TEXT_COL,
         )
     except Exception:
@@ -536,17 +539,132 @@ def _cleanup_state_store():
         STATE_STORE.pop(k, None)
 
 
+def _discord_id_for_sql(discord_id_like: Optional[str]):
+    """
+    Convierte el Discord snowflake al tipo real de public.players.discord_id.
+    Comparar siempre con discord_id::text es seguro para SELECT, pero para UPDATE
+    necesitamos enviar int si la columna es BIGINT.
+    """
+    s = str(discord_id_like or "").strip()
+    if DISCORD_ID_SQLTYPE == "bigint":
+        if not re.fullmatch(r"\d+", s):
+            raise HTTPException(400, "discordId debe ser numérico")
+        return int(s)
+    return s
+
+
+def _identity_norm(value: Optional[str]) -> str:
+    """Normaliza nombres para comparar Discord username/global_name con players.name."""
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = value.encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", "", value.lower()).strip()
+
+
+def _discord_name_candidates(username: Optional[str], global_name: Optional[str]) -> List[str]:
+    """
+    Candidatos seguros para enlazar automáticamente.
+    Ejemplo: username=stickyrice39 y global_name=stickyrice => [stickyrice, stickyrice39].
+    También intenta quitar dígitos finales del username, pero sólo se usa si el match es único.
+    """
+    out: List[str] = []
+    for raw in [global_name, username]:
+        n = _identity_norm(raw)
+        if n and n not in out:
+            out.append(n)
+
+    username_norm = _identity_norm(username)
+    stripped = re.sub(r"\d+$", "", username_norm)
+    if stripped and len(stripped) >= 3 and stripped not in out:
+        out.append(stripped)
+
+    return out
+
+
 async def _resolve_user_id_from_discord(discord_id: str) -> Optional[str]:
     if not (db_pool and HAS_DISCORD_ID_COL and discord_id):
         return None
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT user_id FROM public.players WHERE discord_id = $1 LIMIT 1",
-            discord_id,
+            "SELECT user_id FROM public.players WHERE discord_id::text = $1 LIMIT 1",
+            str(discord_id),
         )
         if row:
             return str(row["user_id"])
     return None
+
+
+async def _resolve_or_link_user_id_from_discord(
+    discord_id: Optional[str],
+    username: Optional[str] = None,
+    global_name: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Resuelve el user_id público del leaderboard a partir del Discord ID.
+
+    Si todavía no existe players.discord_id, intenta enlazar automáticamente por nombre:
+      - compara players.name con Discord global_name / username normalizados
+      - sólo actualiza si hay EXACTAMENTE un jugador candidato
+      - no pisa discord_id de otro usuario
+
+    Esto evita tener que actualizar manualmente player.discord_id para cada jugador.
+    """
+    did = str(discord_id or "").strip()
+    if not (db_pool and HAS_DISCORD_ID_COL and did):
+        return None
+
+    existing = await _resolve_user_id_from_discord(did)
+    if existing:
+        return existing
+
+    candidates = _discord_name_candidates(username, global_name)
+    if not candidates:
+        return None
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, name, discord_id
+                FROM public.players
+                WHERE lower(regexp_replace(coalesce(name, ''), '[^a-zA-Z0-9]+', '', 'g')) = ANY($1::text[])
+                  AND (discord_id IS NULL OR discord_id::text = '' OR discord_id::text = $2)
+                ORDER BY user_id::text ASC
+                LIMIT 5
+                """,
+                candidates,
+                did,
+            )
+
+            if len(rows) != 1:
+                if len(rows) > 1:
+                    logger.warning(
+                        "Auto-link skipped for discord_id=%s username=%s global_name=%s because %s players matched",
+                        did, username, global_name, len(rows),
+                    )
+                return None
+
+            user_id = str(rows[0]["user_id"])
+            await conn.execute(
+                """
+                UPDATE public.players
+                SET discord_id = $2
+                WHERE user_id::text = $1
+                  AND (discord_id IS NULL OR discord_id::text = '' OR discord_id::text = $3)
+                """,
+                user_id,
+                _discord_id_for_sql(did),
+                did,
+            )
+
+            logger.info(
+                "Auto-linked Discord user to player: discord_id=%s username=%s global_name=%s user_id=%s player_name=%s",
+                did, username, global_name, user_id, rows[0]["name"],
+            )
+            return user_id
+
+    except Exception:
+        traceback.print_exc()
+        return None
 
 
 def _valid_https_url(u: str) -> bool:
@@ -579,6 +697,56 @@ def _resolve_pfp_for_player(
         if url:
             return url
     return None
+
+
+async def _persist_public_pfp(
+    user_id: Optional[str],
+    discord_id: Optional[str],
+    url: Optional[str],
+    name: Optional[str] = None,
+) -> bool:
+    """
+    Persiste el PFP en la fuente pública que usa el leaderboard.
+    Login solo no basta si no se escribe en public.player_pfps; por eso
+    guardamos automáticamente cuando Discord devuelve avatar y existe user_id público.
+    """
+    clean_url = (url or "").strip()
+    uid = str(user_id or "").strip()
+    did = str(discord_id or "").strip()
+    name_lower = (name or "").strip().lower()
+
+    if not clean_url or not _valid_https_url(clean_url):
+        return False
+
+    # Cache local del proceso actual. Esto ayuda inmediatamente en este worker.
+    if uid:
+        PFP_BY_ID[uid] = clean_url
+    if did:
+        PFP_BY_DISCORD[did] = clean_url
+    if name_lower:
+        PFP_BY_NAME[name_lower] = clean_url
+
+    # Persistencia pública real. Sin user_id no hay forma segura de asociarlo al player del leaderboard.
+    if not (db_pool and uid):
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfps(user_id, url, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (user_id) DO UPDATE
+                  SET url = EXCLUDED.url,
+                      updated_at = now()
+                """,
+                _uid_for_sql(uid),
+                clean_url,
+            )
+        return True
+    except Exception:
+        traceback.print_exc()
+        return False
 
 
 def _uid_for_sql(user_id_like: Optional[str]):
@@ -824,7 +992,12 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
     avatar_hash = user.get("avatar")
     avatar_url = _discord_avatar_url(discord_id, avatar_hash)
 
-    resolved_user_id = await _resolve_user_id_from_discord(discord_id)
+    resolved_user_id = await _resolve_or_link_user_id_from_discord(discord_id, username, global_name)
+
+    # Publicar el avatar automáticamente al hacer login.
+    # Antes el usuario sólo lo veía localmente; ahora se guarda en player_pfps
+    # para que otros usuarios también lo vean en Leaderboard/History.
+    await _persist_public_pfp(resolved_user_id, discord_id, avatar_url, global_name or username)
 
     session_user = {
         "id": discord_id,
@@ -856,7 +1029,18 @@ async def auth02_me(request: Request):
 
     resolved_user_id = payload.get("resolvedUserId") or payload.get("resolved_user_id")
     if not resolved_user_id:
-        resolved_user_id = await _resolve_user_id_from_discord(discord_id)
+        resolved_user_id = await _resolve_or_link_user_id_from_discord(
+            discord_id,
+            payload.get("username"),
+            payload.get("globalName") or payload.get("global_name"),
+        )
+        if resolved_user_id and avatar_url:
+            await _persist_public_pfp(
+                resolved_user_id,
+                discord_id,
+                avatar_url,
+                payload.get("globalName") or payload.get("global_name") or payload.get("username"),
+            )
 
     response = JSONResponse(
         {
@@ -915,7 +1099,11 @@ async def set_pfp(request: Request):
     )
 
     if not resolved_user_id and discord_id:
-        resolved_user_id = await _resolve_user_id_from_discord(discord_id)
+        resolved_user_id = await _resolve_or_link_user_id_from_discord(
+            discord_id,
+            session.get("username"),
+            session.get("globalName") or session.get("global_name"),
+        )
 
     # Preferimos el user_id público real. userId del frontend puede ser Discord ID,
     # así que sólo se usa como fallback.
@@ -942,6 +1130,13 @@ async def set_pfp(request: Request):
     ).strip()
 
     name_lower = player_name.lower()
+
+    # Si todavía no pudimos resolver user_id, intenta enlazar usando el playerName
+    # enviado por el frontend. Sólo se actualizará si ese nombre coincide con un único player.
+    if not user_id and discord_id and player_name:
+        linked = await _resolve_or_link_user_id_from_discord(discord_id, player_name, player_name)
+        if linked:
+            user_id = str(linked)
 
     if not user_id and not discord_id and not name_lower:
         raise HTTPException(400, "missing public player identity")
