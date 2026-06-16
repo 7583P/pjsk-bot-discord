@@ -144,8 +144,13 @@ def read_session_token(token: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def set_session_cookie(resp, session_user: Dict[str, Any]):
-    token = make_session_token(session_user)
+def set_session_cookie(resp, session_user: Dict[str, Any], token: Optional[str] = None) -> str:
+    """
+    Guarda la sesión en cookie y devuelve el mismo token.
+    El token también se usa como fallback móvil porque algunos WebViews no conservan
+    cookies SameSite=None después del redirect de Discord.
+    """
+    token = token or make_session_token(session_user)
     resp.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=token,
@@ -155,6 +160,7 @@ def set_session_cookie(resp, session_user: Dict[str, Any]):
         path="/",
         max_age=SESSION_MAX_AGE,
     )
+    return token
 
 
 def clear_session_cookie(resp):
@@ -164,8 +170,29 @@ def clear_session_cookie(resp):
     )
 
 
-def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
+def get_session_token_from_request(request: Request) -> Optional[str]:
+    """
+    Orden de autenticación:
+      1) Cookie pjsk_session.
+      2) Authorization: Bearer <token> para móvil/Discord WebView.
+      3) X-PJSK-Session como fallback extra.
+    """
     token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        return token
+
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        bearer = auth.split(" ", 1)[1].strip()
+        if bearer:
+            return bearer
+
+    x_token = (request.headers.get("x-pjsk-session") or "").strip()
+    return x_token or None
+
+
+def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
+    token = get_session_token_from_request(request)
     return read_session_token(token)
 
 
@@ -358,6 +385,12 @@ async def startup():
     logger.info("✅ DB pool initialized")
 
     async with db_pool.acquire() as conn:
+        # Asegura que el backend pueda enlazar Discord -> player sin cambios manuales en DB.
+        try:
+            await conn.execute("ALTER TABLE IF EXISTS public.players ADD COLUMN IF NOT EXISTS discord_id TEXT")
+        except Exception:
+            logger.exception("Could not ensure public.players.discord_id column")
+
         await _detect_schema(conn)
 
         # Crear tablas persistentes
@@ -848,11 +881,17 @@ async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[
 
 
 async def _resolved_auth_user_id(session: Dict[str, Any]) -> Optional[str]:
-    discord_id = str(session.get("id") or "")
-    resolved = session.get("resolvedUserId")
+    discord_id = str(session.get("id") or session.get("discordId") or session.get("discord_id") or "")
+    resolved = session.get("resolvedUserId") or session.get("resolved_user_id")
     if not resolved and discord_id:
         resolved = await _resolve_user_id_from_discord(discord_id)
-    return str(resolved or discord_id or "") or None
+    # Si existe players.discord_id, no uses el Discord ID como user_id público.
+    # Eso causaba PFP/titles incorrectos cuando resolvedUserId venía null.
+    if resolved:
+        return str(resolved)
+    if not HAS_DISCORD_ID_COL and discord_id:
+        return discord_id
+    return None
 
 
 async def _eligible_titles_for_user_id(conn: asyncpg.Connection, user_id: str) -> List[Dict[str, Any]]:
@@ -1012,8 +1051,13 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
         "resolved_user_id": resolved_user_id,
     }
 
-    resp = RedirectResponse(url=f"{FRONT_URL}?verified=1", status_code=303)
-    set_session_cookie(resp, session_user)
+    # Cookie + token fallback:
+    # - Cookie funciona en navegadores normales.
+    # - #pjsk_token funciona en móvil/Discord WebView si la cookie se pierde.
+    session_token = make_session_token(session_user)
+    redirect_url = f"{FRONT_URL}?verified=1#pjsk_token={quote(session_token, safe='')}"
+    resp = RedirectResponse(url=redirect_url, status_code=303)
+    set_session_cookie(resp, session_user, session_token)
     return resp
 
 @app.get("/auth02/me")
@@ -1042,7 +1086,8 @@ async def auth02_me(request: Request):
                 payload.get("globalName") or payload.get("global_name") or payload.get("username"),
             )
 
-    response = JSONResponse(
+    session_user = dict(payload)
+    session_user.update(
         {
             "id": discord_id,
             "discordId": discord_id,
@@ -1057,6 +1102,27 @@ async def auth02_me(request: Request):
             "resolved_user_id": resolved_user_id,
         }
     )
+    auth_token = make_session_token(session_user)
+
+    response = JSONResponse(
+        {
+            "id": discord_id,
+            "discordId": discord_id,
+            "discord_id": discord_id,
+            "username": session_user.get("username"),
+            "globalName": session_user.get("globalName"),
+            "global_name": session_user.get("global_name"),
+            "avatar": avatar_hash,
+            "avatarUrl": avatar_url,
+            "avatar_url": avatar_url,
+            "resolvedUserId": resolved_user_id,
+            "resolved_user_id": resolved_user_id,
+            "needsPlayerLink": not bool(resolved_user_id),
+            "needs_player_link": not bool(resolved_user_id),
+            "authToken": auth_token,
+        }
+    )
+    set_session_cookie(response, session_user, auth_token)
     return _no_store(response)
 
 
@@ -1074,9 +1140,9 @@ MAX_PFPS = 5000
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Guarda/actualiza el PFP global del usuario autenticado.
-    Ahora usa cookie firmada y persiste por user_id público para que el leaderboard
-    lo pueda ver desde otros navegadores/usuarios.
+    Guarda/actualiza el PFP público del usuario autenticado.
+    Regla nueva: si Discord todavía no está linkeado a un player del leaderboard,
+    NO se guarda falso "Saved". Primero debe usarse /auth02/link-player.
     """
     session = require_auth_session(request)
     body = await request.json()
@@ -1105,59 +1171,43 @@ async def set_pfp(request: Request):
             session.get("globalName") or session.get("global_name"),
         )
 
-    # Preferimos el user_id público real. userId del frontend puede ser Discord ID,
-    # así que sólo se usa como fallback.
-    user_id = str(
-        resolved_user_id
-        or body.get("playerUserId")
-        or body.get("player_user_id")
-        or body.get("playerId")
-        or body.get("player_id")
-        or body.get("resolvedUserId")
-        or body.get("resolved_user_id")
-        or body.get("userId")
-        or body.get("user_id")
-        or ""
-    ).strip()
+    if not resolved_user_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "player-not-linked",
+                "message": "Link your Discord account to your leaderboard player before saving PFP.",
+            },
+        )
 
+    user_id = str(resolved_user_id).strip()
     player_name = str(
         body.get("playerName")
         or body.get("player_name")
         or body.get("nameLower")
-        or session.get("playerName")
+        or session.get("globalName")
+        or session.get("global_name")
         or session.get("username")
         or ""
     ).strip()
-
     name_lower = player_name.lower()
-
-    # Si todavía no pudimos resolver user_id, intenta enlazar usando el playerName
-    # enviado por el frontend. Sólo se actualizará si ese nombre coincide con un único player.
-    if not user_id and discord_id and player_name:
-        linked = await _resolve_or_link_user_id_from_discord(discord_id, player_name, player_name)
-        if linked:
-            user_id = str(linked)
-
-    if not user_id and not discord_id and not name_lower:
-        raise HTTPException(400, "missing public player identity")
 
     # Borrado público
     if url == "":
-        if user_id:
-            PFP_BY_ID.pop(str(user_id), None)
+        PFP_BY_ID.pop(str(user_id), None)
         if discord_id:
             PFP_BY_DISCORD.pop(str(discord_id), None)
         if name_lower:
             PFP_BY_NAME.pop(name_lower, None)
 
-        if db_pool and user_id:
+        if db_pool:
             async with db_pool.acquire() as conn:
                 await conn.execute(
                     "DELETE FROM public.player_pfps WHERE user_id = $1",
                     _uid_for_sql(user_id),
                 )
 
-        return _no_store(JSONResponse({"ok": True, "deleted": True}))
+        return _no_store(JSONResponse({"ok": True, "deleted": True, "userId": user_id}))
 
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
@@ -1165,16 +1215,13 @@ async def set_pfp(request: Request):
     if len(PFP_BY_ID) + len(PFP_BY_NAME) + len(PFP_BY_DISCORD) > MAX_PFPS:
         raise HTTPException(429, "pfp store is full")
 
-    # Memoria local inmediata
-    if user_id:
-        PFP_BY_ID[str(user_id)] = url
+    PFP_BY_ID[str(user_id)] = url
     if discord_id:
         PFP_BY_DISCORD[str(discord_id)] = url
     if name_lower:
         PFP_BY_NAME[name_lower] = url
 
-    # Persistencia real para otros usuarios/leaderboard.
-    if db_pool and user_id:
+    if db_pool:
         async with db_pool.acquire() as conn:
             await conn.execute(
                 """
@@ -1192,15 +1239,277 @@ async def set_pfp(request: Request):
         JSONResponse(
             {
                 "ok": True,
-                "userId": user_id or None,
+                "userId": user_id,
                 "discordId": discord_id or None,
                 "nameLower": name_lower or None,
-                "byId": bool(user_id),
+                "byId": True,
                 "byDiscord": bool(discord_id),
                 "byName": bool(name_lower),
             }
         )
     )
+
+
+@app.get("/auth02/link-candidates")
+async def auth02_link_candidates(
+    request: Request,
+    q: str = Query("", description="Search player name"),
+    limit: int = Query(80, ge=1, le=300),
+):
+    """
+    Devuelve jugadores del leaderboard que el usuario logueado puede reclamar/linkear.
+    Sólo muestra players sin discord_id o ya linkeados al mismo Discord ID.
+    """
+    session = require_auth_session(request)
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+    if not HAS_DISCORD_ID_COL:
+        raise HTTPException(500, "players.discord_id column is not available")
+
+    discord_id = str(session.get("id") or session.get("discordId") or session.get("discord_id") or "").strip()
+    if not discord_id:
+        raise HTTPException(401, "missing-discord-session")
+
+    search = (q or "").strip()
+    async with db_pool.acquire() as conn:
+        try:
+            picked = await _pick_effective_season(conn, 0)
+        except Exception:
+            picked = None
+
+        linked_row = await conn.fetchrow(
+            "SELECT user_id::text AS user_id FROM public.players WHERE discord_id::text = $1 LIMIT 1",
+            discord_id,
+        )
+        linked_user_id = linked_row["user_id"] if linked_row else None
+
+        params: List[Any] = [discord_id]
+        where = ["(p.discord_id IS NULL OR p.discord_id::text = '' OR p.discord_id::text = $1)"]
+        if search:
+            params.append(f"%{search}%")
+            where.append(f"p.name ILIKE ${len(params)}")
+
+        where_sql = " AND ".join(where)
+
+        if picked is not None:
+            params.extend([picked, limit])
+            season_idx = len(params) - 1
+            limit_idx = len(params)
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    p.user_id::text AS user_id,
+                    p.name AS name,
+                    p.country AS country,
+                    p.discord_id::text AS discord_id,
+                    sp.mmr AS mmr,
+                    sp.role AS rank,
+                    pp.url AS pfp
+                FROM public.players p
+                INNER JOIN public.seasonplayers sp ON sp.user_id = p.user_id
+                LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
+                WHERE {where_sql}
+                  AND sp.season_id = ${season_idx}
+                ORDER BY
+                    CASE
+                      WHEN lower(p.name) = lower($2) THEN 0
+                      WHEN p.name ILIKE $2 THEN 1
+                      ELSE 2
+                    END,
+                    sp.mmr DESC,
+                    p.name ASC
+                LIMIT ${limit_idx}
+                """ if search else f"""
+                SELECT
+                    p.user_id::text AS user_id,
+                    p.name AS name,
+                    p.country AS country,
+                    p.discord_id::text AS discord_id,
+                    sp.mmr AS mmr,
+                    sp.role AS rank,
+                    pp.url AS pfp
+                FROM public.players p
+                INNER JOIN public.seasonplayers sp ON sp.user_id = p.user_id
+                LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
+                WHERE {where_sql}
+                  AND sp.season_id = ${season_idx}
+                ORDER BY sp.mmr DESC, p.name ASC
+                LIMIT ${limit_idx}
+                """,
+                *params,
+            )
+        else:
+            params.append(limit)
+            limit_idx = len(params)
+            rows = await conn.fetch(
+                f"""
+                SELECT
+                    p.user_id::text AS user_id,
+                    p.name AS name,
+                    p.country AS country,
+                    p.discord_id::text AS discord_id,
+                    NULL::integer AS mmr,
+                    NULL::text AS rank,
+                    pp.url AS pfp
+                FROM public.players p
+                LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
+                WHERE {where_sql}
+                ORDER BY p.name ASC
+                LIMIT ${limit_idx}
+                """,
+                *params,
+            )
+
+    candidates = []
+    for r in rows:
+        candidates.append(
+            {
+                "userId": r["user_id"],
+                "user_id": r["user_id"],
+                "name": r["name"],
+                "country": r["country"],
+                "discordId": r["discord_id"],
+                "discord_id": r["discord_id"],
+                "mmr": r["mmr"],
+                "rank": r["rank"],
+                "pfp": r["pfp"],
+                "alreadyLinkedToMe": str(r["discord_id"] or "") == discord_id,
+            }
+        )
+
+    return _no_store(
+        JSONResponse(
+            {
+                "ok": True,
+                "discordId": discord_id,
+                "linkedUserId": linked_user_id,
+                "needsPlayerLink": not bool(linked_user_id),
+                "candidates": candidates,
+            }
+        )
+    )
+
+
+@app.post("/auth02/link-player")
+async def auth02_link_player(request: Request):
+    """
+    Link explícito Discord -> public.players.user_id.
+    Esto elimina el error resolvedUserId=null sin editar PostgreSQL manualmente.
+    """
+    session = require_auth_session(request)
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+    if not HAS_DISCORD_ID_COL:
+        raise HTTPException(500, "players.discord_id column is not available")
+
+    body = await request.json()
+    user_id = str(
+        body.get("userId")
+        or body.get("user_id")
+        or body.get("playerId")
+        or body.get("player_id")
+        or ""
+    ).strip()
+    if not user_id:
+        raise HTTPException(400, "missing userId")
+
+    discord_id = str(session.get("id") or session.get("discordId") or session.get("discord_id") or "").strip()
+    if not discord_id:
+        raise HTTPException(401, "missing-discord-session")
+
+    avatar_hash = session.get("avatar")
+    avatar_url = session.get("avatarUrl") or session.get("avatar_url")
+    if not avatar_url and avatar_hash:
+        avatar_url = _discord_avatar_url(discord_id, avatar_hash)
+
+    async with db_pool.acquire() as conn:
+        target = await conn.fetchrow(
+            """
+            SELECT user_id::text AS user_id, name, discord_id::text AS discord_id
+            FROM public.players
+            WHERE user_id::text = $1
+            LIMIT 1
+            """,
+            user_id,
+        )
+        if not target:
+            raise HTTPException(404, "player not found")
+
+        used_by_other = await conn.fetchrow(
+            """
+            SELECT user_id::text AS user_id, name
+            FROM public.players
+            WHERE discord_id::text = $1
+              AND user_id::text <> $2
+            LIMIT 1
+            """,
+            discord_id,
+            user_id,
+        )
+        if used_by_other:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "discord-already-linked",
+                    "message": "This Discord account is already linked to another leaderboard player.",
+                    "linkedUserId": used_by_other["user_id"],
+                    "linkedName": used_by_other["name"],
+                },
+            )
+
+        target_discord = str(target["discord_id"] or "").strip()
+        if target_discord and target_discord != discord_id:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "player-already-linked",
+                    "message": "This leaderboard player is already linked to another Discord account.",
+                    "linkedDiscordId": target_discord,
+                },
+            )
+
+        await conn.execute(
+            """
+            UPDATE public.players
+            SET discord_id = $2
+            WHERE user_id::text = $1
+            """,
+            user_id,
+            _discord_id_for_sql(discord_id),
+        )
+
+    await _persist_public_pfp(user_id, discord_id, avatar_url, target["name"] or session.get("username"))
+
+    session_user = dict(session)
+    session_user.update(
+        {
+            "id": discord_id,
+            "discordId": discord_id,
+            "discord_id": discord_id,
+            "avatarUrl": avatar_url,
+            "avatar_url": avatar_url,
+            "resolvedUserId": user_id,
+            "resolved_user_id": user_id,
+            "linkedPlayerName": target["name"],
+        }
+    )
+    auth_token = make_session_token(session_user)
+
+    resp = JSONResponse(
+        {
+            "ok": True,
+            "userId": user_id,
+            "resolvedUserId": user_id,
+            "resolved_user_id": user_id,
+            "discordId": discord_id,
+            "playerName": target["name"],
+            "avatarUrl": avatar_url,
+            "needsPlayerLink": False,
+            "authToken": auth_token,
+        }
+    )
+    set_session_cookie(resp, session_user, auth_token)
+    return _no_store(resp)
 
 
 @app.get("/auth02/pfps")
