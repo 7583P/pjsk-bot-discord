@@ -58,6 +58,88 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 # ===================== FastAPI =====================
 app = FastAPI()
 
+
+# ============================================================
+# PJSK DEPLOY CHECK - TEMPORARY DEBUG
+# ============================================================
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_V8_2026_06_16"
+
+print("======================================================")
+print("[PJSK DEPLOY CHECK] app.py loaded")
+print(f"[PJSK DEPLOY CHECK] version = {PJSK_DEPLOY_VERSION}")
+print(f"[PJSK DEPLOY CHECK] file = {os.path.abspath(__file__)}")
+print("======================================================")
+
+
+@app.get("/auth02/debug-version")
+async def auth02_debug_version():
+    return {
+        "version": PJSK_DEPLOY_VERSION,
+        "file": os.path.abspath(__file__),
+        "frontUrl": FRONT_URL,
+        "discordRedirectUri": DISCORD_REDIRECT_URI,
+        "sessionCookieName": SESSION_COOKIE_NAME,
+        "has_pjsk_token": True,
+        "has_query_token": True,
+        "has_hash_token": True,
+        "has_bearer_auth": True,
+        "has_link_candidates": True,
+        "has_link_player": True,
+        "has_player_not_linked": True,
+    }
+
+
+@app.get("/api/debug-version")
+async def api_debug_version():
+    return {
+        "version": PJSK_DEPLOY_VERSION,
+        "file": os.path.abspath(__file__),
+        "api_rewrite_ok": True,
+    }
+
+
+@app.get("/auth02/debug-request")
+async def auth02_debug_request(request: Request):
+    auth_header = request.headers.get("authorization") or ""
+    cookie_header = request.headers.get("cookie") or ""
+    token_candidates = _candidate_session_tokens_from_request(request)
+    valid_candidate_count = 0
+    for candidate in token_candidates:
+        if read_session_token(candidate):
+            valid_candidate_count += 1
+
+    return _no_store(
+        JSONResponse(
+            {
+                "version": PJSK_DEPLOY_VERSION,
+                "has_authorization_header": bool(auth_header),
+                "authorization_starts_with_bearer": auth_header.lower().startswith("bearer "),
+                "authorization_length": len(auth_header),
+                "has_cookie_header": bool(cookie_header),
+                "cookie_length": len(cookie_header),
+                "has_pjsk_session_cookie": SESSION_COOKIE_NAME in request.cookies,
+                "session_cookie_name": SESSION_COOKIE_NAME,
+                "token_candidate_count": len(token_candidates),
+                "valid_candidate_count": valid_candidate_count,
+            }
+        )
+    )
+
+
+@app.get("/auth02/debug-routes")
+async def auth02_debug_routes():
+    routes = []
+    for route in app.routes:
+        path = getattr(route, "path", "")
+        if "/auth02" in path or "/api/debug" in path:
+            routes.append(
+                {
+                    "path": path,
+                    "methods": sorted(list(getattr(route, "methods", []) or [])),
+                }
+            )
+    return _no_store(JSONResponse({"version": PJSK_DEPLOY_VERSION, "routes": routes}))
+
 _allowed_origins = []
 for raw in [FRONT_URL, CORS_ORIGIN]:
     for o in str(raw or "").split(","):
@@ -167,33 +249,59 @@ def clear_session_cookie(resp):
     resp.delete_cookie(
         key=SESSION_COOKIE_NAME,
         path="/",
+        secure=True,
+        samesite="none",
     )
 
 
-def get_session_token_from_request(request: Request) -> Optional[str]:
+def _candidate_session_tokens_from_request(request: Request) -> List[str]:
     """
-    Orden de autenticación:
-      1) Cookie pjsk_session.
-      2) Authorization: Bearer <token> para móvil/Discord WebView.
-      3) X-PJSK-Session como fallback extra.
+    Devuelve todos los tokens posibles.
+
+    Importante: si existe una cookie vieja/expirada, NO debe bloquear el Bearer token.
+    Por eso get_session_from_request prueba cada candidato hasta encontrar uno válido.
     """
-    token = request.cookies.get(SESSION_COOKIE_NAME)
-    if token:
-        return token
+    out: List[str] = []
+
+    cookie_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_token:
+        out.append(cookie_token)
 
     auth = (request.headers.get("authorization") or "").strip()
     if auth.lower().startswith("bearer "):
         bearer = auth.split(" ", 1)[1].strip()
         if bearer:
-            return bearer
+            out.append(bearer)
 
     x_token = (request.headers.get("x-pjsk-session") or "").strip()
-    return x_token or None
+    if x_token:
+        out.append(x_token)
+
+    # Dedup manteniendo orden.
+    seen = set()
+    deduped: List[str] = []
+    for token in out:
+        if token and token not in seen:
+            seen.add(token)
+            deduped.append(token)
+    return deduped
+
+
+def get_session_token_from_request(request: Request) -> Optional[str]:
+    """
+    Compatibilidad con código anterior: devuelve el primer token recibido.
+    Para validar sesión real usar get_session_from_request().
+    """
+    candidates = _candidate_session_tokens_from_request(request)
+    return candidates[0] if candidates else None
 
 
 def get_session_from_request(request: Request) -> Optional[Dict[str, Any]]:
-    token = get_session_token_from_request(request)
-    return read_session_token(token)
+    for token in _candidate_session_tokens_from_request(request):
+        session = read_session_token(token)
+        if session:
+            return session
+    return None
 
 
 def require_auth_session(request: Request) -> Dict[str, Any]:
@@ -1053,9 +1161,18 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     # Cookie + token fallback:
     # - Cookie funciona en navegadores normales.
-    # - #pjsk_token funciona en móvil/Discord WebView si la cookie se pierde.
+    # - pjsk_token viaja en query y hash para móvil/Discord WebView si la cookie se pierde.
     session_token = make_session_token(session_user)
-    redirect_url = f"{FRONT_URL}?verified=1#pjsk_token={quote(session_token, safe='')}"
+    token_safe = quote(session_token, safe="")
+    sep = "&" if "?" in FRONT_URL else "?"
+    redirect_url = f"{FRONT_URL}{sep}verified=1&pjsk_token={token_safe}#pjsk_token={token_safe}"
+    logger.info(
+        "OAuth redirect ready: discord_id=%s resolved_user_id=%s has_token=%s redirect_front=%s",
+        discord_id,
+        resolved_user_id,
+        bool(session_token),
+        FRONT_URL,
+    )
     resp = RedirectResponse(url=redirect_url, status_code=303)
     set_session_cookie(resp, session_user, session_token)
     return resp
@@ -1147,7 +1264,7 @@ async def set_pfp(request: Request):
     session = require_auth_session(request)
     body = await request.json()
 
-    url = (body.get("url") or "").strip()
+    url = (body.get("url") or body.get("avatarUrl") or body.get("avatar_url") or "").strip()
 
     discord_id = str(
         session.get("id")
