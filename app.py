@@ -3261,3 +3261,14 @@ async def get_card_variants(
 static_dir = os.path.join(os.path.dirname(__file__), "public")
 if os.path.isdir(static_dir):
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="static")
+
+@app.get("/auth02/debug-version")
+async def auth02_debug_version():
+    return {
+        "version": "mobile-auth-pfp-link-fix-debug-v3",
+        "has_pjsk_token": True,
+        "has_bearer_auth": True,
+        "has_link_candidates": True,
+        "has_link_player": True,
+        "has_player_not_linked": True,
+    }
