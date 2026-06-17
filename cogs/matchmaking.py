@@ -1666,6 +1666,46 @@ class Matchmaking(commands.Cog):
 
         return out
 
+    async def _fetch_matches_played_batch(
+        self,
+        season_id: int,
+        user_ids: list[int],
+    ) -> dict[int, int]:
+        """
+        Devuelve cuántas partidas tenía cada usuario en match_history
+        para esta season ANTES de insertar el submit actual.
+
+        Uso visual: permite mostrar [PLACEMENT] solo cuando un usuario
+        Placement normal está jugando su primera partida.
+        """
+        if not user_ids:
+            return {}
+
+        ids = [int(uid) for uid in user_ids]
+
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT user_id, COUNT(*)::int AS matches_played
+                FROM match_history
+                WHERE season_id = $1
+                  AND user_id = ANY($2::bigint[])
+                GROUP BY user_id
+                """,
+                int(season_id),
+                ids,
+            )
+
+        out = {
+            int(r["user_id"]): int(r["matches_played"] or 0)
+            for r in rows
+        }
+
+        for uid in ids:
+            out.setdefault(uid, 0)
+
+        return out
+
 
     async def _assign_queue_role_for_join(
         self, member: discord.Member, join_channel_id: int
@@ -6436,6 +6476,14 @@ class Matchmaking(commands.Cog):
             # Esto NO escribe ni modifica players.country en PostgreSQL.
             country_map = await self._fetch_country_codes_batch([m.id for m in players])
 
+            # --- matches previos por usuario en esta season ---
+            # Se consulta ANTES de insertar el match actual.
+            # Solo Placement normal + 0 partidas previas muestra [PLACEMENT] en results.png.
+            matches_played_before_map = await self._fetch_matches_played_batch(
+                season_id,
+                [m.id for m in players],
+            )
+
             # --- construir players_list ---
             players_list = []
             for member in players:
@@ -6456,6 +6504,17 @@ class Matchmaking(commands.Cog):
                 is_season_placement = self._has_season_placement_role(member)
                 is_rank_placement = (current_role == "Placement")
 
+                matches_played_before = int(matches_played_before_map.get(uid, 0))
+
+                # Visual solamente para results.png:
+                # Placement normal + primera partida de la season.
+                # Season Placement no usa este badge.
+                show_placement_badge = bool(
+                    is_rank_placement
+                    and not is_season_placement
+                    and matches_played_before == 0
+                )
+
                 prev_season_mmr = int(prev_mmr_map.get(uid, 0)) if is_season_placement else 0
 
                 players_list.append(
@@ -6472,6 +6531,8 @@ class Matchmaking(commands.Cog):
                         "is_season_placement": bool(is_season_placement),
                         "prev_season_mmr": prev_season_mmr,
                         "is_rank_placement": bool(is_rank_placement),
+                        "matches_played_before": matches_played_before,
+                        "show_placement_badge": show_placement_badge,
                         "seed_mmr": None,
                         "seed_rank": None,
                     }
@@ -6590,6 +6651,7 @@ class Matchmaking(commands.Cog):
                         p["was_placement"],
                         role_name,  # color del board basado en el rango FINAL
                         p["country_code"],  # ISO2 o __UNKNOWN_FLAG__ para assets/flags/unknown.jpg
+                        p.get("show_placement_badge", False),  # SOLO visual en results.png
                     )
                 )
 
