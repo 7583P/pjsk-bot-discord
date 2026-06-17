@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_SECURE_V10_DIRECT_ID_2026_06_16"
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_SECURE_V12_AUTO_FIRST_PFP_2026_06_16"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -99,7 +99,9 @@ async def auth02_debug_version():
         "allow_public_player_claim": ALLOW_PUBLIC_PLAYER_CLAIM,
         "allow_auto_link_by_name": ALLOW_AUTO_LINK_BY_NAME,
         "allow_direct_user_id_link": ALLOW_DIRECT_USER_ID_LINK,
-        "security_mode": "verified-link-only-with-direct-user-id",
+        "security_mode": "verified-link-only-with-direct-user-id-auto-first-pfp",
+        "pfp_auto_publish": "first-login-only",
+        "pfp_delete_opt_out": True,
     }
 
 
@@ -109,7 +111,9 @@ async def api_debug_version():
         "version": PJSK_DEPLOY_VERSION,
         "file": os.path.abspath(__file__),
         "api_rewrite_ok": True,
-        "security_mode": "verified-link-only",
+        "security_mode": "verified-link-only-auto-first-pfp",
+        "pfp_auto_publish": "first-login-only",
+        "pfp_delete_opt_out": True,
         "allow_public_player_claim": ALLOW_PUBLIC_PLAYER_CLAIM,
         "allow_auto_link_by_name": ALLOW_AUTO_LINK_BY_NAME,
         "allow_direct_user_id_link": ALLOW_DIRECT_USER_ID_LINK,
@@ -541,6 +545,11 @@ async def startup():
           user_id    {uid_type_sql} PRIMARY KEY,
           url        TEXT NOT NULL,
           updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE TABLE IF NOT EXISTS public.player_pfp_settings(
+          user_id             {uid_type_sql} PRIMARY KEY,
+          auto_pfp_disabled   BOOLEAN NOT NULL DEFAULT false,
+          updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS public.player_titles(
           user_id    {uid_type_sql} PRIMARY KEY,
@@ -992,6 +1001,133 @@ async def _persist_public_pfp(
         return False
 
 
+
+async def _set_auto_pfp_disabled(user_id: Optional[str], disabled: bool) -> bool:
+    """
+    Guarda la decisión manual del usuario:
+    - disabled=True  => el usuario borró su PFP; Auth02 NO debe re-publicarla solo.
+    - disabled=False => el usuario guardó/reaplicó PFP; Auth02 puede volver a auto-publicar si en el futuro falta PFP.
+    """
+    uid = str(user_id or "").strip()
+    if not (db_pool and uid):
+        return False
+
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfp_settings(user_id, auto_pfp_disabled, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (user_id) DO UPDATE
+                  SET auto_pfp_disabled = EXCLUDED.auto_pfp_disabled,
+                      updated_at = now()
+                """,
+                _uid_for_sql(uid),
+                bool(disabled),
+            )
+        return True
+    except Exception:
+        logger.exception("Could not update player_pfp_settings for user_id=%s", uid)
+        return False
+
+
+async def _auto_publish_discord_pfp_if_allowed(
+    user_id: Optional[str],
+    discord_id: Optional[str],
+    avatar_url: Optional[str],
+    name: Optional[str] = None,
+) -> bool:
+    """
+    V12: publica automáticamente el avatar de Discord sólo como inicialización segura.
+
+    Reglas:
+    - Requiere resolved_user_id verificado.
+    - Si ya existe public.player_pfps para ese usuario, NO sobreescribe.
+    - Si el usuario borró PFP manualmente, NO lo vuelve a agregar.
+    - Si no existe PFP y no hay opt-out manual, inserta Discord avatar una sola vez.
+
+    Esto conserva el comportamiento deseado: login Auth02 pone PFP automáticamente,
+    pero Delete PFP ya no es deshecho por un refresh/login posterior.
+    """
+    uid = str(user_id or "").strip()
+    did = str(discord_id or "").strip()
+    clean_url = str(avatar_url or "").strip()
+    name_lower = str(name or "").strip().lower()
+
+    if not uid or not clean_url or not _valid_https_url(clean_url):
+        return False
+
+    if not db_pool:
+        # Fallback para entorno sin DB: no hay forma persistente de recordar delete opt-out.
+        # Sólo llena cache si no hay PFP local.
+        if PFP_BY_ID.get(uid):
+            return False
+        PFP_BY_ID[uid] = clean_url
+        if did:
+            PFP_BY_DISCORD[did] = clean_url
+        if name_lower:
+            PFP_BY_NAME[name_lower] = clean_url
+        return True
+
+    try:
+        inserted = False
+        async with db_pool.acquire() as conn:
+            state = await conn.fetchrow(
+                """
+                SELECT
+                  pp.url AS public_url,
+                  COALESCE(s.auto_pfp_disabled, false) AS auto_pfp_disabled
+                FROM (SELECT 1) x
+                LEFT JOIN public.player_pfps pp ON pp.user_id = $1
+                LEFT JOIN public.player_pfp_settings s ON s.user_id = $1
+                """,
+                _uid_for_sql(uid),
+            )
+
+            public_url = str(state["public_url"] or "").strip() if state else ""
+            auto_disabled = bool(state["auto_pfp_disabled"]) if state else False
+
+            if public_url:
+                # Mantén cache alineado con lo público, pero no lo sobreescribas con Discord.
+                PFP_BY_ID[uid] = public_url
+                if did:
+                    PFP_BY_DISCORD[did] = public_url
+                if name_lower:
+                    PFP_BY_NAME[name_lower] = public_url
+                return False
+
+            if auto_disabled:
+                return False
+
+            row = await conn.fetchrow(
+                """
+                INSERT INTO public.player_pfps(user_id, url, updated_at)
+                SELECT $1, $2, now()
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM public.player_pfps WHERE user_id = $1
+                )
+                RETURNING user_id::text AS user_id
+                """,
+                _uid_for_sql(uid),
+                clean_url,
+            )
+            inserted = bool(row)
+
+        if inserted:
+            PFP_BY_ID[uid] = clean_url
+            if did:
+                PFP_BY_DISCORD[did] = clean_url
+            if name_lower:
+                PFP_BY_NAME[name_lower] = clean_url
+            logger.info("Auto-published initial Discord PFP for user_id=%s discord_id=%s", uid, did or None)
+            return True
+
+        return False
+    except Exception:
+        logger.exception("Could not auto-publish initial Discord PFP for user_id=%s", uid)
+        return False
+
+
 def _uid_for_sql(user_id_like: Optional[str]):
     """
     Devuelve el parámetro listo para la query según el tipo de columna:
@@ -1243,10 +1379,10 @@ async def auth02_callback(code: Optional[str] = None, state: Optional[str] = Non
 
     resolved_user_id = await _resolve_or_link_user_id_from_discord(discord_id, username, global_name)
 
-    # Publicar el avatar automáticamente al hacer login.
-    # Antes el usuario sólo lo veía localmente; ahora se guarda en player_pfps
-    # para que otros usuarios también lo vean en Leaderboard/History.
-    await _persist_public_pfp(resolved_user_id, discord_id, avatar_url, global_name or username)
+    # V12: Auth02 publica automáticamente sólo el PFP inicial.
+    # No sobreescribe si ya existe PFP público, y no lo re-agrega si el usuario lo borró.
+    if resolved_user_id and avatar_url:
+        await _auto_publish_discord_pfp_if_allowed(resolved_user_id, discord_id, avatar_url, global_name or username)
 
     session_user = {
         "id": discord_id,
@@ -1297,13 +1433,17 @@ async def auth02_me(request: Request):
             payload.get("username"),
             payload.get("globalName") or payload.get("global_name"),
         )
-        if resolved_user_id and avatar_url:
-            await _persist_public_pfp(
-                resolved_user_id,
-                discord_id,
-                avatar_url,
-                payload.get("globalName") or payload.get("global_name") or payload.get("username"),
-            )
+        # V12: resolved_user_id fue recuperado desde la sesión/DB.
+
+    # V12: si el usuario queda resuelto y todavía no tiene PFP público,
+    # publica Discord avatar una sola vez, salvo que el usuario haya hecho Delete PFP.
+    if resolved_user_id and avatar_url:
+        await _auto_publish_discord_pfp_if_allowed(
+            resolved_user_id,
+            discord_id,
+            avatar_url,
+            payload.get("globalName") or payload.get("global_name") or payload.get("username"),
+        )
 
     session_user = dict(payload)
     session_user.update(
@@ -1359,14 +1499,20 @@ MAX_PFPS = 5000
 @app.post("/auth02/set-pfp")
 async def set_pfp(request: Request):
     """
-    Guarda/actualiza el PFP público del usuario autenticado.
-    Regla nueva: si Discord todavía no está linkeado a un player del leaderboard,
-    NO se guarda falso "Saved". Primero debe usarse /auth02/link-player.
+    Guarda, actualiza o elimina el PFP público del usuario autenticado.
+
+    V12 PFP rules:
+      - /auth02/callback and /auth02/me may auto-publish Discord avatar only once,
+        when the verified player has no public PFP and has not opted out by deleting it.
+      - Save requires action='save' and a valid HTTPS url.
+      - Delete requires action='delete'. Empty url by itself is NOT a delete.
+      - Delete stores an opt-out flag so login/refresh does not re-add the PFP.
     """
     session = require_auth_session(request)
     body = await request.json()
 
-    url = (body.get("url") or body.get("avatarUrl") or body.get("avatar_url") or "").strip()
+    action = str(body.get("action") or "save").strip().lower()
+    url = str(body.get("url") or body.get("avatarUrl") or body.get("avatar_url") or "").strip()
 
     discord_id = str(
         session.get("id")
@@ -1411,8 +1557,7 @@ async def set_pfp(request: Request):
     ).strip()
     name_lower = player_name.lower()
 
-    # Borrado público
-    if url == "":
+    if action == "delete":
         PFP_BY_ID.pop(str(user_id), None)
         if discord_id:
             PFP_BY_DISCORD.pop(str(discord_id), None)
@@ -1425,8 +1570,34 @@ async def set_pfp(request: Request):
                     "DELETE FROM public.player_pfps WHERE user_id = $1",
                     _uid_for_sql(user_id),
                 )
+                await conn.execute(
+                    """
+                    INSERT INTO public.player_pfp_settings(user_id, auto_pfp_disabled, updated_at)
+                    VALUES ($1, true, now())
+                    ON CONFLICT (user_id) DO UPDATE
+                      SET auto_pfp_disabled = true,
+                          updated_at = now()
+                    """,
+                    _uid_for_sql(user_id),
+                )
 
-        return _no_store(JSONResponse({"ok": True, "deleted": True, "userId": user_id}))
+        return _no_store(
+            JSONResponse(
+                {
+                    "ok": True,
+                    "action": "delete",
+                    "deleted": True,
+                    "userId": user_id,
+                    "discordId": discord_id or None,
+                }
+            )
+        )
+
+    if action != "save":
+        raise HTTPException(400, "invalid-pfp-action")
+
+    if not url:
+        raise HTTPException(400, "missing-pfp-url")
 
     if not _valid_https_url(url):
         raise HTTPException(400, "invalid url")
@@ -1453,11 +1624,22 @@ async def set_pfp(request: Request):
                 _uid_for_sql(user_id),
                 url,
             )
+            await conn.execute(
+                """
+                INSERT INTO public.player_pfp_settings(user_id, auto_pfp_disabled, updated_at)
+                VALUES ($1, false, now())
+                ON CONFLICT (user_id) DO UPDATE
+                  SET auto_pfp_disabled = false,
+                      updated_at = now()
+                """,
+                _uid_for_sql(user_id),
+            )
 
     return _no_store(
         JSONResponse(
             {
                 "ok": True,
+                "action": "save",
                 "userId": user_id,
                 "discordId": discord_id or None,
                 "nameLower": name_lower or None,
@@ -1719,7 +1901,10 @@ async def auth02_link_player(request: Request):
             _discord_id_for_sql(discord_id),
         )
 
-    await _persist_public_pfp(user_id, discord_id, avatar_url, target["name"] or session.get("username"))
+    # V12: after a verified link, auto-publish only the initial Discord PFP.
+    # It will not overwrite an existing PFP and will not re-add it after Delete PFP.
+    if user_id and avatar_url:
+        await _auto_publish_discord_pfp_if_allowed(user_id, discord_id, avatar_url, target["name"])
 
     session_user = dict(session)
     session_user.update(
