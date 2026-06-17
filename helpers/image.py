@@ -880,9 +880,24 @@ def _load_rank_logo(rank: str) -> Image.Image | None:
 
 def normalize_summary_row(row: tuple) -> dict:
     """
-    Soporta 3 formatos:
+    Soporta 4 formatos:
 
     Nuevo recomendado:
+      (
+        pos,
+        name,
+        total_points,
+        stats_list,
+        mmr_prev,
+        mmr_delta,
+        mmr_final,
+        was_placement,
+        final_rank_name,
+        country_code,
+        show_placement_badge
+      )
+
+    Compatible con formato actual:
       (
         pos,
         name,
@@ -896,7 +911,7 @@ def normalize_summary_row(row: tuple) -> dict:
         country_code
       )
 
-    Compatible con tu formato actual:
+    Compatible con formato anterior:
       (
         pos,
         name,
@@ -923,8 +938,9 @@ def normalize_summary_row(row: tuple) -> dict:
     """
     country_code = None
     rank_name = None
+    show_placement_badge = False
 
-    if len(row) >= 10:
+    if len(row) >= 11:
         (
             pos,
             name,
@@ -936,7 +952,22 @@ def normalize_summary_row(row: tuple) -> dict:
             was_placement,
             rank_name,
             country_code,
-        ) = row[:10]
+            show_placement_badge,
+        ) = row[:11]
+
+    elif len(row) == 10:
+        (
+            pos,
+            name,
+            points,
+            results,
+            mmr_old,
+            mmr_delta,
+            mmr_new,
+            was_placement,
+            rank_name,
+            country_code,
+        ) = row
 
     elif len(row) == 9:
         (
@@ -965,8 +996,9 @@ def normalize_summary_row(row: tuple) -> dict:
 
     else:
         raise ValueError(
-            "summary row must have 8, 9 or 10 values: "
-            "(pos, name, points, results, mmr_old, mmr_delta, mmr_new, was_placement, rank_name?, country_code?)"
+            "summary row must have 8, 9, 10 or 11 values: "
+            "(pos, name, points, results, mmr_old, mmr_delta, mmr_new, "
+            "was_placement, rank_name?, country_code?, show_placement_badge?)"
         )
 
     name = str(name or "").strip()
@@ -999,8 +1031,8 @@ def normalize_summary_row(row: tuple) -> dict:
         "was_placement": was_placement,
         "rank_name": final_rank,
         "country_code": country_code,
+        "show_placement_badge": bool(show_placement_badge),
     }
-
 
 def generate_results_image(
     summary_rows: List[tuple],
@@ -1026,7 +1058,8 @@ def generate_results_image(
             mmr_final,
             was_placement,
             final_rank_name,
-            country_code
+            country_code,
+            show_placement_badge
         ),
         ...
     ]
@@ -1208,9 +1241,13 @@ def generate_results_image(
             )
             t_y = y + 5
 
-        im.paste(name_img, (X_NAME, t_y), name_img)
+        show_placement_badge = bool(row.get("show_placement_badge", False))
 
-        # Bandera a la derecha del nombre
+        # Preparar bandera antes de dibujar, para poder calcular el rectángulo.
+        flag_img = None
+        flag_x = None
+        flag_y = None
+
         if country_code:
             flag_img = get_flag_image(
                 country_code,
@@ -1225,7 +1262,69 @@ def generate_results_image(
                 flag_x = X_NAME + name_img.width + FLAG_GAP
                 flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
 
-                im.paste(flag_img, (flag_x, flag_y), flag_img)
+        # Badge [PLACEMENT] debajo del usuario.
+        placement_badge_text = "[PLACEMENT]"
+        placement_badge_font = smallist_font
+        placement_badge_color = (255, 112, 0, 255)  # naranja Placement
+
+        badge_bbox = draw.textbbox((0, 0), placement_badge_text, font=placement_badge_font)
+        badge_w = badge_bbox[2] - badge_bbox[0]
+        badge_h = badge_bbox[3] - badge_bbox[1]
+
+        # Calcular ancho del bloque nombre + bandera.
+        content_right = X_NAME + name_img.width
+        if flag_img is not None and flag_x is not None:
+            content_right = max(content_right, flag_x + flag_img.width)
+
+        content_w = max(1, content_right - X_NAME)
+
+        badge_y = t_y + name_img.height + 6
+
+        # Si el badge es más ancho que el nombre+flag, centramos el bloque visual.
+        visual_w = max(content_w, badge_w)
+        visual_left = X_NAME
+        visual_right = visual_left + visual_w
+
+        badge_x = visual_left
+        if badge_w < visual_w:
+            badge_x = visual_left + (visual_w - badge_w) // 2
+
+        # Rectángulo transparente con borde blanco.
+        # Encierra nombre + bandera + [PLACEMENT].
+        if show_placement_badge:
+            pad_x = 14
+            pad_y = 9
+
+            rect_left = visual_left - pad_x
+            rect_top = t_y - pad_y
+            rect_right = visual_right + pad_x
+            rect_bottom = badge_y + badge_h + pad_y + 2
+
+            draw.rounded_rectangle(
+                (rect_left, rect_top, rect_right, rect_bottom),
+                radius=14,
+                fill=(0, 0, 0, 35),
+                outline=(255, 255, 255, 235),
+                width=3,
+            )
+
+        # Nombre
+        im.paste(name_img, (X_NAME, t_y), name_img)
+
+        # Bandera a la derecha del nombre
+        if flag_img is not None and flag_x is not None and flag_y is not None:
+            im.paste(flag_img, (flag_x, flag_y), flag_img)
+
+        # Texto [PLACEMENT] debajo del usuario
+        if show_placement_badge:
+            draw.text(
+                (badge_x, badge_y),
+                placement_badge_text,
+                font=placement_badge_font,
+                fill=placement_badge_color,
+                stroke_width=2,
+                stroke_fill=(25, 10, 0, 255),
+            )
 
         # Results tuple
         draw.text(
