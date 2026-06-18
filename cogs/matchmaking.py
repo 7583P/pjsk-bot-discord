@@ -3908,6 +3908,34 @@ class Matchmaking(commands.Cog):
                 """
             )
 
+            # Blindaje para bases antiguas donde seasonplayers pudo existir sin PK.
+            # Primero se limpian duplicados técnicos exactos por season+user, luego
+            # se crea índice único para que ON CONFLICT(season_id,user_id) sea confiable.
+            await conn.execute(
+                """
+                WITH ranked AS (
+                    SELECT
+                        ctid,
+                        row_number() OVER (
+                            PARTITION BY season_id, user_id
+                            ORDER BY mmr DESC, ctid DESC
+                        ) AS rn
+                    FROM seasonplayers
+                )
+                DELETE FROM seasonplayers sp
+                USING ranked r
+                WHERE sp.ctid = r.ctid
+                  AND r.rn > 1;
+                """
+            )
+
+            await conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_seasonplayers_season_user
+                ON seasonplayers(season_id, user_id);
+                """
+            )
+
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr ON seasonplayers(season_id, mmr DESC);"
             )
