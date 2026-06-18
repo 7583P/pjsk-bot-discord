@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_BACKEND_SEASON_TITLES_V13_2026_06_17"
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_TITLES_LEGACY_FALLBACK_V15_2026_06_18"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -1332,6 +1332,101 @@ def _title_payload(
     }
 
 
+
+def _literal_title_payload(title_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    """
+    Compatibilidad para titles guardados manualmente como texto completo,
+    por ejemplo: "TEST Season 1 1st Place".
+    """
+    raw = str(title_key or "").strip()
+    if not raw:
+        return None
+
+    rank_name = _rank_title_from_any(raw)
+    is_test = raw.upper().startswith("TEST ")
+    if rank_name:
+        return _title_payload(
+            key=raw,
+            season_id=None,
+            season_name=None,
+            title_type="rank",
+            rank=rank_name,
+            label=raw,
+            style_key=_rank_title_style(rank_name),
+            is_test=is_test,
+        )
+
+    place = 1
+    if re.search(r"\b2nd\b", raw, flags=re.I):
+        place = 2
+    elif re.search(r"\b3rd\b", raw, flags=re.I):
+        place = 3
+
+    return _title_payload(
+        key=raw,
+        season_id=None,
+        season_name=None,
+        title_type="place",
+        place=place,
+        label=raw,
+        style_key=_season_title_color(place),
+        is_test=is_test,
+    )
+
+
+def _title_payload_from_selected_row(row: Any) -> Optional[Dict[str, Any]]:
+    """
+    Construye el title activo para payloads públicos.
+
+    Orden de prioridad:
+      1) Inventory moderno: public.player_title_inventory + players.selected_title_key.
+      2) Legacy/manual: public.player_titles.title_key.
+      3) Texto legacy completo como fallback.
+    """
+    inv_title_key = _rget(row, "inv_title_key")
+    if inv_title_key:
+        return _title_payload(
+            key=inv_title_key,
+            season_id=_rget(row, "inv_title_season_id"),
+            season_name=_rget(row, "inv_title_season_name"),
+            title_type=_rget(row, "inv_title_type") or "place",
+            place=_rget(row, "inv_title_place"),
+            rank=_rget(row, "inv_title_rank"),
+            label=_rget(row, "inv_title_label"),
+            style_key=_rget(row, "inv_title_style_key"),
+            is_test=_rget(row, "inv_title_is_test"),
+        )
+
+    title_key = (
+        _rget(row, "effective_title_key")
+        or _rget(row, "selected_title_key")
+        or _rget(row, "legacy_title_key")
+    )
+    if not title_key:
+        return None
+
+    parsed = _parse_title_key(str(title_key))
+    if not parsed:
+        return _literal_title_payload(str(title_key))
+
+    season_name = _rget(row, "effective_title_season_name")
+    if parsed["title_type"] == "rank":
+        return _title_payload(
+            key=str(title_key),
+            season_id=parsed["season_id"],
+            season_name=season_name,
+            title_type="rank",
+            rank=parsed["rank"],
+        )
+
+    return _title_payload(
+        key=str(title_key),
+        season_id=parsed["season_id"],
+        season_name=season_name,
+        title_type="place",
+        place=parsed["place"],
+    )
+
 def _season_title_payload(season_id: Any, season_name: Optional[str], place: Any) -> Dict[str, Any]:
     return _title_payload(
         key=_season_title_key(season_id, place),
@@ -1353,6 +1448,11 @@ async def _ensure_title_schema(conn: asyncpg.Connection) -> None:
     uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
     await conn.execute(
         f"""
+        CREATE TABLE IF NOT EXISTS public.player_titles (
+            user_id {uid_type_sql} PRIMARY KEY,
+            title_key TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
         CREATE TABLE IF NOT EXISTS public.player_title_inventory (
             id BIGSERIAL PRIMARY KEY,
             user_id {uid_type_sql} NOT NULL,
@@ -1415,7 +1515,7 @@ async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[
 
     parsed = _parse_title_key(title_key)
     if not parsed:
-        return None
+        return _literal_title_payload(title_key)
 
     season_name = None
     try:
@@ -2343,6 +2443,9 @@ async def get_players(
                 "pp.url     AS pfp_url",
                 "pp.updated_at AS pfp_updated_at",
                 "p.selected_title_key AS selected_title_key",
+                "pt.title_key AS legacy_title_key",
+                "COALESCE(p.selected_title_key, pt.title_key) AS effective_title_key",
+                "title_s.name AS effective_title_season_name",
                 "pti.title_key AS inv_title_key",
                 "pti.title_label AS inv_title_label",
                 "pti.title_type AS inv_title_type",
@@ -2372,9 +2475,12 @@ async def get_players(
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
                 LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
+                LEFT JOIN public.player_titles pt ON pt.user_id::text = p.user_id::text
+                LEFT JOIN public.seasons title_s
+                  ON title_s.id::text = split_part(COALESCE(p.selected_title_key, pt.title_key), ':', 2)
                 LEFT JOIN public.player_title_inventory pti
                   ON pti.user_id::text = p.user_id::text
-                 AND pti.title_key = p.selected_title_key
+                 AND pti.title_key = COALESCE(p.selected_title_key, pt.title_key)
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -2518,20 +2624,7 @@ async def get_players(
             last10_losses = s.get("losses")
             last10_mmr_delta = s.get("mmr_delta")
 
-        selected_title = None
-        inv_title_key = _rget(r, "inv_title_key")
-        if inv_title_key:
-            selected_title = _title_payload(
-                key=inv_title_key,
-                season_id=_rget(r, "inv_title_season_id"),
-                season_name=_rget(r, "inv_title_season_name"),
-                title_type=_rget(r, "inv_title_type") or "place",
-                place=_rget(r, "inv_title_place"),
-                rank=_rget(r, "inv_title_rank"),
-                label=_rget(r, "inv_title_label"),
-                style_key=_rget(r, "inv_title_style_key"),
-                is_test=_rget(r, "inv_title_is_test"),
-            )
+        selected_title = _title_payload_from_selected_row(r)
 
         out.append(
             {
@@ -2626,6 +2719,320 @@ def extract_songs_from_result_text(result_text: Optional[str]) -> List[Dict[str,
         )
 
     return songs
+
+
+
+# ======================= API: Hall Of Fame / Cutoffs =======================
+HOF_CUTOFF_POSITIONS = [1, 10, 20, 30, 40, 50, 100, 200, 300, 400, 500, 1000]
+
+
+def _rank_from_mmr_for_api(mmr: Any) -> str:
+    n = int(mmr or 0)
+    if n >= 1000:
+        return "Legend"
+    if n >= 950:
+        return "Divine Star"
+    if n >= 900:
+        return "Star"
+    if n >= 850:
+        return "Grand Champion"
+    if n >= 800:
+        return "Champion"
+    if n >= 750:
+        return "Master ⬆"
+    if n >= 700:
+        return "Master"
+    if n >= 650:
+        return "Crystal ⬆"
+    if n >= 600:
+        return "Crystal"
+    if n >= 550:
+        return "Diamond ⬆"
+    if n >= 500:
+        return "Diamond"
+    if n >= 450:
+        return "Platinum ⬆"
+    if n >= 400:
+        return "Platinum"
+    if n >= 350:
+        return "Gold ⬆"
+    if n >= 300:
+        return "Gold"
+    if n >= 250:
+        return "Silver ⬆"
+    if n >= 200:
+        return "Silver"
+    if n >= 150:
+        return "Bronze ⬆"
+    if n >= 100:
+        return "Bronze"
+    if n >= 50:
+        return "Iron ⬆"
+    return "Iron"
+
+
+def _player_payload_for_hof_cutoffs(row: Any) -> Optional[Dict[str, Any]]:
+    user_id = _rget(row, "user_id")
+    if user_id is None:
+        return None
+
+    discord_id = _rget(row, "discord_id") if HAS_DISCORD_ID_COL else None
+    name = _rget(row, "name")
+
+    pfp_url = _rget(row, "pfp_url")
+    pfp_ts = _rget(row, "pfp_updated_at")
+    if pfp_url:
+        try:
+            epoch = int(pfp_ts.timestamp()) if pfp_ts else None
+        except Exception:
+            epoch = None
+        if epoch:
+            sep = "&" if "?" in pfp_url else "?"
+            pfp_url = f"{pfp_url}{sep}v={epoch}"
+    else:
+        pfp_url = _resolve_pfp_for_player(
+            str(user_id) if user_id is not None else None,
+            str(discord_id) if discord_id is not None else None,
+            name,
+        )
+
+    mmr = int(_rget(row, "mmr") or 0)
+    rank = _rget(row, "rank") or _rank_from_mmr_for_api(mmr)
+
+    selected_title = _title_payload_from_selected_row(row)
+
+    return {
+        "id": user_id,
+        "user_id": user_id,
+        "discordId": discord_id,
+        "discord_id": discord_id,
+        "name": name,
+        "country": _rget(row, "country"),
+        "mmr": mmr,
+        "peakMmr": mmr,
+        "peak_mmr": mmr,
+        "rank": rank,
+        "pfp": pfp_url,
+        "seasonTitle": selected_title,
+        "season_title": selected_title,
+        "selectedTitle": selected_title,
+        "selected_title": selected_title,
+        "activeTitle": selected_title,
+        "active_title": selected_title,
+    }
+
+
+def _season_query_columns(alias: str = "s") -> str:
+    name_expr = f"{alias}.name" if SEASONS_HAS_NAME else f"('Season ' || {alias}.id::text)"
+    active_expr = f"{alias}.active" if SEASONS_HAS_ACTIVE else "FALSE"
+    starts_expr = f"{alias}.starts_at" if SEASONS_HAS_STARTS_AT else "NULL::timestamptz"
+    ends_expr = f"{alias}.ends_at" if SEASONS_HAS_ENDS_AT else "NULL::timestamptz"
+    return (
+        f"{alias}.id AS season_id, "
+        f"{name_expr} AS season_name, "
+        f"{active_expr} AS season_active, "
+        f"{starts_expr} AS season_starts_at, "
+        f"{ends_expr} AS season_ends_at"
+    )
+
+
+def _season_payload_from_row(row: Any) -> Dict[str, Any]:
+    starts = _rget(row, "season_starts_at")
+    ends = _rget(row, "season_ends_at")
+    return {
+        "id": _rget(row, "season_id"),
+        "seasonId": _rget(row, "season_id"),
+        "season_id": _rget(row, "season_id"),
+        "name": _rget(row, "season_name"),
+        "seasonName": _rget(row, "season_name"),
+        "season_name": _rget(row, "season_name"),
+        "active": bool(_rget(row, "season_active")),
+        "isCurrent": bool(_rget(row, "season_active")),
+        "is_current": bool(_rget(row, "season_active")),
+        "startsAt": starts.isoformat() if starts else None,
+        "starts_at": starts.isoformat() if starts else None,
+        "endsAt": ends.isoformat() if ends else None,
+        "ends_at": ends.isoformat() if ends else None,
+        "isTestSeason": _is_test_season_name(_rget(row, "season_name")),
+        "is_test_season": _is_test_season_name(_rget(row, "season_name")),
+    }
+
+
+async def _fetch_ranked_season_rows(
+    conn: asyncpg.Connection,
+    *,
+    cutoffs: List[int],
+    include_current: bool,
+    only_winners: bool = False,
+) -> List[Any]:
+    await _ensure_title_schema(conn)
+
+    season_filter = ""
+    if SEASONS_HAS_ACTIVE and not include_current:
+        season_filter = "WHERE COALESCE(s.active, FALSE) = FALSE"
+
+    discord_col = "p.discord_id AS discord_id," if HAS_DISCORD_ID_COL else "NULL::text AS discord_id,"
+    wanted = [1] if only_winners else [int(x) for x in cutoffs]
+
+    q = f"""
+        WITH target_seasons AS (
+            SELECT {_season_query_columns('s')}
+            FROM public.seasons s
+            {season_filter}
+        ),
+        desired AS (
+            SELECT unnest($1::int[])::int AS cutoff_position
+        ),
+        ranked AS (
+            SELECT
+                ts.season_id,
+                sp.user_id,
+                sp.mmr,
+                sp.role AS rank,
+                row_number() OVER (
+                    PARTITION BY ts.season_id
+                    ORDER BY sp.mmr DESC, sp.user_id::text ASC
+                )::int AS position
+            FROM target_seasons ts
+            INNER JOIN public.seasonplayers sp ON sp.season_id = ts.season_id
+        )
+        SELECT
+            ts.season_id,
+            ts.season_name,
+            ts.season_active,
+            ts.season_starts_at,
+            ts.season_ends_at,
+            d.cutoff_position,
+            r.position,
+            r.user_id,
+            r.mmr,
+            r.rank,
+            {discord_col}
+            p.name,
+            p.country,
+            pp.url AS pfp_url,
+            pp.updated_at AS pfp_updated_at,
+            p.selected_title_key AS selected_title_key,
+            pt.title_key AS legacy_title_key,
+            COALESCE(p.selected_title_key, pt.title_key) AS effective_title_key,
+            title_s.name AS effective_title_season_name,
+            pti.title_key AS inv_title_key,
+            pti.title_label AS inv_title_label,
+            pti.title_type AS inv_title_type,
+            pti.place AS inv_title_place,
+            pti.rank AS inv_title_rank,
+            pti.style_key AS inv_title_style_key,
+            pti.season_id AS inv_title_season_id,
+            pti.season_name AS inv_title_season_name,
+            pti.is_test_season AS inv_title_is_test
+        FROM target_seasons ts
+        CROSS JOIN desired d
+        LEFT JOIN ranked r
+          ON r.season_id = ts.season_id
+         AND r.position = d.cutoff_position
+        LEFT JOIN public.players p
+          ON p.user_id = r.user_id
+        LEFT JOIN public.player_pfps pp
+          ON pp.user_id::text = r.user_id::text
+        LEFT JOIN public.player_titles pt
+          ON pt.user_id::text = r.user_id::text
+        LEFT JOIN public.seasons title_s
+          ON title_s.id::text = split_part(COALESCE(p.selected_title_key, pt.title_key), ':', 2)
+        LEFT JOIN public.player_title_inventory pti
+          ON pti.user_id::text = r.user_id::text
+         AND pti.title_key = COALESCE(p.selected_title_key, pt.title_key)
+        ORDER BY ts.season_id DESC, d.cutoff_position ASC
+    """
+
+    return await conn.fetch(q, wanted)
+
+
+@app.get("/api/hall-of-fame")
+async def get_hall_of_fame(
+    include_current: bool = Query(False, description="false = solo seasons cerradas; true = incluye season actual"),
+):
+    """
+    Hall Of Fame de la página: devuelve el Top 1 de cada season.
+    Por defecto solo muestra seasons cerradas para que sean ganadores finales.
+    """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await _fetch_ranked_season_rows(
+                conn,
+                cutoffs=[1],
+                include_current=include_current,
+                only_winners=True,
+            )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"DB error: {e}")
+
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        player = _player_payload_for_hof_cutoffs(r)
+        # En Hall of Fame no mostramos seasons sin ganador.
+        if not player:
+            continue
+        out.append(
+            {
+                **_season_payload_from_row(r),
+                "position": 1,
+                "winner": player,
+                "player": player,
+            }
+        )
+
+    return out
+
+
+@app.get("/api/season-cutoffs")
+async def get_season_cutoffs(
+    include_current: bool = Query(True, description="true = incluye season actual"),
+):
+    """
+    Cutoffs de la página: Top 1, 10, 20, 30, 40, 50, 100, 200, 300, 400, 500 y 1000 por season.
+    Se calcula dinámicamente desde seasonplayers, así se actualiza solo después de season reset.
+    """
+    if not db_pool:
+        raise HTTPException(500, "DB pool not initialized")
+
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await _fetch_ranked_season_rows(
+                conn,
+                cutoffs=HOF_CUTOFF_POSITIONS,
+                include_current=include_current,
+                only_winners=False,
+            )
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"DB error: {e}")
+
+    by_season: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        sid = str(_rget(r, "season_id"))
+        if sid not in by_season:
+            by_season[sid] = {
+                **_season_payload_from_row(r),
+                "cutoffs": [],
+            }
+
+        cutoff = int(_rget(r, "cutoff_position") or 0)
+        position = _rget(r, "position")
+        player = _player_payload_for_hof_cutoffs(r)
+        by_season[sid]["cutoffs"].append(
+            {
+                "top": cutoff,
+                "cutoff": cutoff,
+                "position": int(position) if position is not None else None,
+                "player": player,
+            }
+        )
+
+    return list(by_season.values())
 
 
 # ======================= API: Matches =======================
