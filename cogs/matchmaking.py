@@ -4691,6 +4691,281 @@ class Matchmaking(commands.Cog):
         return await interaction.followup.send("Removed from queue.", ephemeral=True)
 
 
+    # =========================
+    # Season title rewards
+    # =========================
+    SEASON_TITLE_RANKS = ("Star", "Divine Star", "Legend")
+
+    @staticmethod
+    def _season_title_slug(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+    @staticmethod
+    def _season_title_place_suffix(place: int) -> str:
+        place = int(place or 0)
+        if place == 1:
+            return "1st"
+        if place == 2:
+            return "2nd"
+        if place == 3:
+            return "3rd"
+        return str(place)
+
+    @staticmethod
+    def _is_test_season_name(season_name: str | None) -> bool:
+        raw = str(season_name or "").strip().lower()
+        compact = re.sub(r"[\s_-]+", "", raw)
+        if not compact:
+            return False
+        if "alphatest" in compact or "betatest" in compact or "testseason" in compact:
+            return True
+        if compact in {"preseason", "pre", "current", "seasonpreseason"}:
+            return True
+        m = re.search(r"season\s*(\d+)", raw, flags=re.I)
+        if m:
+            return int(m.group(1)) < 2
+        return False
+
+    @classmethod
+    def _season_title_label_for_place(cls, season_name: str, place: int) -> str:
+        base = f"{season_name} {cls._season_title_place_suffix(place)} Place".strip()
+        base = re.sub(r"\s+", " ", base)
+        if cls._is_test_season_name(season_name) and not base.upper().startswith("TEST "):
+            base = f"TEST {base}"
+        return base
+
+    @classmethod
+    def _season_title_label_for_rank(cls, season_name: str, rank: str) -> str:
+        base = f"{season_name} {rank}".strip()
+        base = re.sub(r"\s+", " ", base)
+        if cls._is_test_season_name(season_name) and not base.upper().startswith("TEST "):
+            base = f"TEST {base}"
+        return base
+
+    @staticmethod
+    def _season_title_style_for_place(place: int) -> str:
+        p = int(place or 0)
+        if p == 1:
+            return "gold"
+        if p == 2:
+            return "silver"
+        if p == 3:
+            return "bronze"
+        return "gold"
+
+    @staticmethod
+    def _season_title_style_for_rank(rank: str) -> str:
+        key = str(rank or "").replace(" ", "")
+        if key == "DivineStar":
+            return "rank-DivineStar"
+        if key == "Legend":
+            return "rank-Legend"
+        return "rank-Star"
+
+    @staticmethod
+    def _season_rank_from_peak_mmr(peak_mmr: int | None) -> str | None:
+        mmr = int(peak_mmr or 0)
+        if mmr >= 1000:
+            return "Legend"
+        if mmr >= 950:
+            return "Divine Star"
+        if mmr >= 900:
+            return "Star"
+        return None
+
+    async def _ensure_player_title_inventory_schema(self, conn) -> None:
+        """
+        Inventario permanente de rewards/titles.
+        Nota: no reutilizamos public.player_titles porque versiones previas lo usaban
+        como tabla legacy de selección de un solo title por user_id.
+        """
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS public.player_title_inventory (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                season_id INTEGER NOT NULL,
+                season_name TEXT NOT NULL,
+                title_key TEXT NOT NULL,
+                title_label TEXT NOT NULL,
+                title_type TEXT NOT NULL,
+                place INTEGER,
+                rank TEXT,
+                style_key TEXT NOT NULL,
+                is_test_season BOOLEAN NOT NULL DEFAULT false,
+                earned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(user_id, title_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_player_title_inventory_user
+              ON public.player_title_inventory(user_id);
+            CREATE INDEX IF NOT EXISTS idx_player_title_inventory_season
+              ON public.player_title_inventory(season_id);
+            ALTER TABLE public.players
+              ADD COLUMN IF NOT EXISTS selected_title_key TEXT;
+            """
+        )
+
+    async def _grant_finished_season_titles(self, conn, season_id: int, season_name: str) -> dict:
+        """
+        Otorga rewards de la season terminada de forma idempotente:
+        - Top 1/2/3 final.
+        - Peak rank alcanzado: Star / Divine Star / Legend.
+
+        Es seguro llamarlo desde /seasonreset y desde /migrate_players_to_newseason.
+        ON CONFLICT evita duplicados si se ejecuta más de una vez.
+        """
+        await self._ensure_player_title_inventory_schema(conn)
+
+        season_id = int(season_id)
+        season_name = str(season_name or f"Season {season_id}").strip() or f"Season {season_id}"
+        is_test = self._is_test_season_name(season_name)
+
+        place_payload: list[tuple] = []
+        rank_payload: list[tuple] = []
+
+        try:
+            top_rows = await conn.fetch(
+                """
+                WITH played AS (
+                    SELECT DISTINCT user_id
+                    FROM public.match_history
+                    WHERE season_id = $1
+                ), ranked AS (
+                    SELECT
+                        sp.user_id,
+                        sp.mmr,
+                        sp.role,
+                        ROW_NUMBER() OVER (
+                            ORDER BY sp.mmr DESC, sp.user_id ASC
+                        ) AS place
+                    FROM public.seasonplayers sp
+                    INNER JOIN played p ON p.user_id = sp.user_id
+                    WHERE sp.season_id = $1
+                )
+                SELECT user_id, place, mmr, role
+                FROM ranked
+                WHERE place <= 3
+                ORDER BY place ASC
+                """,
+                season_id,
+            )
+        except Exception:
+            # Fallback si match_history aún no existe o está incompleto.
+            top_rows = await conn.fetch(
+                """
+                SELECT user_id,
+                       ROW_NUMBER() OVER (ORDER BY mmr DESC, user_id ASC) AS place,
+                       mmr,
+                       role
+                FROM public.seasonplayers
+                WHERE season_id = $1
+                  AND mmr > 0
+                ORDER BY place ASC
+                LIMIT 3
+                """,
+                season_id,
+            )
+
+        for r in top_rows:
+            uid = int(r["user_id"])
+            place = int(r["place"])
+            title_key = f"season:{season_id}:place:{place}"
+            title_label = self._season_title_label_for_place(season_name, place)
+            place_payload.append(
+                (
+                    uid,
+                    season_id,
+                    season_name,
+                    title_key,
+                    title_label,
+                    "place",
+                    place,
+                    None,
+                    self._season_title_style_for_place(place),
+                    is_test,
+                )
+            )
+
+        try:
+            peak_rows = await conn.fetch(
+                """
+                SELECT
+                    user_id,
+                    MAX(
+                        CASE
+                            WHEN was_placement THEN mmr_after
+                            ELSE GREATEST(mmr_before, mmr_after)
+                        END
+                    )::int AS peak_mmr
+                FROM public.match_history
+                WHERE season_id = $1
+                GROUP BY user_id
+                HAVING MAX(
+                    CASE
+                        WHEN was_placement THEN mmr_after
+                        ELSE GREATEST(mmr_before, mmr_after)
+                    END
+                ) >= 900
+                ORDER BY peak_mmr DESC, user_id ASC
+                """,
+                season_id,
+            )
+        except Exception:
+            peak_rows = []
+
+        for r in peak_rows:
+            uid = int(r["user_id"])
+            reached_rank = self._season_rank_from_peak_mmr(r["peak_mmr"])
+            if not reached_rank:
+                continue
+            slug = self._season_title_slug(reached_rank)
+            title_key = f"season:{season_id}:rank:{slug}"
+            title_label = self._season_title_label_for_rank(season_name, reached_rank)
+            rank_payload.append(
+                (
+                    uid,
+                    season_id,
+                    season_name,
+                    title_key,
+                    title_label,
+                    "rank",
+                    None,
+                    reached_rank,
+                    self._season_title_style_for_rank(reached_rank),
+                    is_test,
+                )
+            )
+
+        insert_sql = """
+            INSERT INTO public.player_title_inventory (
+                user_id, season_id, season_name, title_key, title_label,
+                title_type, place, rank, style_key, is_test_season
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (user_id, title_key) DO UPDATE SET
+                season_name = EXCLUDED.season_name,
+                title_label = EXCLUDED.title_label,
+                title_type = EXCLUDED.title_type,
+                place = EXCLUDED.place,
+                rank = EXCLUDED.rank,
+                style_key = EXCLUDED.style_key,
+                is_test_season = EXCLUDED.is_test_season
+        """
+
+        if place_payload:
+            await conn.executemany(insert_sql, place_payload)
+        if rank_payload:
+            await conn.executemany(insert_sql, rank_payload)
+
+        return {
+            "season_id": season_id,
+            "season_name": season_name,
+            "place_titles": len(place_payload),
+            "rank_titles": len(rank_payload),
+            "total_titles": len(place_payload) + len(rank_payload),
+        }
+
+
     @app_commands.command(
         name="migrate_players_to_newseason",
         description="Migrates players to the active season."
@@ -4757,8 +5032,14 @@ class Matchmaking(commands.Cog):
         # Solo jugadores registrados que sigan estando en el servidor
         guild_member_ids = {m.id for m in guild.members if not m.bot}
 
+        title_summary = {"place_titles": 0, "rank_titles": 0, "total_titles": 0}
+
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
+                # Fallback fundamental: si la nueva season ya existe,
+                # otorgamos rewards/titles de la season previa antes de migrar.
+                title_summary = await self._grant_finished_season_titles(conn, prev_id, prev_name)
+
                 registered_rows = await conn.fetch("SELECT user_id FROM players")
                 registered_ids = {int(r["user_id"]) for r in registered_rows}
 
@@ -5233,6 +5514,10 @@ class Matchmaking(commands.Cog):
 
                 cur_id = int(cur["id"])
                 cur_name = str(cur["name"])
+
+                # Otorgar rewards/titles de la season que termina ANTES de cerrarla.
+                # Es idempotente: si se vuelve a ejecutar, no duplica títulos.
+                title_summary = await self._grant_finished_season_titles(conn, cur_id, cur_name)
 
                 # cerrar season actual
                 await conn.execute(
