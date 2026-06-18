@@ -882,7 +882,7 @@ def normalize_summary_row(row: tuple) -> dict:
     """
     Soporta 4 formatos:
 
-    Nuevo recomendado:
+    Nuevo recomendado con badge visual:
       (
         pos,
         name,
@@ -1033,6 +1033,7 @@ def normalize_summary_row(row: tuple) -> dict:
         "country_code": country_code,
         "show_placement_badge": bool(show_placement_badge),
     }
+
 
 def generate_results_image(
     summary_rows: List[tuple],
@@ -1243,7 +1244,7 @@ def generate_results_image(
 
         show_placement_badge = bool(row.get("show_placement_badge", False))
 
-        # Preparar bandera antes de dibujar, para poder calcular el rectángulo.
+        # Preparar bandera antes de dibujar para poder calcular el borde.
         flag_img = None
         flag_x = None
         flag_y = None
@@ -1263,6 +1264,7 @@ def generate_results_image(
                 flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
 
         # Badge [PLACEMENT] debajo del usuario.
+        # IMPORTANTE: el rectángulo NO tiene fill para evitar el fondo negro.
         placement_badge_text = "[PLACEMENT]"
         placement_badge_font = smallist_font
         placement_badge_color = (255, 112, 0, 255)  # naranja Placement
@@ -1271,16 +1273,13 @@ def generate_results_image(
         badge_w = badge_bbox[2] - badge_bbox[0]
         badge_h = badge_bbox[3] - badge_bbox[1]
 
-        # Calcular ancho del bloque nombre + bandera.
         content_right = X_NAME + name_img.width
         if flag_img is not None and flag_x is not None:
             content_right = max(content_right, flag_x + flag_img.width)
 
         content_w = max(1, content_right - X_NAME)
-
         badge_y = t_y + name_img.height + 6
 
-        # Si el badge es más ancho que el nombre+flag, centramos el bloque visual.
         visual_w = max(content_w, badge_w)
         visual_left = X_NAME
         visual_right = visual_left + visual_w
@@ -1289,8 +1288,6 @@ def generate_results_image(
         if badge_w < visual_w:
             badge_x = visual_left + (visual_w - badge_w) // 2
 
-        # Rectángulo transparente con borde blanco.
-        # Encierra nombre + bandera + [PLACEMENT].
         if show_placement_badge:
             pad_x = 14
             pad_y = 9
@@ -1300,10 +1297,12 @@ def generate_results_image(
             rect_right = visual_right + pad_x
             rect_bottom = badge_y + badge_h + pad_y + 2
 
+            # Sin fill: interior 100% transparente.
+            # Solo se dibuja el borde blanco alrededor de nombre + bandera + [PLACEMENT].
             draw.rounded_rectangle(
                 (rect_left, rect_top, rect_right, rect_bottom),
                 radius=14,
-                fill=(0, 0, 0, 35),
+                fill=None,
                 outline=(255, 255, 255, 235),
                 width=3,
             )
