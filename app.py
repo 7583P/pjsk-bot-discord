@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_BACKEND_AUTH_PFP_LINK_SECURE_V12_AUTO_FIRST_PFP_2026_06_16"
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_SEASON_TITLES_V13_2026_06_17"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -522,6 +522,10 @@ async def startup():
             logger.exception("Could not ensure public.players.discord_id column")
 
         await _detect_schema(conn)
+
+        # Titles schema: inventario permanente + title seleccionado en players.
+        # Se ejecuta desde código para no depender de SQL manual en Railway.
+        await _ensure_title_schema(conn)
 
         # Crear tablas persistentes
         uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
@@ -1153,8 +1157,57 @@ def _place_suffix(place: int) -> str:
     return str(place)
 
 
+def _title_slug(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def _rank_title_from_slug(value: Any) -> Optional[str]:
+    compact = re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    if compact == "legend":
+        return "Legend"
+    if compact in ("divinestar", "divine"):
+        return "Divine Star"
+    if compact == "star":
+        return "Star"
+    return None
+
+
+def _rank_title_from_any(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if re.search(r"\blegend\b", raw, flags=re.I):
+        return "Legend"
+    if re.search(r"\bdivine\s*star\b", raw, flags=re.I):
+        return "Divine Star"
+    if re.search(r"\bstar\b", raw, flags=re.I):
+        return "Star"
+    return _rank_title_from_slug(raw)
+
+
+def _is_test_season_name(season_name: Any) -> bool:
+    raw = str(season_name or "").strip().lower()
+    compact = re.sub(r"[\s_-]+", "", raw)
+    if not compact:
+        return False
+    if "alphatest" in compact or "betatest" in compact or "testseason" in compact:
+        return True
+    if compact in ("preseason", "pre", "current", "seasonpreseason"):
+        return True
+    m = re.search(r"season\s*(\d+)", raw, flags=re.I)
+    if m:
+        return int(m.group(1)) < 2
+    return False
+
+
 def _season_title_key(season_id: Any, place: Any) -> str:
-    return f"season:{season_id}:{int(place)}"
+    return f"season:{season_id}:place:{int(place)}"
+
+
+def _rank_title_key(season_id: Any, rank: str) -> str:
+    return f"season:{season_id}:rank:{_title_slug(rank)}"
 
 
 def _season_title_color(place: Any) -> str:
@@ -1168,62 +1221,228 @@ def _season_title_color(place: Any) -> str:
     return "gold"
 
 
-def _season_display_label(season_id: Any, season_name: Optional[str]) -> str:
-    raw = str(season_name or "").strip()
-    if not raw:
-        return str(season_id)
-
-    low = raw.lower()
-    if low in ("current", "preseason", "pre-season"):
-        return str(season_id)
-
-    if low.startswith("season "):
-        return raw.split(" ", 1)[1].strip() or str(season_id)
-
-    return raw
+def _rank_title_style(rank: str) -> str:
+    compact = str(rank or "").replace(" ", "")
+    if compact == "Legend":
+        return "rank-Legend"
+    if compact == "DivineStar":
+        return "rank-DivineStar"
+    return "rank-Star"
 
 
-def _season_title_payload(season_id: Any, season_name: Optional[str], place: Any) -> Dict[str, Any]:
-    p = int(place)
-    season_label = _season_display_label(season_id, season_name)
+def _format_title_label(season_name: Optional[str], title_type: str, place: Any = None, rank: Any = None, is_test: bool = False) -> str:
+    visible_season = str(season_name or "").strip() or "Season"
+    if str(title_type or "").lower() == "rank":
+        body = f"{visible_season} {rank or ''}".strip()
+    else:
+        body = f"{visible_season} {_place_suffix(int(place or 0))} Place".strip()
+    body = re.sub(r"\s+", " ", body)
+    if (is_test or _is_test_season_name(visible_season)) and not body.upper().startswith("TEST "):
+        body = f"TEST {body}"
+    return body
+
+
+def _parse_title_key(title_key: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not title_key:
+        return None
+    key = str(title_key).strip()
+
+    # New keys: season:<id>:place:<1|2|3>
+    m = re.fullmatch(r"(?:season|reward):([^:]+):place:([123])", key, flags=re.I)
+    if m:
+        return {"season_id": m.group(1), "title_type": "place", "place": int(m.group(2)), "rank": None}
+
+    # Legacy keys: season:<id>:<1|2|3> / reward:<id>:<1|2|3>
+    m = re.fullmatch(r"(?:season|reward):([^:]+):([123])", key, flags=re.I)
+    if m:
+        return {"season_id": m.group(1), "title_type": "place", "place": int(m.group(2)), "rank": None}
+
+    # Rank keys: season:<id>:rank:<star|divine-star|legend>
+    m = re.fullmatch(r"(?:season|reward):([^:]+):rank:([^:]+)", key, flags=re.I)
+    if m:
+        rank = _rank_title_from_slug(m.group(2))
+        if rank:
+            return {"season_id": m.group(1), "title_type": "rank", "place": None, "rank": rank}
+
+    return None
+
+
+def _title_payload(
+    *,
+    key: str,
+    season_id: Any,
+    season_name: Optional[str],
+    title_type: str,
+    place: Any = None,
+    rank: Any = None,
+    label: Optional[str] = None,
+    style_key: Optional[str] = None,
+    is_test: Optional[bool] = None,
+) -> Dict[str, Any]:
+    title_type = str(title_type or "place").lower()
+    is_test_bool = bool(_is_test_season_name(season_name) if is_test is None else is_test)
+
+    if title_type == "rank":
+        rank_name = _rank_title_from_any(rank) or "Star"
+        final_style = style_key or _rank_title_style(rank_name)
+        final_label = label or _format_title_label(season_name, "rank", rank=rank_name, is_test=is_test_bool)
+        final_key = key or _rank_title_key(season_id, rank_name)
+        return {
+            "key": final_key,
+            "titleKey": final_key,
+            "title_key": final_key,
+            "label": final_label,
+            "seasonId": season_id,
+            "season_id": season_id,
+            "seasonName": season_name,
+            "season_name": season_name,
+            "type": "rank",
+            "titleType": "rank",
+            "title_type": "rank",
+            "rank": rank_name,
+            "styleKey": final_style,
+            "style_key": final_style,
+            "color": final_style,
+            "isTestSeason": is_test_bool,
+            "is_test_season": is_test_bool,
+        }
+
+    p = int(place or 0)
+    final_style = style_key or _season_title_color(p)
+    final_label = label or _format_title_label(season_name, "place", place=p, is_test=is_test_bool)
+    final_key = key or _season_title_key(season_id, p)
     return {
-        "key": _season_title_key(season_id, p),
-        "titleKey": _season_title_key(season_id, p),
-        "label": f"Season {season_label} {_place_suffix(p)} Place",
+        "key": final_key,
+        "titleKey": final_key,
+        "title_key": final_key,
+        "label": final_label,
         "seasonId": season_id,
         "season_id": season_id,
         "seasonName": season_name,
         "season_name": season_name,
+        "type": "place",
+        "titleType": "place",
+        "title_type": "place",
         "place": p,
-        "color": _season_title_color(p),
+        "styleKey": final_style,
+        "style_key": final_style,
+        "color": final_style,
+        "isTestSeason": is_test_bool,
+        "is_test_season": is_test_bool,
     }
 
 
+def _season_title_payload(season_id: Any, season_name: Optional[str], place: Any) -> Dict[str, Any]:
+    return _title_payload(
+        key=_season_title_key(season_id, place),
+        season_id=season_id,
+        season_name=season_name,
+        title_type="place",
+        place=place,
+    )
+
+
 def _parse_season_title_key(title_key: Optional[str]) -> Optional[Tuple[str, int]]:
+    parsed = _parse_title_key(title_key)
+    if not parsed or parsed.get("title_type") != "place":
+        return None
+    return str(parsed["season_id"]), int(parsed["place"])
+
+
+async def _ensure_title_schema(conn: asyncpg.Connection) -> None:
+    uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
+    await conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS public.player_title_inventory (
+            id BIGSERIAL PRIMARY KEY,
+            user_id {uid_type_sql} NOT NULL,
+            season_id INTEGER NOT NULL,
+            season_name TEXT NOT NULL,
+            title_key TEXT NOT NULL,
+            title_label TEXT NOT NULL,
+            title_type TEXT NOT NULL,
+            place INTEGER,
+            rank TEXT,
+            style_key TEXT NOT NULL,
+            is_test_season BOOLEAN NOT NULL DEFAULT false,
+            earned_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            UNIQUE(user_id, title_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_player_title_inventory_user
+          ON public.player_title_inventory(user_id);
+        CREATE INDEX IF NOT EXISTS idx_player_title_inventory_season
+          ON public.player_title_inventory(season_id);
+        ALTER TABLE IF EXISTS public.players
+          ADD COLUMN IF NOT EXISTS selected_title_key TEXT;
+        """
+    )
+
+
+async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[str], user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
     if not title_key:
         return None
-    m = re.fullmatch(r"season:([^:]+):(1|2|3)", str(title_key).strip())
-    if not m:
-        return None
-    return m.group(1), int(m.group(2))
 
+    await _ensure_title_schema(conn)
 
-async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[str]) -> Optional[Dict[str, Any]]:
-    parsed = _parse_season_title_key(title_key)
+    params: List[Any] = [str(title_key)]
+    user_filter = ""
+    if user_id:
+        user_filter = " AND user_id::text = $2"
+        params.append(str(user_id))
+
+    row = await conn.fetchrow(
+        f"""
+        SELECT user_id, season_id, season_name, title_key, title_label,
+               title_type, place, rank, style_key, is_test_season
+        FROM public.player_title_inventory
+        WHERE title_key = $1{user_filter}
+        LIMIT 1
+        """,
+        *params,
+    )
+    if row:
+        return _title_payload(
+            key=row["title_key"],
+            season_id=row["season_id"],
+            season_name=row["season_name"],
+            title_type=row["title_type"],
+            place=row["place"],
+            rank=row["rank"],
+            label=row["title_label"],
+            style_key=row["style_key"],
+            is_test=row["is_test_season"],
+        )
+
+    parsed = _parse_title_key(title_key)
     if not parsed:
         return None
-    season_id, place = parsed
+
     season_name = None
     try:
-        row = await conn.fetchrow(
+        srow = await conn.fetchrow(
             "SELECT name FROM public.seasons WHERE id::text = $1 LIMIT 1",
-            str(season_id),
+            str(parsed["season_id"]),
         )
-        if row:
-            season_name = row["name"]
+        if srow:
+            season_name = srow["name"]
     except Exception:
         season_name = None
-    return _season_title_payload(season_id, season_name, place)
+
+    if parsed["title_type"] == "rank":
+        return _title_payload(
+            key=str(title_key),
+            season_id=parsed["season_id"],
+            season_name=season_name,
+            title_type="rank",
+            rank=parsed["rank"],
+        )
+    return _title_payload(
+        key=str(title_key),
+        season_id=parsed["season_id"],
+        season_name=season_name,
+        title_type="place",
+        place=parsed["place"],
+    )
 
 
 async def _resolved_auth_user_id(session: Dict[str, Any]) -> Optional[str]:
@@ -1244,44 +1463,36 @@ async def _eligible_titles_for_user_id(conn: asyncpg.Connection, user_id: str) -
     if not user_id:
         return []
 
-    name_expr = "s.name" if SEASONS_HAS_NAME else "NULL::text"
-    filters = []
-    if SEASONS_HAS_ACTIVE:
-        filters.append("(s.active IS DISTINCT FROM TRUE)")
-    if SEASONS_HAS_NAME:
-        filters.append("(s.name IS NULL OR lower(s.name) NOT IN ('current','preseason','pre-season'))")
-
-    where_sql = ""
-    if filters:
-        where_sql = "WHERE " + " AND ".join(filters)
+    await _ensure_title_schema(conn)
 
     rows = await conn.fetch(
-        f"""
-        WITH ranked AS (
-            SELECT
-                sp.season_id,
-                {name_expr} AS season_name,
-                sp.user_id,
-                sp.mmr,
-                row_number() OVER (
-                    PARTITION BY sp.season_id
-                    ORDER BY sp.mmr DESC, sp.user_id::text ASC
-                ) AS rn
-            FROM public.seasonplayers sp
-            LEFT JOIN public.seasons s ON s.id = sp.season_id
-            {where_sql}
-        )
-        SELECT season_id, season_name, rn AS place
-        FROM ranked
+        """
+        SELECT season_id, season_name, title_key, title_label,
+               title_type, place, rank, style_key, is_test_season, earned_at
+        FROM public.player_title_inventory
         WHERE user_id::text = $1
-          AND rn <= 3
-        ORDER BY season_id DESC, rn ASC
+        ORDER BY
+          season_id DESC,
+          CASE title_type WHEN 'place' THEN 0 ELSE 1 END,
+          COALESCE(place, 99) ASC,
+          CASE rank WHEN 'Legend' THEN 0 WHEN 'Divine Star' THEN 1 WHEN 'Star' THEN 2 ELSE 9 END,
+          earned_at DESC
         """,
         str(user_id),
     )
 
     return [
-        _season_title_payload(r["season_id"], r["season_name"], r["place"])
+        _title_payload(
+            key=r["title_key"],
+            season_id=r["season_id"],
+            season_name=r["season_name"],
+            title_type=r["title_type"],
+            place=r["place"],
+            rank=r["rank"],
+            label=r["title_label"],
+            style_key=r["style_key"],
+            is_test=r["is_test_season"],
+        )
         for r in rows
     ]
 
@@ -1289,13 +1500,28 @@ async def _eligible_titles_for_user_id(conn: asyncpg.Connection, user_id: str) -
 async def _selected_title_for_user_id(conn: asyncpg.Connection, user_id: str) -> Optional[Dict[str, Any]]:
     if not user_id:
         return None
-    row = await conn.fetchrow(
-        "SELECT title_key FROM public.player_titles WHERE user_id::text = $1 LIMIT 1",
+
+    await _ensure_title_schema(conn)
+
+    title_key = await conn.fetchval(
+        "SELECT selected_title_key FROM public.players WHERE user_id::text = $1 LIMIT 1",
         str(user_id),
     )
-    if not row:
+
+    # Legacy fallback: versiones anteriores guardaban el seleccionado en public.player_titles.
+    if not title_key:
+        try:
+            title_key = await conn.fetchval(
+                "SELECT title_key FROM public.player_titles WHERE user_id::text = $1 LIMIT 1",
+                str(user_id),
+            )
+        except Exception:
+            title_key = None
+
+    if not title_key:
         return None
-    return await _title_payload_from_key(conn, row["title_key"])
+
+    return await _title_payload_from_key(conn, title_key, user_id=user_id)
 
 
 @app.get("/health")
@@ -1993,7 +2219,7 @@ class TitleSelectIn(BaseModel):
 async def get_auth_titles(request: Request):
     """
     Devuelve los titles disponibles para el usuario autenticado.
-    Un title se desbloquea si el usuario terminó Top 1, 2 o 3 en una season cerrada.
+    Un title se desbloquea si el usuario terminó Top 1/2/3 o alcanzó Star/Divine Star/Legend en una season cerrada.
     """
     session = require_auth_session(request)
     if not db_pool:
@@ -2031,11 +2257,21 @@ async def set_auth_title(request: Request, body: TitleSelectIn):
     title_key = (body.titleKey or "").strip()
 
     async with db_pool.acquire() as conn:
+        await _ensure_title_schema(conn)
+
         if title_key == "":
             await conn.execute(
-                "DELETE FROM public.player_titles WHERE user_id = $1",
-                _uid_for_sql(user_id),
+                "UPDATE public.players SET selected_title_key = NULL WHERE user_id::text = $1",
+                str(user_id),
             )
+            # Legacy cleanup only for the old selection table. It does NOT delete inventory titles.
+            try:
+                await conn.execute(
+                    "DELETE FROM public.player_titles WHERE user_id::text = $1",
+                    str(user_id),
+                )
+            except Exception:
+                pass
             return {"ok": True, "selected": None}
 
         available = await _eligible_titles_for_user_id(conn, user_id)
@@ -2044,16 +2280,26 @@ async def set_auth_title(request: Request, body: TitleSelectIn):
             raise HTTPException(403, "title not unlocked")
 
         await conn.execute(
-            """
-            INSERT INTO public.player_titles(user_id, title_key, updated_at)
-            VALUES ($1, $2, now())
-            ON CONFLICT (user_id) DO UPDATE
-              SET title_key = EXCLUDED.title_key,
-                  updated_at = now()
-            """,
-            _uid_for_sql(user_id),
+            "UPDATE public.players SET selected_title_key = $2 WHERE user_id::text = $1",
+            str(user_id),
             title_key,
         )
+
+        # Mantener compatibilidad con la tabla legacy si existe.
+        try:
+            await conn.execute(
+                """
+                INSERT INTO public.player_titles(user_id, title_key, updated_at)
+                VALUES ($1, $2, now())
+                ON CONFLICT (user_id) DO UPDATE
+                  SET title_key = EXCLUDED.title_key,
+                      updated_at = now()
+                """,
+                _uid_for_sql(user_id),
+                title_key,
+            )
+        except Exception:
+            pass
 
         return {"ok": True, "selected": allowed[title_key]}
 
@@ -2084,6 +2330,7 @@ async def get_players(
         async with db_pool.acquire() as conn:
             # Re-detectar match_history si el bot la creó después del startup
             await _ensure_matches_table(conn)
+            await _ensure_title_schema(conn)
 
             picked = await _pick_effective_season(conn, season_id)
 
@@ -2095,8 +2342,16 @@ async def get_players(
                 "sp.role    AS rank",
                 "pp.url     AS pfp_url",
                 "pp.updated_at AS pfp_updated_at",
-                "pt.title_key AS title_key",
-                "ts.name AS title_season_name",
+                "p.selected_title_key AS selected_title_key",
+                "pti.title_key AS inv_title_key",
+                "pti.title_label AS inv_title_label",
+                "pti.title_type AS inv_title_type",
+                "pti.place AS inv_title_place",
+                "pti.rank AS inv_title_rank",
+                "pti.style_key AS inv_title_style_key",
+                "pti.season_id AS inv_title_season_id",
+                "pti.season_name AS inv_title_season_name",
+                "pti.is_test_season AS inv_title_is_test",
             ]
             if HAS_DISCORD_ID_COL:
                 select_cols.insert(1, "p.discord_id AS discord_id")
@@ -2117,8 +2372,9 @@ async def get_players(
                 FROM public.players p
                 INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
                 LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
-                LEFT JOIN public.player_titles pt ON pt.user_id::text = p.user_id::text
-                LEFT JOIN public.seasons ts ON ts.id::text = split_part(pt.title_key, ':', 2)
+                LEFT JOIN public.player_title_inventory pti
+                  ON pti.user_id::text = p.user_id::text
+                 AND pti.title_key = p.selected_title_key
                 WHERE sp.season_id = $1
                 ORDER BY sp.mmr DESC
                 LIMIT $2 OFFSET $3
@@ -2263,14 +2519,18 @@ async def get_players(
             last10_mmr_delta = s.get("mmr_delta")
 
         selected_title = None
-        title_key = _rget(r, "title_key")
-        parsed_title = _parse_season_title_key(title_key)
-        if parsed_title:
-            title_season_id, title_place = parsed_title
-            selected_title = _season_title_payload(
-                title_season_id,
-                _rget(r, "title_season_name"),
-                title_place,
+        inv_title_key = _rget(r, "inv_title_key")
+        if inv_title_key:
+            selected_title = _title_payload(
+                key=inv_title_key,
+                season_id=_rget(r, "inv_title_season_id"),
+                season_name=_rget(r, "inv_title_season_name"),
+                title_type=_rget(r, "inv_title_type") or "place",
+                place=_rget(r, "inv_title_place"),
+                rank=_rget(r, "inv_title_rank"),
+                label=_rget(r, "inv_title_label"),
+                style_key=_rget(r, "inv_title_style_key"),
+                is_test=_rget(r, "inv_title_is_test"),
             )
 
         out.append(
