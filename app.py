@@ -757,22 +757,6 @@ async def list_seasons():
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(q)
 
-    picked_is_current = False
-    if rows:
-        try:
-            async with db_pool.acquire() as conn:
-                if SEASONS_HAS_ACTIVE:
-                    picked_is_current = bool(
-                        await conn.fetchval(
-                            "SELECT COALESCE(active, FALSE) FROM public.seasons WHERE id = $1",
-                            picked,
-                        )
-                    )
-                else:
-                    latest_id = await conn.fetchval("SELECT MAX(id) FROM public.seasons")
-                    picked_is_current = str(latest_id) == str(picked)
-        except Exception:
-            picked_is_current = False
 
     out = []
     for r in rows:
@@ -2541,6 +2525,22 @@ async def get_players(
             await _ensure_title_schema(conn)
 
             picked = await _pick_effective_season(conn, season_id)
+
+            # Necesario para mostrar Season Placement sólo en la season activa.
+            # Antes faltaba esta variable y /api/players podía romper o devolver vacío.
+            try:
+                if SEASONS_HAS_ACTIVE:
+                    picked_is_current = bool(
+                        await conn.fetchval(
+                            "SELECT COALESCE(active, FALSE) FROM public.seasons WHERE id = $1",
+                            picked,
+                        )
+                    )
+                else:
+                    latest_id = await conn.fetchval("SELECT MAX(id) FROM public.seasons")
+                    picked_is_current = str(latest_id) == str(picked)
+            except Exception:
+                picked_is_current = False
 
             select_cols = [
                 "p.user_id  AS user_id",
