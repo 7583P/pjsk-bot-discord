@@ -497,6 +497,94 @@ async def _ensure_matches_table(conn: asyncpg.Connection) -> None:
         traceback.print_exc()
 
 
+async def _ensure_leaderboard_integrity_schema(conn: asyncpg.Connection) -> None:
+    """
+    Blindaje anti-duplicados para leaderboard/cutoffs.
+
+    No mergea jugadores distintos por nombre porque eso puede borrar cuentas reales.
+    Solo elimina duplicados técnicos seguros:
+      - misma season_id + mismo user_id en seasonplayers
+      - mismo user_id en player_titles
+      - mismo user_id + mismo title_key en player_title_inventory
+    Luego crea índices únicos para que el problema no vuelva.
+    """
+    try:
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+              IF to_regclass('public.seasonplayers') IS NOT NULL THEN
+                WITH ranked AS (
+                  SELECT
+                    ctid,
+                    row_number() OVER (
+                      PARTITION BY season_id, user_id
+                      ORDER BY mmr DESC, ctid DESC
+                    ) AS rn
+                  FROM public.seasonplayers
+                )
+                DELETE FROM public.seasonplayers sp
+                USING ranked r
+                WHERE sp.ctid = r.ctid
+                  AND r.rn > 1;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_seasonplayers_season_user
+                  ON public.seasonplayers(season_id, user_id);
+
+                CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr
+                  ON public.seasonplayers(season_id, mmr DESC);
+              END IF;
+
+              IF to_regclass('public.player_titles') IS NOT NULL THEN
+                WITH ranked AS (
+                  SELECT
+                    ctid,
+                    row_number() OVER (
+                      PARTITION BY user_id
+                      ORDER BY updated_at DESC NULLS LAST, ctid DESC
+                    ) AS rn
+                  FROM public.player_titles
+                )
+                DELETE FROM public.player_titles pt
+                USING ranked r
+                WHERE pt.ctid = r.ctid
+                  AND r.rn > 1;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_player_titles_user
+                  ON public.player_titles(user_id);
+              END IF;
+
+              IF to_regclass('public.player_title_inventory') IS NOT NULL THEN
+                WITH ranked AS (
+                  SELECT
+                    ctid,
+                    row_number() OVER (
+                      PARTITION BY user_id, title_key
+                      ORDER BY earned_at DESC NULLS LAST, id DESC NULLS LAST, ctid DESC
+                    ) AS rn
+                  FROM public.player_title_inventory
+                )
+                DELETE FROM public.player_title_inventory pti
+                USING ranked r
+                WHERE pti.ctid = r.ctid
+                  AND r.rn > 1;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS uq_player_title_inventory_user_key
+                  ON public.player_title_inventory(user_id, title_key);
+              END IF;
+
+              IF to_regclass('public.players') IS NOT NULL THEN
+                CREATE INDEX IF NOT EXISTS idx_players_discord_id
+                  ON public.players(discord_id)
+                  WHERE discord_id IS NOT NULL AND discord_id <> '';
+              END IF;
+            END$$;
+            """
+        )
+    except Exception:
+        logger.exception("Could not ensure leaderboard integrity schema")
+
+
 @app.on_event("startup")
 async def startup():
     global db_pool, _cards_task, _cards_stop
@@ -526,6 +614,9 @@ async def startup():
         # Titles schema: inventario permanente + title seleccionado en players.
         # Se ejecuta desde código para no depender de SQL manual en Railway.
         await _ensure_title_schema(conn)
+
+        # Evita duplicados técnicos que pueden multiplicar filas en leaderboard/cutoffs.
+        await _ensure_leaderboard_integrity_schema(conn)
 
         # Crear tablas persistentes
         uid_type_sql = "BIGINT" if USER_ID_SQLTYPE == "bigint" else "TEXT"
@@ -665,6 +756,23 @@ async def list_seasons():
     q = f"SELECT {select_cols} FROM public.seasons ORDER BY id DESC"
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(q)
+
+    picked_is_current = False
+    if rows:
+        try:
+            async with db_pool.acquire() as conn:
+                if SEASONS_HAS_ACTIVE:
+                    picked_is_current = bool(
+                        await conn.fetchval(
+                            "SELECT COALESCE(active, FALSE) FROM public.seasons WHERE id = $1",
+                            picked,
+                        )
+                    )
+                else:
+                    latest_id = await conn.fetchval("SELECT MAX(id) FROM public.seasons")
+                    picked_is_current = str(latest_id) == str(picked)
+        except Exception:
+            picked_is_current = False
 
     out = []
     for r in rows:
@@ -2471,18 +2579,58 @@ async def get_players(
                     select_cols.append("sp.games AS games_played")
 
             q = f"""
+                WITH sp_one AS (
+                    SELECT *
+                    FROM (
+                        SELECT
+                            sp.*,
+                            row_number() OVER (
+                                PARTITION BY sp.season_id, sp.user_id
+                                ORDER BY sp.mmr DESC, sp.ctid DESC
+                            ) AS rn
+                        FROM public.seasonplayers sp
+                        WHERE sp.season_id = $1
+                    ) x
+                    WHERE rn = 1
+                ),
+                pt_one AS (
+                    SELECT *
+                    FROM (
+                        SELECT
+                            pt.*,
+                            row_number() OVER (
+                                PARTITION BY pt.user_id
+                                ORDER BY pt.updated_at DESC NULLS LAST, pt.ctid DESC
+                            ) AS rn
+                        FROM public.player_titles pt
+                    ) x
+                    WHERE rn = 1
+                ),
+                pti_one AS (
+                    SELECT *
+                    FROM (
+                        SELECT
+                            pti.*,
+                            row_number() OVER (
+                                PARTITION BY pti.user_id, pti.title_key
+                                ORDER BY pti.earned_at DESC NULLS LAST, pti.id DESC NULLS LAST, pti.ctid DESC
+                            ) AS rn
+                        FROM public.player_title_inventory pti
+                    ) x
+                    WHERE rn = 1
+                )
                 SELECT {", ".join(select_cols)}
                 FROM public.players p
-                INNER JOIN public.seasonplayers sp ON p.user_id = sp.user_id
+                INNER JOIN sp_one sp ON p.user_id = sp.user_id
                 LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
-                LEFT JOIN public.player_titles pt ON pt.user_id::text = p.user_id::text
+                LEFT JOIN pt_one pt ON pt.user_id::text = p.user_id::text
                 LEFT JOIN public.seasons title_s
                   ON title_s.id::text = split_part(COALESCE(p.selected_title_key, pt.title_key), ':', 2)
-                LEFT JOIN public.player_title_inventory pti
+                LEFT JOIN pti_one pti
                   ON pti.user_id::text = p.user_id::text
                  AND pti.title_key = COALESCE(p.selected_title_key, pt.title_key)
                 WHERE sp.season_id = $1
-                ORDER BY sp.mmr DESC
+                ORDER BY sp.mmr DESC, p.user_id::text ASC
                 LIMIT $2 OFFSET $3
             """
             rows = await conn.fetch(q, picked, limit, offset)
@@ -2626,16 +2774,39 @@ async def get_players(
 
         selected_title = _title_payload_from_selected_row(r)
 
+        real_mmr = int(_rget(r, "mmr") or 0)
+        real_peak_mmr = int(peak_mmr or real_mmr)
+        rank_value = _rget(r, "rank") or _rank_from_mmr_for_api(real_mmr)
+        matches_count = int(games_played or 0)
+
+        # Mismo criterio visual que el frontend:
+        # en la season activa, un jugador seed de Season Placement sin partidas
+        # se muestra con MMR 0 y no cuenta como cutoff real.
+        is_season_placement = (
+            bool(picked_is_current)
+            and matches_count == 0
+            and str(rank_value or "").strip() != "Placement"
+        )
+
+        visible_mmr = 0 if is_season_placement else real_mmr
+        visible_peak_mmr = 0 if is_season_placement else real_peak_mmr
+
         out.append(
             {
                 "id": user_id,
+                "user_id": user_id,
                 "discordId": discord_id,
+                "discord_id": discord_id,
                 "name": name,
-                "mmr": _rget(r, "mmr"),
-                "peakMmr": peak_mmr,
-                "peak_mmr": peak_mmr,
+                "mmr": real_mmr,
+                "visible_mmr": visible_mmr,
+                "display_mmr": visible_mmr,
+                "peakMmr": real_peak_mmr,
+                "peak_mmr": real_peak_mmr,
+                "visible_peak_mmr": visible_peak_mmr,
+                "display_peak_mmr": visible_peak_mmr,
                 "country": _rget(r, "country"),
-                "rank": _rget(r, "rank"),
+                "rank": rank_value,
                 "pfp": pfp_url,
                 "seasonTitle": selected_title,
                 "season_title": selected_title,
@@ -2644,15 +2815,22 @@ async def get_players(
                 "activeTitle": selected_title,
                 "active_title": selected_title,
                 "in_guild": _rget(r, "in_guild") if PLAYERS_HAS_IN_GUILD else None,
+                "is_season_placement": is_season_placement,
+                "season_status": "Season Placement" if is_season_placement else None,
                 "wins": wins,
                 "losses": losses,
                 "gamesPlayed": games_played,
                 "matchesPlayed": games_played,
                 "matches": games_played,
+                "matches_played": games_played,
                 "last10Games": last10_games,
                 "last10Wins": last10_wins,
                 "last10Losses": last10_losses,
                 "last10MmrDelta": last10_mmr_delta,
+                "last10_games": last10_games,
+                "last10_wins": last10_wins,
+                "last10_losses": last10_losses,
+                "last10_mmr_delta": last10_mmr_delta,
             }
         )
     return out
@@ -2866,14 +3044,23 @@ async def _fetch_ranked_season_rows(
     only_winners: bool = False,
 ) -> List[Any]:
     await _ensure_title_schema(conn)
+    await _ensure_leaderboard_integrity_schema(conn)
+    await _ensure_matches_table(conn)
 
     season_filter = ""
     if SEASONS_HAS_ACTIVE and not include_current:
         season_filter = "WHERE COALESCE(s.active, FALSE) = FALSE"
 
     discord_col = "p.discord_id AS discord_id," if HAS_DISCORD_ID_COL else "NULL::text AS discord_id,"
+    in_guild_expr = "COALESCE(p.in_guild, TRUE)" if PLAYERS_HAS_IN_GUILD else "TRUE"
     wanted = [1] if only_winners else [int(x) for x in cutoffs]
 
+    # La clave del fix:
+    # 1) sp_one elimina duplicados técnicos de seasonplayers.
+    # 2) pt_one/pti_one evitan que titles multipliquen filas.
+    # 3) ranked_valid usa la misma lógica visual del leaderboard:
+    #    no cuenta Season Placement sin jugar ni Placement 0 MMR como cutoff real.
+    # 4) desired_pick usa fallback al último jugador real si la season no llega al cutoff.
     q = f"""
         WITH target_seasons AS (
             SELECT {_season_query_columns('s')}
@@ -2883,18 +3070,134 @@ async def _fetch_ranked_season_rows(
         desired AS (
             SELECT unnest($1::int[])::int AS cutoff_position
         ),
-        ranked AS (
+        sp_one AS (
+            SELECT *
+            FROM (
+                SELECT
+                    sp.*,
+                    row_number() OVER (
+                        PARTITION BY sp.season_id, sp.user_id
+                        ORDER BY sp.mmr DESC, sp.ctid DESC
+                    ) AS rn
+                FROM public.seasonplayers sp
+            ) x
+            WHERE rn = 1
+        ),
+        mh AS (
+            SELECT
+                season_id,
+                user_id,
+                COUNT(*)::int AS matches_played,
+                MAX(
+                    CASE
+                        WHEN was_placement THEN mmr_after
+                        ELSE GREATEST(mmr_before, mmr_after)
+                    END
+                ) AS peak_mmr
+            FROM public.match_history
+            GROUP BY season_id, user_id
+        ),
+        base AS (
             SELECT
                 ts.season_id,
+                ts.season_name,
+                ts.season_active,
+                ts.season_starts_at,
+                ts.season_ends_at,
                 sp.user_id,
                 sp.mmr,
                 sp.role AS rank,
-                row_number() OVER (
-                    PARTITION BY ts.season_id
-                    ORDER BY sp.mmr DESC, sp.user_id::text ASC
-                )::int AS position
+                COALESCE(mh.matches_played, 0)::int AS matches_played,
+                COALESCE(mh.peak_mmr, sp.mmr) AS peak_mmr,
+                p.name,
+                p.country,
+                {discord_col}
+                {in_guild_expr} AS in_guild,
+                (
+                    COALESCE(ts.season_active, FALSE) = TRUE
+                    AND COALESCE(mh.matches_played, 0) = 0
+                    AND COALESCE(NULLIF(sp.role, ''), 'Placement') <> 'Placement'
+                ) AS is_unplayed_season_placement,
+                (
+                    COALESCE(mh.matches_played, 0) > 0
+                    OR COALESCE(sp.mmr, 0) > 0
+                    OR COALESCE(NULLIF(sp.role, ''), 'Placement') <> 'Placement'
+                ) AS has_real_standing
             FROM target_seasons ts
-            INNER JOIN public.seasonplayers sp ON sp.season_id = ts.season_id
+            INNER JOIN sp_one sp
+              ON sp.season_id = ts.season_id
+            INNER JOIN public.players p
+              ON p.user_id = sp.user_id
+            LEFT JOIN mh
+              ON mh.season_id = sp.season_id
+             AND mh.user_id::text = sp.user_id::text
+        ),
+        ranked_valid AS (
+            SELECT
+                b.*,
+                row_number() OVER (
+                    PARTITION BY b.season_id
+                    ORDER BY b.mmr DESC, b.peak_mmr DESC, b.user_id::text ASC
+                )::int AS position
+            FROM base b
+            WHERE b.in_guild = TRUE
+              AND b.has_real_standing = TRUE
+              AND b.is_unplayed_season_placement = FALSE
+        ),
+        totals AS (
+            SELECT
+                ts.season_id,
+                COUNT(rv.user_id)::int AS total_players
+            FROM target_seasons ts
+            LEFT JOIN ranked_valid rv
+              ON rv.season_id = ts.season_id
+            GROUP BY ts.season_id
+        ),
+        desired_pick AS (
+            SELECT
+                ts.season_id,
+                d.cutoff_position,
+                totals.total_players,
+                CASE
+                    WHEN totals.total_players <= 0 THEN NULL::int
+                    WHEN totals.total_players >= d.cutoff_position THEN d.cutoff_position
+                    ELSE totals.total_players
+                END AS effective_position,
+                CASE
+                    WHEN totals.total_players > 0
+                     AND totals.total_players < d.cutoff_position
+                    THEN TRUE
+                    ELSE FALSE
+                END AS is_fallback
+            FROM target_seasons ts
+            CROSS JOIN desired d
+            LEFT JOIN totals ON totals.season_id = ts.season_id
+        ),
+        pt_one AS (
+            SELECT *
+            FROM (
+                SELECT
+                    pt.*,
+                    row_number() OVER (
+                        PARTITION BY pt.user_id
+                        ORDER BY pt.updated_at DESC NULLS LAST, pt.ctid DESC
+                    ) AS rn
+                FROM public.player_titles pt
+            ) x
+            WHERE rn = 1
+        ),
+        pti_one AS (
+            SELECT *
+            FROM (
+                SELECT
+                    pti.*,
+                    row_number() OVER (
+                        PARTITION BY pti.user_id, pti.title_key
+                        ORDER BY pti.earned_at DESC NULLS LAST, pti.id DESC NULLS LAST, pti.ctid DESC
+                    ) AS rn
+                FROM public.player_title_inventory pti
+            ) x
+            WHERE rn = 1
         )
         SELECT
             ts.season_id,
@@ -2902,14 +3205,20 @@ async def _fetch_ranked_season_rows(
             ts.season_active,
             ts.season_starts_at,
             ts.season_ends_at,
-            d.cutoff_position,
-            r.position,
-            r.user_id,
-            r.mmr,
-            r.rank,
+            dp.cutoff_position,
+            dp.effective_position,
+            dp.is_fallback,
+            dp.total_players,
+            rv.position,
+            rv.user_id,
+            rv.mmr,
+            rv.peak_mmr,
+            rv.rank,
+            rv.matches_played,
+            rv.is_unplayed_season_placement,
             {discord_col}
-            p.name,
-            p.country,
+            rv.name,
+            rv.country,
             pp.url AS pfp_url,
             pp.updated_at AS pfp_updated_at,
             p.selected_title_key AS selected_title_key,
@@ -2925,23 +3234,24 @@ async def _fetch_ranked_season_rows(
             pti.season_id AS inv_title_season_id,
             pti.season_name AS inv_title_season_name,
             pti.is_test_season AS inv_title_is_test
-        FROM target_seasons ts
-        CROSS JOIN desired d
-        LEFT JOIN ranked r
-          ON r.season_id = ts.season_id
-         AND r.position = d.cutoff_position
+        FROM desired_pick dp
+        INNER JOIN target_seasons ts
+          ON ts.season_id = dp.season_id
+        LEFT JOIN ranked_valid rv
+          ON rv.season_id = dp.season_id
+         AND rv.position = dp.effective_position
         LEFT JOIN public.players p
-          ON p.user_id = r.user_id
+          ON p.user_id = rv.user_id
         LEFT JOIN public.player_pfps pp
-          ON pp.user_id::text = r.user_id::text
-        LEFT JOIN public.player_titles pt
-          ON pt.user_id::text = r.user_id::text
+          ON pp.user_id::text = rv.user_id::text
+        LEFT JOIN pt_one pt
+          ON pt.user_id::text = rv.user_id::text
         LEFT JOIN public.seasons title_s
           ON title_s.id::text = split_part(COALESCE(p.selected_title_key, pt.title_key), ':', 2)
-        LEFT JOIN public.player_title_inventory pti
-          ON pti.user_id::text = r.user_id::text
+        LEFT JOIN pti_one pti
+          ON pti.user_id::text = rv.user_id::text
          AND pti.title_key = COALESCE(p.selected_title_key, pt.title_key)
-        ORDER BY ts.season_id DESC, d.cutoff_position ASC
+        ORDER BY ts.season_id DESC, dP.cutoff_position ASC
     """
 
     return await conn.fetch(q, wanted)
@@ -3022,12 +3332,25 @@ async def get_season_cutoffs(
 
         cutoff = int(_rget(r, "cutoff_position") or 0)
         position = _rget(r, "position")
+        effective_position = _rget(r, "effective_position")
+        total_players = int(_rget(r, "total_players") or 0)
+        is_fallback = bool(_rget(r, "is_fallback"))
         player = _player_payload_for_hof_cutoffs(r)
         by_season[sid]["cutoffs"].append(
             {
                 "top": cutoff,
                 "cutoff": cutoff,
+                "requestedTop": cutoff,
+                "requested_top": cutoff,
                 "position": int(position) if position is not None else None,
+                "actualPosition": int(position) if position is not None else None,
+                "actual_position": int(position) if position is not None else None,
+                "effectivePosition": int(effective_position) if effective_position is not None else None,
+                "effective_position": int(effective_position) if effective_position is not None else None,
+                "totalPlayers": total_players,
+                "total_players": total_players,
+                "isFallback": is_fallback,
+                "is_fallback": is_fallback,
                 "player": player,
             }
         )
