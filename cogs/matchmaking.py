@@ -42,7 +42,7 @@ JOIN_CHANNEL_IDS = {
 
 QUEUE_ROLE_IDS = {
     "en": 1451255910469996726,
-    "jp": 1451255910469996726,
+    "jp": 1451259854693072927,
 }
 
 PING_ROLES_BY_JOIN_CHANNEL = {
@@ -903,6 +903,18 @@ class Matchmaking(commands.Cog):
 
         return slot_dt
 
+    def _lock_unlock_dt_for_current_prep(self, now: dt.datetime) -> dt.datetime | None:
+        prep_start = self._in_prep_window(now)
+        if prep_start is None:
+            return None
+        return self._slot_start_from_prep_start(now, prep_start)
+
+    def _format_mmss_until(self, target: dt.datetime, now: dt.datetime) -> str:
+        remaining = max(0, int((target - now).total_seconds()))
+        minutes = remaining // 60
+        seconds = remaining % 60
+        return f"{minutes}:{seconds:02d}"
+
     def _next_occurrence_of_minute(self, now: dt.datetime, minute: int) -> dt.datetime:
         """
         Próxima ocurrencia (>= now) de un minuto específico (:25/:55) en hora local.
@@ -1022,9 +1034,11 @@ class Matchmaking(commands.Cog):
         # Si ya se crearon rooms exactas para este slot, no se permite nueva queue.
         if locked_rooms > 0 and qlen == 0:
             try:
+                mmss = self._format_mmss_until(slot_dt, now)
                 await join_channel.send(
                     f"**{mins_left} min left** — Queue starting at <t:{slot_ts}:T> (<t:{slot_ts}:R>). "
-                    f"✅ Room queue for this slot is full. Queue is locked until the next slot."
+                    f"✅ Room queue for this slot is full. Queue is locked until <t:{slot_ts}:T> "
+                    f"— **{mmss}** left."
                 )
             except Exception:
                 pass
@@ -1050,7 +1064,8 @@ class Matchmaking(commands.Cog):
         if qlen > 0 and need == 0:
             full_rooms = qlen // ROOM_CAPACITY
             plural = "s" if full_rooms != 1 else ""
-            need_txt = f"✅ {full_rooms} room{plural} full. Queue is locked until the next slot."
+            mmss = self._format_mmss_until(slot_dt, now)
+            need_txt = f"✅ {full_rooms} room{plural} full. Queue is locked until <t:{slot_ts}:T> — **{mmss}** left."
         else:
             need_txt = f"Need {need} more player(s) to fill the next room."
 
@@ -1600,6 +1615,13 @@ class Matchmaking(commands.Cog):
                 await self.bot.get_channel(info["join_channel_id"]).get_thread(
                     info["thread"]
                 ).send(" Match started, Good luck and have fun!")
+            except Exception:
+                pass
+
+            try:
+                parent_channel = self.bot.get_channel(info["join_channel_id"])
+                if isinstance(parent_channel, discord.TextChannel):
+                    await self._announce_room_start(parent_channel, rid, info)
             except Exception:
                 pass
 
@@ -4550,12 +4572,24 @@ class Matchmaking(commands.Cog):
                         "❌ You are already in the queue.", ephemeral=True
                     )
 
-            # Lock-down: durante PREP se bloquea SOLO si need==0 (tu lógica actual)
+            # Lock-down: durante PREP se bloquea si ya se lockearon rooms para el slot
+            # o si la queue está completa exacta en múltiplos de 5.
             now = self._now_lima()
             if await self._is_join_locked(guild, ch.id, now):
+                unlock_dt = self._lock_unlock_dt_for_current_prep(now)
+                if unlock_dt is not None:
+                    unlock_ts = int(unlock_dt.timestamp())
+                    mmss = self._format_mmss_until(unlock_dt, now)
+                    return await interaction.followup.send(
+                        f"⛔ Queue is locked in for this slot. Unlocks at <t:{unlock_ts}:T> "
+                        f"(<t:{unlock_ts}:R>) — **{mmss}** left.",
+                        ephemeral=True,
+                    )
                 return await interaction.followup.send(
-                    "⛔ Queue is locked down until the next slot.", ephemeral=True
+                    "⛔ Queue is locked in for this slot.", ephemeral=True
                 )
+
+            queue_was_empty = len(self.queues.get(ch.id, set())) == 0
 
             # Siempre encola (no se intenta meter a rooms “unfilled”)
             self.queues.setdefault(ch.id, set()).add(member.id)
@@ -4591,10 +4625,27 @@ class Matchmaking(commands.Cog):
             ephemeral=True,
         )
 
-        # Mensaje público en #join / #jp-join
+        # Mensaje público en #join / #jp-join.
+        # Si el primer jugador entra durante la ventana de 5..1 minutos,
+        # se hace ping al tag correcto del canal (enTags o jpTags).
         try:
             qcount = len(self.queues.get(ch.id, set()))
-            await ch.send(f"({member.mention}) Joined the queue (`{qcount}`)")
+            ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(ch.id)
+            unlock_dt = self._lock_unlock_dt_for_current_prep(now)
+            should_ping_tag = bool(queue_was_empty and ping_role_id and unlock_dt is not None)
+            ping_part = f"<@&{ping_role_id}> " if should_ping_tag else ""
+            extra = ""
+            if unlock_dt is not None:
+                unlock_ts = int(unlock_dt.timestamp())
+                extra = f" Next slot: <t:{unlock_ts}:T> (<t:{unlock_ts}:R>)."
+            await ch.send(
+                f"{ping_part}({member.mention}) Joined the queue (`{qcount}`).{extra}",
+                allowed_mentions=discord.AllowedMentions(
+                    users=True,
+                    roles=should_ping_tag,
+                    everyone=False,
+                ),
+            )
         except Exception:
             pass
 
