@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_BACKEND_TITLES_LEGACY_FALLBACK_V15_2026_06_18"
+PJSK_DEPLOY_VERSION = "PJSK_BACKEND_CUTOFFS_QUEUE_V16_2026_06_18"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -3322,6 +3322,39 @@ async def get_season_cutoffs(
         raise HTTPException(500, f"DB error: {e}")
 
     by_season: Dict[str, Dict[str, Any]] = {}
+    fallback_added: Dict[str, bool] = {}
+
+    def _cutoff_item(
+        *,
+        cutoff: int,
+        position: Any,
+        effective_position: Any,
+        total_players: int,
+        is_fallback: bool,
+        player: Optional[Dict[str, Any]],
+        is_missing_cutoff: bool = False,
+    ) -> Dict[str, Any]:
+        pos_int = int(position) if position is not None else None
+        eff_int = int(effective_position) if effective_position is not None else None
+        return {
+            "top": cutoff,
+            "cutoff": cutoff,
+            "requestedTop": cutoff,
+            "requested_top": cutoff,
+            "position": pos_int,
+            "actualPosition": pos_int,
+            "actual_position": pos_int,
+            "effectivePosition": eff_int,
+            "effective_position": eff_int,
+            "totalPlayers": total_players,
+            "total_players": total_players,
+            "isFallback": is_fallback,
+            "is_fallback": is_fallback,
+            "isMissingCutoff": is_missing_cutoff,
+            "is_missing_cutoff": is_missing_cutoff,
+            "player": player,
+        }
+
     for r in rows:
         sid = str(_rget(r, "season_id"))
         if sid not in by_season:
@@ -3329,30 +3362,62 @@ async def get_season_cutoffs(
                 **_season_payload_from_row(r),
                 "cutoffs": [],
             }
+            fallback_added[sid] = False
 
         cutoff = int(_rget(r, "cutoff_position") or 0)
         position = _rget(r, "position")
         effective_position = _rget(r, "effective_position")
         total_players = int(_rget(r, "total_players") or 0)
-        is_fallback = bool(_rget(r, "is_fallback"))
         player = _player_payload_for_hof_cutoffs(r)
+
+        # Regla correcta de Cutoffs:
+        # - Los cutoffs alcanzados se muestran normal: Top 1, 10, 20, 30...
+        # - Si la season quedó entre dos cutoffs, se inserta UNA sola fila extra
+        #   con el último jugador real antes del siguiente cutoff.
+        #   Ej: 72 jugadores => Top 50, Top 72, luego Top 100 vacío.
+        #   Ej: 182 jugadores => Top 100, Top 182, luego Top 200 vacío.
+        # - Nunca se repite el mismo último jugador en Top 100/200/300/etc.
+        if total_players > 0 and cutoff <= total_players:
+            by_season[sid]["cutoffs"].append(
+                _cutoff_item(
+                    cutoff=cutoff,
+                    position=position,
+                    effective_position=effective_position,
+                    total_players=total_players,
+                    is_fallback=False,
+                    player=player,
+                )
+            )
+            continue
+
+        if total_players > 0 and not fallback_added.get(sid, False):
+            # Si total_players coincide exactamente con un cutoff real, ya fue mostrado arriba.
+            # En ese caso no insertamos una fila duplicada.
+            if total_players not in set(HOF_CUTOFF_POSITIONS):
+                by_season[sid]["cutoffs"].append(
+                    _cutoff_item(
+                        cutoff=cutoff,
+                        position=position,
+                        effective_position=effective_position,
+                        total_players=total_players,
+                        is_fallback=True,
+                        player=player,
+                    )
+                )
+            fallback_added[sid] = True
+
+        # Mantener la casilla del cutoff no alcanzado, pero vacía.
+        # Así la tabla conserva el orden Top 72 -> Top 100, sin inventar jugador Top 100.
         by_season[sid]["cutoffs"].append(
-            {
-                "top": cutoff,
-                "cutoff": cutoff,
-                "requestedTop": cutoff,
-                "requested_top": cutoff,
-                "position": int(position) if position is not None else None,
-                "actualPosition": int(position) if position is not None else None,
-                "actual_position": int(position) if position is not None else None,
-                "effectivePosition": int(effective_position) if effective_position is not None else None,
-                "effective_position": int(effective_position) if effective_position is not None else None,
-                "totalPlayers": total_players,
-                "total_players": total_players,
-                "isFallback": is_fallback,
-                "is_fallback": is_fallback,
-                "player": player,
-            }
+            _cutoff_item(
+                cutoff=cutoff,
+                position=None,
+                effective_position=None,
+                total_players=total_players,
+                is_fallback=False,
+                player=None,
+                is_missing_cutoff=True,
+            )
         )
 
     return list(by_season.values())
