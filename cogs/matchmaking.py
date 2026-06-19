@@ -1294,6 +1294,7 @@ class Matchmaking(commands.Cog):
                     sp.user_id,
                     sp.mmr,
                     sp.role,
+                    tie.first_reached_current_mmr,
                     COALESCE(mh.matches_played, 0) AS matches_played,
                     prev.prev_mmr,
                     prev.prev_pos
@@ -1305,6 +1306,19 @@ class Matchmaking(commands.Cog):
                     GROUP BY user_id
                 ) mh
                     ON mh.user_id = sp.user_id
+                LEFT JOIN (
+                    SELECT
+                        sp2.user_id,
+                        MIN(mhist.played_at) AS first_reached_current_mmr
+                    FROM seasonplayers sp2
+                    LEFT JOIN match_history mhist
+                      ON mhist.season_id = sp2.season_id
+                     AND mhist.user_id = sp2.user_id
+                     AND mhist.mmr_after = sp2.mmr
+                    WHERE sp2.season_id = $1
+                    GROUP BY sp2.user_id
+                ) tie
+                    ON tie.user_id = sp.user_id
                 LEFT JOIN (
                     SELECT
                         sp2.user_id,
@@ -1347,6 +1361,7 @@ class Matchmaking(commands.Cog):
                     "role": str(r["role"]),
                     "mmr": mmr,
                     "visible_mmr": 0 if is_unplayed_sp else mmr,
+                    "tie_reached_at": r["first_reached_current_mmr"],
                     "matches_played": matches_played,
                     "prev_mmr": int(r["prev_mmr"] or 0),
                     "prev_pos": int(r["prev_pos"] or 10**9),
@@ -1361,7 +1376,8 @@ class Matchmaking(commands.Cog):
             bucket = 0 if row["matches_played"] > 0 else (1 if row["is_unplayed_sp"] else 2)
 
             if bucket == 0:
-                return (0, -row["mmr"], row["user_id"])
+                tie_at = row.get("tie_reached_at") or dt.datetime.max.replace(tzinfo=dt.timezone.utc)
+                return (0, -row["mmr"], tie_at, row["user_id"])
 
             if bucket == 1:
                 # se ordenan por cómo quedaron en la season pasada
@@ -4909,16 +4925,28 @@ class Matchmaking(commands.Cog):
                     SELECT DISTINCT user_id
                     FROM public.match_history
                     WHERE season_id = $1
+                ), tied AS (
+                    SELECT
+                        sp.user_id,
+                        MIN(mh.played_at) AS first_reached_current_mmr
+                    FROM public.seasonplayers sp
+                    LEFT JOIN public.match_history mh
+                      ON mh.season_id = sp.season_id
+                     AND mh.user_id = sp.user_id
+                     AND mh.mmr_after = sp.mmr
+                    WHERE sp.season_id = $1
+                    GROUP BY sp.user_id
                 ), ranked AS (
                     SELECT
                         sp.user_id,
                         sp.mmr,
                         sp.role,
                         ROW_NUMBER() OVER (
-                            ORDER BY sp.mmr DESC, sp.user_id ASC
+                            ORDER BY sp.mmr DESC, tied.first_reached_current_mmr ASC NULLS LAST, sp.user_id ASC
                         ) AS place
                     FROM public.seasonplayers sp
                     INNER JOIN played p ON p.user_id = sp.user_id
+                    LEFT JOIN tied ON tied.user_id = sp.user_id
                     WHERE sp.season_id = $1
                 )
                 SELECT user_id, place, mmr, role
