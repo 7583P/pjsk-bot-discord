@@ -2548,6 +2548,7 @@ async def get_players(
                 "p.country  AS country",
                 "sp.mmr     AS mmr",
                 "sp.role    AS rank",
+                "tr.first_reached_current_mmr AS tie_reached_at",
                 "pp.url     AS pfp_url",
                 "pp.updated_at AS pfp_updated_at",
                 "p.selected_title_key AS selected_title_key",
@@ -2593,6 +2594,18 @@ async def get_players(
                     ) x
                     WHERE rn = 1
                 ),
+                tie_reached AS (
+                    SELECT
+                        sp.season_id,
+                        sp.user_id,
+                        MIN(mh.played_at) AS first_reached_current_mmr
+                    FROM sp_one sp
+                    LEFT JOIN public.match_history mh
+                      ON mh.season_id = sp.season_id
+                     AND mh.user_id::text = sp.user_id::text
+                     AND mh.mmr_after = sp.mmr
+                    GROUP BY sp.season_id, sp.user_id
+                ),
                 pt_one AS (
                     SELECT *
                     FROM (
@@ -2622,6 +2635,9 @@ async def get_players(
                 SELECT {", ".join(select_cols)}
                 FROM public.players p
                 INNER JOIN sp_one sp ON p.user_id = sp.user_id
+                LEFT JOIN tie_reached tr
+                  ON tr.season_id = sp.season_id
+                 AND tr.user_id::text = sp.user_id::text
                 LEFT JOIN public.player_pfps pp ON pp.user_id::text = p.user_id::text
                 LEFT JOIN pt_one pt ON pt.user_id::text = p.user_id::text
                 LEFT JOIN public.seasons title_s
@@ -2630,7 +2646,10 @@ async def get_players(
                   ON pti.user_id::text = p.user_id::text
                  AND pti.title_key = COALESCE(p.selected_title_key, pt.title_key)
                 WHERE sp.season_id = $1
-                ORDER BY sp.mmr DESC, p.user_id::text ASC
+                ORDER BY
+                    sp.mmr DESC,
+                    tr.first_reached_current_mmr ASC NULLS LAST,
+                    p.user_id::text ASC
                 LIMIT $2 OFFSET $3
             """
             rows = await conn.fetch(q, picked, limit, offset)
@@ -2774,6 +2793,12 @@ async def get_players(
 
         selected_title = _title_payload_from_selected_row(r)
 
+        tie_reached_at = _rget(r, "tie_reached_at")
+        try:
+            tie_reached_value = tie_reached_at.isoformat() if tie_reached_at else None
+        except Exception:
+            tie_reached_value = str(tie_reached_at) if tie_reached_at else None
+
         real_mmr = int(_rget(r, "mmr") or 0)
         real_peak_mmr = int(peak_mmr or real_mmr)
         rank_value = _rget(r, "rank") or _rank_from_mmr_for_api(real_mmr)
@@ -2807,6 +2832,10 @@ async def get_players(
                 "display_peak_mmr": visible_peak_mmr,
                 "country": _rget(r, "country"),
                 "rank": rank_value,
+                "tieReachedAt": tie_reached_value,
+                "tie_reached_at": tie_reached_value,
+                "firstReachedCurrentMmr": tie_reached_value,
+                "first_reached_current_mmr": tie_reached_value,
                 "pfp": pfp_url,
                 "seasonTitle": selected_title,
                 "season_title": selected_title,
@@ -2979,6 +3008,12 @@ def _player_payload_for_hof_cutoffs(row: Any) -> Optional[Dict[str, Any]]:
 
     selected_title = _title_payload_from_selected_row(row)
 
+    tie_reached_at = _rget(row, "first_reached_current_mmr") or _rget(row, "tie_reached_at")
+    try:
+        tie_reached_value = tie_reached_at.isoformat() if tie_reached_at else None
+    except Exception:
+        tie_reached_value = str(tie_reached_at) if tie_reached_at else None
+
     return {
         "id": user_id,
         "user_id": user_id,
@@ -2990,6 +3025,10 @@ def _player_payload_for_hof_cutoffs(row: Any) -> Optional[Dict[str, Any]]:
         "peakMmr": mmr,
         "peak_mmr": mmr,
         "rank": rank,
+        "tieReachedAt": tie_reached_value,
+        "tie_reached_at": tie_reached_value,
+        "firstReachedCurrentMmr": tie_reached_value,
+        "first_reached_current_mmr": tie_reached_value,
         "pfp": pfp_url,
         "seasonTitle": selected_title,
         "season_title": selected_title,
@@ -3097,6 +3136,18 @@ async def _fetch_ranked_season_rows(
             FROM public.match_history
             GROUP BY season_id, user_id
         ),
+        tie AS (
+            SELECT
+                sp.season_id,
+                sp.user_id,
+                MIN(mhist.played_at) AS first_reached_current_mmr
+            FROM sp_one sp
+            LEFT JOIN public.match_history mhist
+              ON mhist.season_id = sp.season_id
+             AND mhist.user_id::text = sp.user_id::text
+             AND mhist.mmr_after = sp.mmr
+            GROUP BY sp.season_id, sp.user_id
+        ),
         base AS (
             SELECT
                 ts.season_id,
@@ -3109,6 +3160,7 @@ async def _fetch_ranked_season_rows(
                 sp.role AS rank,
                 COALESCE(mh.matches_played, 0)::int AS matches_played,
                 COALESCE(mh.peak_mmr, sp.mmr) AS peak_mmr,
+                tie.first_reached_current_mmr,
                 p.name,
                 p.country,
                 {discord_col}
@@ -3131,13 +3183,19 @@ async def _fetch_ranked_season_rows(
             LEFT JOIN mh
               ON mh.season_id = sp.season_id
              AND mh.user_id::text = sp.user_id::text
+            LEFT JOIN tie
+              ON tie.season_id = sp.season_id
+             AND tie.user_id::text = sp.user_id::text
         ),
         ranked_valid AS (
             SELECT
                 b.*,
                 row_number() OVER (
                     PARTITION BY b.season_id
-                    ORDER BY b.mmr DESC, b.peak_mmr DESC, b.user_id::text ASC
+                    ORDER BY
+                        b.mmr DESC,
+                        b.first_reached_current_mmr ASC NULLS LAST,
+                        b.user_id::text ASC
                 )::int AS position
             FROM base b
             WHERE b.in_guild = TRUE
@@ -3213,6 +3271,7 @@ async def _fetch_ranked_season_rows(
             rv.user_id,
             rv.mmr,
             rv.peak_mmr,
+            rv.first_reached_current_mmr,
             rv.rank,
             rv.matches_played,
             rv.is_unplayed_season_placement,
