@@ -1801,16 +1801,24 @@ def generate_stats_image(
 
     # Username and country badge
     safe_name = str(player_name or "Unknown").strip() or "Unknown"
-    _draw_glow_text(
-        draw,
-        (sx(570), sy(198)),
+    username_img = make_gradient_text_image(
         safe_name,
         username_font,
-        fill=(245, 248, 255, 255),
-        glow=(*blue_rgb, 105),
-        stroke_width=max(2, sy(3)),
+        start_rgb,
+        end_rgb,
+        padding=max(4, sy(4)),
+        direction="right",
     )
-    draw.line((sx(565), sy(292), sx(1138), sy(292)), fill=(*gold_rgb, 210), width=max(2, sy(3)))
+    username_img = add_stroke(username_img, max(2, sy(3)), (8, 14, 28, 255))
+    # soft glow in the player's rank color behind the username
+    username_glow = Image.new("RGBA", username_img.size, (0, 0, 0, 0))
+    ugd = ImageDraw.Draw(username_glow)
+    ugd.rounded_rectangle((0, sy(8), username_img.size[0], username_img.size[1] - sy(8)), radius=max(6, sy(8)), fill=(*accent_rgb, 22))
+    username_glow = username_glow.filter(ImageFilter.GaussianBlur(radius=max(3, sy(4))))
+    img.paste(username_glow, (sx(570), sy(198)), username_glow)
+    img.paste(username_img, (sx(570), sy(198)), username_img)
+    draw = ImageDraw.Draw(img)
+    draw.line((sx(565), sy(292), sx(1138), sy(292)), fill=(*end_rgb, 210), width=max(2, sy(3)))
     _draw_country_badge(
         img,
         (sx(545), sy(318), sx(935), sy(382)),
