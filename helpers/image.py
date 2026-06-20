@@ -706,6 +706,38 @@ def _make_ellipse_ring(size: int, thickness: int, start_rgb: tuple[int, int, int
     return out
 
 
+def _paste_gradient_rounded_border(
+    base: Image.Image,
+    rect: tuple[int, int, int, int],
+    start_rgb: tuple[int, int, int],
+    end_rgb: tuple[int, int, int],
+    *,
+    thickness: int = 4,
+    radius: int = 18,
+    alpha: int = 255,
+):
+    x1, y1, x2, y2 = map(int, rect)
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    thickness = max(1, int(thickness))
+    radius = max(0, int(radius))
+
+    grad = _make_horizontal_gradient((width, height), start_rgb, end_rgb)
+    if alpha < 255:
+        a = Image.new("L", (width, height), max(0, min(255, int(alpha))))
+        grad.putalpha(a)
+
+    mask = Image.new("L", (width, height), 0)
+    d = ImageDraw.Draw(mask)
+    d.rounded_rectangle((0, 0, width - 1, height - 1), radius=radius, fill=255)
+
+    if width > thickness * 2 and height > thickness * 2:
+        inner_rect = (thickness, thickness, width - 1 - thickness, height - 1 - thickness)
+        inner_radius = max(0, radius - thickness)
+        d.rounded_rectangle(inner_rect, radius=inner_radius, fill=0)
+
+    base.paste(grad, (x1, y1), mask)
+
 
 def _draw_centered_segments(
     draw: ImageDraw.ImageDraw,
@@ -1668,11 +1700,13 @@ def generate_stats_image(
     rank = normalize_rank_name(rank, current_mmr, False)
     rank_display = _rank_display_text(rank).upper()
     start_rgb, end_rgb = _rank_theme(rank)
-    # Mantiene el feeling de la imagen de referencia: bordes azules + acentos dorados del rango.
+    # Mantiene el feeling gamer/sci-fi, pero los elementos pedidos por el usuario
+    # usan el color/degradado real del rango del jugador.
     blue_rgb = (70, 185, 255)
     deep_blue = (12, 43, 104)
+    accent_rgb = tuple(int((start_rgb[i] + end_rgb[i]) / 2) for i in range(3))
     gold_rgb = end_rgb if rank.lower().startswith("gold") else (245, 175, 61)
-    rank_stroke = (*gold_rgb, 255)
+    rank_stroke = (*accent_rgb, 255)
     white = (255, 255, 255, 255)
     green = (58, 231, 125, 255)
     red = (255, 92, 92, 255)
@@ -1733,18 +1767,18 @@ def generate_stats_image(
     gd = ImageDraw.Draw(glow)
     gd.ellipse(
         (avatar_x - sy(24), avatar_y - sy(24), avatar_x + avatar_size + sy(24), avatar_y + avatar_size + sy(24)),
-        fill=(*blue_rgb, 38),
+        fill=(*accent_rgb, 42),
     )
     gd.ellipse(
-        (avatar_x - sy(14), avatar_y - sy(14), avatar_x + avatar_size + sy(14), avatar_y + avatar_size + sy(14)),
-        outline=(*gold_rgb, 150),
+        (avatar_x - sy(14), avatar_y - sy(14), avatar_x + avatar_size + sy(14), avatar_y + sy(14) + avatar_size),
+        outline=(*accent_rgb, 155),
         width=max(2, sy(4)),
     )
     img = Image.alpha_composite(img, glow)
 
-    ring_outer = _make_ellipse_ring(avatar_size + sy(24), max(7, sy(10)), blue_rgb, gold_rgb)
+    ring_outer = _make_ellipse_ring(avatar_size + sy(24), max(7, sy(10)), start_rgb, end_rgb)
     img.paste(ring_outer, (avatar_x - sy(12), avatar_y - sy(12)), ring_outer)
-    ring_inner = _make_ellipse_ring(avatar_size + sy(4), max(3, sy(4)), (255, 229, 150), gold_rgb)
+    ring_inner = _make_ellipse_ring(avatar_size + sy(4), max(3, sy(4)), end_rgb, start_rgb)
     img.paste(ring_inner, (avatar_x - sy(2), avatar_y - sy(2)), ring_inner)
 
     avatar_drawn = False
@@ -1790,9 +1824,10 @@ def generate_stats_image(
 
     # Rank box on the right
     rank_box = (sx(1210), sy(128), sx(1460), sy(398))
-    _draw_sci_fi_card(draw, rank_box, gold_rgb, fill=(5, 7, 19, 218), radius=sy(22), width=max(2, sy(3)), cut=sy(18))
+    _draw_sci_fi_card(draw, rank_box, accent_rgb, fill=(5, 7, 19, 218), radius=sy(22), width=max(2, sy(3)), cut=sy(18))
+    _paste_gradient_rounded_border(img, rank_box, start_rgb, end_rgb, thickness=max(2, sy(3)), radius=sy(22), alpha=250)
     inner_rank = (rank_box[0] + sx(14), rank_box[1] + sy(15), rank_box[2] - sx(14), rank_box[3] - sy(15))
-    draw.rounded_rectangle(inner_rank, radius=sy(18), outline=(*gold_rgb, 95), width=max(1, sy(2)))
+    _paste_gradient_rounded_border(img, inner_rank, end_rgb, start_rgb, thickness=max(1, sy(2)), radius=sy(18), alpha=165)
     _center_text(draw, (sx(1335), sy(170)), "RANK", rank_label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     rank_logo = _load_rank_logo(rank)
@@ -1867,11 +1902,13 @@ def generate_stats_image(
 
     # MMR progress panel/bar
     bar_panel = (sx(130), sy(615), sx(1542), sy(742))
-    _draw_sci_fi_card(draw, bar_panel, gold_rgb, fill=(5, 8, 20, 202), radius=sy(20), width=max(2, sy(3)), cut=sy(22))
+    _draw_sci_fi_card(draw, bar_panel, accent_rgb, fill=(5, 8, 20, 202), radius=sy(20), width=max(2, sy(3)), cut=sy(22))
+    _paste_gradient_rounded_border(img, bar_panel, start_rgb, end_rgb, thickness=max(2, sy(3)), radius=sy(20), alpha=245)
     _center_text(draw, (sx(836), sy(638)), "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     bar_x1, bar_y1, bar_x2, bar_y2 = sx(280), sy(663), sx(1392), sy(720)
-    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(22), fill=(2, 9, 30, 245), outline=(*gold_rgb, 230), width=max(2, sy(3)))
+    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(22), fill=(2, 9, 30, 245), outline=(*accent_rgb, 140), width=1)
+    _paste_gradient_rounded_border(img, (bar_x1, bar_y1, bar_x2, bar_y2), start_rgb, end_rgb, thickness=max(2, sy(3)), radius=sy(22), alpha=245)
     progress_text, progress = _rank_progress(rank, current_mmr)
     fill_x2 = bar_x1 + int((bar_x2 - bar_x1) * progress)
     if fill_x2 > bar_x1 + sy(12):
