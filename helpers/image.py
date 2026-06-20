@@ -1386,6 +1386,259 @@ def generate_results_image(
     return buf
 
 
+
+# ============================================================
+# COUNTRY DISPLAY HELPERS FOR STATS CARD
+# ============================================================
+
+ISO2_COUNTRY_NAMES = {
+    "AF": "Afghanistan", "AL": "Albania", "DZ": "Algeria", "AS": "American Samoa", "AD": "Andorra",
+    "AO": "Angola", "AI": "Anguilla", "AQ": "Antarctica", "AG": "Antigua and Barbuda", "AR": "Argentina",
+    "AM": "Armenia", "AW": "Aruba", "AU": "Australia", "AT": "Austria", "AZ": "Azerbaijan",
+    "BS": "Bahamas", "BH": "Bahrain", "BD": "Bangladesh", "BB": "Barbados", "BY": "Belarus",
+    "BE": "Belgium", "BZ": "Belize", "BJ": "Benin", "BM": "Bermuda", "BT": "Bhutan",
+    "BO": "Bolivia", "BA": "Bosnia and Herzegovina", "BW": "Botswana", "BR": "Brazil", "IO": "British Indian Ocean Territory",
+    "BN": "Brunei", "BG": "Bulgaria", "BF": "Burkina Faso", "BI": "Burundi", "KH": "Cambodia",
+    "CM": "Cameroon", "CA": "Canada", "CV": "Cape Verde", "KY": "Cayman Islands", "CF": "Central African Republic",
+    "TD": "Chad", "CL": "Chile", "CN": "China", "CX": "Christmas Island", "CC": "Cocos Islands",
+    "CO": "Colombia", "KM": "Comoros", "CG": "Congo", "CD": "DR Congo", "CK": "Cook Islands",
+    "CR": "Costa Rica", "CI": "Côte d’Ivoire", "HR": "Croatia", "CU": "Cuba", "CW": "Curaçao",
+    "CY": "Cyprus", "CZ": "Czechia", "DK": "Denmark", "DJ": "Djibouti", "DM": "Dominica",
+    "DO": "Dominican Republic", "EC": "Ecuador", "EG": "Egypt", "SV": "El Salvador", "GQ": "Equatorial Guinea",
+    "ER": "Eritrea", "EE": "Estonia", "SZ": "Eswatini", "ET": "Ethiopia", "FK": "Falkland Islands",
+    "FO": "Faroe Islands", "FJ": "Fiji", "FI": "Finland", "FR": "France", "GF": "French Guiana",
+    "PF": "French Polynesia", "GA": "Gabon", "GM": "Gambia", "GE": "Georgia", "DE": "Germany",
+    "GH": "Ghana", "GI": "Gibraltar", "GR": "Greece", "GL": "Greenland", "GD": "Grenada",
+    "GP": "Guadeloupe", "GU": "Guam", "GT": "Guatemala", "GG": "Guernsey", "GN": "Guinea",
+    "GW": "Guinea-Bissau", "GY": "Guyana", "HT": "Haiti", "HN": "Honduras", "HK": "Hong Kong",
+    "HU": "Hungary", "IS": "Iceland", "IN": "India", "ID": "Indonesia", "IR": "Iran",
+    "IQ": "Iraq", "IE": "Ireland", "IM": "Isle of Man", "IL": "Israel", "IT": "Italy",
+    "JM": "Jamaica", "JP": "Japan", "JE": "Jersey", "JO": "Jordan", "KZ": "Kazakhstan",
+    "KE": "Kenya", "KI": "Kiribati", "KP": "North Korea", "KR": "South Korea", "KW": "Kuwait",
+    "KG": "Kyrgyzstan", "LA": "Laos", "LV": "Latvia", "LB": "Lebanon", "LS": "Lesotho",
+    "LR": "Liberia", "LY": "Libya", "LI": "Liechtenstein", "LT": "Lithuania", "LU": "Luxembourg",
+    "MO": "Macao", "MG": "Madagascar", "MW": "Malawi", "MY": "Malaysia", "MV": "Maldives",
+    "ML": "Mali", "MT": "Malta", "MH": "Marshall Islands", "MQ": "Martinique", "MR": "Mauritania",
+    "MU": "Mauritius", "YT": "Mayotte", "MX": "Mexico", "FM": "Micronesia", "MD": "Moldova",
+    "MC": "Monaco", "MN": "Mongolia", "ME": "Montenegro", "MS": "Montserrat", "MA": "Morocco",
+    "MZ": "Mozambique", "MM": "Myanmar", "NA": "Namibia", "NR": "Nauru", "NP": "Nepal",
+    "NL": "Netherlands", "NC": "New Caledonia", "NZ": "New Zealand", "NI": "Nicaragua", "NE": "Niger",
+    "NG": "Nigeria", "NU": "Niue", "NF": "Norfolk Island", "MK": "North Macedonia", "MP": "Northern Mariana Islands",
+    "NO": "Norway", "OM": "Oman", "PK": "Pakistan", "PW": "Palau", "PS": "Palestine",
+    "PA": "Panama", "PG": "Papua New Guinea", "PY": "Paraguay", "PE": "Peru", "PH": "Philippines",
+    "PN": "Pitcairn Islands", "PL": "Poland", "PT": "Portugal", "PR": "Puerto Rico", "QA": "Qatar",
+    "RE": "Réunion", "RO": "Romania", "RU": "Russia", "RW": "Rwanda", "BL": "Saint Barthélemy",
+    "SH": "Saint Helena", "KN": "Saint Kitts and Nevis", "LC": "Saint Lucia", "MF": "Saint Martin", "PM": "Saint Pierre and Miquelon",
+    "VC": "Saint Vincent and the Grenadines", "WS": "Samoa", "SM": "San Marino", "ST": "São Tomé and Príncipe", "SA": "Saudi Arabia",
+    "SN": "Senegal", "RS": "Serbia", "SC": "Seychelles", "SL": "Sierra Leone", "SG": "Singapore",
+    "SX": "Sint Maarten", "SK": "Slovakia", "SI": "Slovenia", "SB": "Solomon Islands", "SO": "Somalia",
+    "ZA": "South Africa", "SS": "South Sudan", "ES": "Spain", "LK": "Sri Lanka", "SD": "Sudan",
+    "SR": "Suriname", "SE": "Sweden", "CH": "Switzerland", "SY": "Syria", "TW": "Taiwan",
+    "TJ": "Tajikistan", "TZ": "Tanzania", "TH": "Thailand", "TL": "Timor-Leste", "TG": "Togo",
+    "TK": "Tokelau", "TO": "Tonga", "TT": "Trinidad and Tobago", "TN": "Tunisia", "TR": "Turkey",
+    "TM": "Turkmenistan", "TC": "Turks and Caicos Islands", "TV": "Tuvalu", "UG": "Uganda", "UA": "Ukraine",
+    "AE": "United Arab Emirates", "GB": "United Kingdom", "US": "United States", "UY": "Uruguay", "UZ": "Uzbekistan",
+    "VU": "Vanuatu", "VA": "Vatican City", "VE": "Venezuela", "VN": "Vietnam", "VG": "British Virgin Islands",
+    "VI": "U.S. Virgin Islands", "WF": "Wallis and Futuna", "EH": "Western Sahara", "YE": "Yemen", "ZM": "Zambia", "ZW": "Zimbabwe",
+}
+
+
+def country_name_from_code(country_code: Any, country_name: str | None = None) -> str:
+    if country_name and str(country_name).strip():
+        return str(country_name).strip()
+
+    if is_unknown_country_code(country_code):
+        return "Unknown"
+
+    cc = normalize_country_code(country_code)
+    if not cc:
+        return "Unknown"
+
+    return ISO2_COUNTRY_NAMES.get(cc, cc)
+
+
+def _draw_sci_fi_card(
+    draw: ImageDraw.ImageDraw,
+    rect: tuple[int, int, int, int],
+    outline_rgb: tuple[int, int, int],
+    *,
+    fill=(3, 9, 27, 196),
+    radius: int = 16,
+    width: int = 2,
+    cut: int = 18,
+):
+    x1, y1, x2, y2 = rect
+    draw.rounded_rectangle(rect, radius=radius, fill=fill, outline=(*outline_rgb, 120), width=width)
+    # small angular corner strokes; this gives a cleaner gamer panel without needing extra PNG assets
+    c = max(6, int(cut))
+    hi = (*outline_rgb, 210)
+    lo = (*outline_rgb, 80)
+    draw.line((x1 + c, y1, x1 + c * 2, y1), fill=hi, width=width)
+    draw.line((x1, y1 + c, x1, y1 + c * 2), fill=lo, width=width)
+    draw.line((x2 - c * 2, y1, x2 - c, y1), fill=hi, width=width)
+    draw.line((x2, y1 + c, x2, y1 + c * 2), fill=lo, width=width)
+    draw.line((x1 + c, y2, x1 + c * 2, y2), fill=hi, width=width)
+    draw.line((x1, y2 - c * 2, x1, y2 - c), fill=lo, width=width)
+    draw.line((x2 - c * 2, y2, x2 - c, y2), fill=hi, width=width)
+    draw.line((x2, y2 - c * 2, x2, y2 - c), fill=lo, width=width)
+
+
+def _draw_icon_glow(draw: ImageDraw.ImageDraw, xy: tuple[int, int], size: int, color=(63, 178, 255, 230)):
+    x, y = xy
+    r = max(6, size // 2)
+    draw.ellipse((x - r, y - r, x + r, y + r), fill=(color[0], color[1], color[2], 18))
+
+
+def _draw_position_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(2 * s))
+    # podium
+    boxes = [
+        (cx - int(21*s), cy + int(8*s), cx - int(7*s), cy + int(24*s)),
+        (cx - int(5*s), cy - int(4*s), cx + int(9*s), cy + int(24*s)),
+        (cx + int(11*s), cy + int(13*s), cx + int(25*s), cy + int(24*s)),
+    ]
+    for b in boxes:
+        draw.rounded_rectangle(b, radius=max(1, int(3*s)), outline=col, width=stroke, fill=(5, 20, 46, 135))
+    _center_text(draw, (cx + int(2*s), cy + int(5*s)), "1", _stats_font(max(8, int(13*s))), fill=col, stroke_width=1)
+    _center_text(draw, (cx - int(14*s), cy + int(17*s)), "2", _stats_font(max(7, int(10*s))), fill=col, stroke_width=1)
+    _center_text(draw, (cx + int(18*s), cy + int(18*s)), "3", _stats_font(max(7, int(10*s))), fill=col, stroke_width=1)
+    draw.ellipse((cx - int(7*s), cy - int(25*s), cx + int(7*s), cy - int(11*s)), outline=col, width=stroke)
+    draw.line((cx, cy - int(11*s), cx, cy - int(4*s)), fill=col, width=stroke)
+
+
+def _draw_swords_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(3*s))
+    # crossed blades
+    draw.line((cx - int(20*s), cy - int(20*s), cx + int(21*s), cy + int(21*s)), fill=col, width=stroke)
+    draw.line((cx + int(20*s), cy - int(20*s), cx - int(21*s), cy + int(21*s)), fill=col, width=stroke)
+    draw.line((cx - int(17*s), cy + int(18*s), cx - int(27*s), cy + int(28*s)), fill=col, width=stroke)
+    draw.line((cx + int(17*s), cy + int(18*s), cx + int(27*s), cy + int(28*s)), fill=col, width=stroke)
+    draw.line((cx - int(21*s), cy + int(10*s), cx - int(9*s), cy + int(22*s)), fill=col, width=max(2, int(2*s)))
+    draw.line((cx + int(21*s), cy + int(10*s), cx + int(9*s), cy + int(22*s)), fill=col, width=max(2, int(2*s)))
+
+
+def _draw_target_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(3*s))
+    for r in (23, 14, 5):
+        draw.ellipse((cx - int(r*s), cy - int(r*s), cx + int(r*s), cy + int(r*s)), outline=col, width=max(1, int(2*s)))
+    draw.line((cx - int(30*s), cy, cx - int(12*s), cy), fill=col, width=stroke)
+    draw.line((cx + int(12*s), cy, cx + int(30*s), cy), fill=col, width=stroke)
+    draw.line((cx, cy - int(30*s), cx, cy - int(12*s)), fill=col, width=stroke)
+    draw.line((cx, cy + int(12*s), cx, cy + int(30*s)), fill=col, width=stroke)
+
+
+def _draw_chart_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(3*s))
+    x0, y0 = cx - int(24*s), cy + int(22*s)
+    draw.line((x0, cy - int(24*s), x0, y0), fill=col, width=max(1, int(2*s)))
+    draw.line((x0, y0, cx + int(26*s), y0), fill=col, width=max(1, int(2*s)))
+    pts = [
+        (cx - int(20*s), cy + int(10*s)),
+        (cx - int(8*s), cy - int(6*s)),
+        (cx + int(3*s), cy + int(2*s)),
+        (cx + int(13*s), cy - int(17*s)),
+        (cx + int(25*s), cy - int(23*s)),
+    ]
+    draw.line(pts, fill=col, width=stroke, joint="curve")
+    for px, py in pts:
+        draw.ellipse((px - int(3*s), py - int(3*s), px + int(3*s), py + int(3*s)), fill=col)
+
+
+def _draw_crown_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(3*s))
+    pts = [
+        (cx - int(26*s), cy + int(12*s)),
+        (cx - int(20*s), cy - int(18*s)),
+        (cx - int(6*s), cy + int(2*s)),
+        (cx, cy - int(25*s)),
+        (cx + int(6*s), cy + int(2*s)),
+        (cx + int(20*s), cy - int(18*s)),
+        (cx + int(26*s), cy + int(12*s)),
+    ]
+    draw.line(pts, fill=col, width=stroke, joint="curve")
+    draw.rounded_rectangle((cx - int(24*s), cy + int(13*s), cx + int(24*s), cy + int(24*s)), radius=max(1, int(4*s)), outline=col, width=stroke, fill=(5, 20, 46, 110))
+
+
+def _draw_shield_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255), star: bool = False):
+    _draw_icon_glow(draw, (cx, cy), size, (*rgb, 230))
+    s = size / 54
+    col = (*rgb, 235)
+    stroke = max(2, int(3*s))
+    poly = [
+        (cx, cy - int(28*s)),
+        (cx + int(24*s), cy - int(16*s)),
+        (cx + int(18*s), cy + int(18*s)),
+        (cx, cy + int(30*s)),
+        (cx - int(18*s), cy + int(18*s)),
+        (cx - int(24*s), cy - int(16*s)),
+    ]
+    draw.polygon(poly, outline=col, fill=(5, 20, 46, 110))
+    draw.line(poly + [poly[0]], fill=col, width=stroke)
+    if star:
+        # 5 point stylized star
+        r1, r2 = int(12*s), int(5*s)
+        pts = []
+        import math
+        for i in range(10):
+            ang = -math.pi / 2 + i * math.pi / 5
+            r = r1 if i % 2 == 0 else r2
+            pts.append((cx + int(math.cos(ang) * r), cy + int(math.sin(ang) * r)))
+        draw.polygon(pts, outline=col, fill=(20, 50, 90, 160))
+
+
+def _draw_location_icon(draw: ImageDraw.ImageDraw, cx: int, cy: int, size: int, rgb=(72, 188, 255)):
+    s = size / 48
+    col = (*rgb, 210)
+    r = max(4, int(9*s))
+    draw.ellipse((cx-r, cy-int(14*s)-r, cx+r, cy-int(14*s)+r), outline=col, width=max(2, int(2*s)), fill=(6, 17, 45, 160))
+    draw.polygon([(cx, cy + int(14*s)), (cx - int(10*s), cy - int(2*s)), (cx + int(10*s), cy - int(2*s))], fill=(6, 17, 45, 160), outline=col)
+    draw.ellipse((cx-int(3*s), cy-int(17*s), cx+int(3*s), cy-int(11*s)), fill=col)
+
+
+def _draw_country_badge(
+    base: Image.Image,
+    rect: tuple[int, int, int, int],
+    *,
+    country_code: str | None,
+    country_name: str | None,
+    font: ImageFont.ImageFont,
+    small_font: ImageFont.ImageFont,
+    outline_rgb: tuple[int, int, int],
+):
+    draw = ImageDraw.Draw(base)
+    x1, y1, x2, y2 = rect
+    h = y2 - y1
+    _draw_sci_fi_card(draw, rect, outline_rgb, fill=(3, 8, 25, 160), radius=max(10, h // 4), width=max(1, h // 20), cut=max(10, h // 3))
+    _draw_location_icon(draw, x1 + int(h * 0.48), y1 + h // 2 + int(h * 0.06), max(24, int(h * 0.70)), outline_rgb)
+
+    flag_w = int(h * 1.15)
+    flag_h = int(h * 0.62)
+    flag_x = x1 + int(h * 0.95)
+    flag_y = y1 + (h - flag_h) // 2
+    flag = get_flag_image(country_code or "", target_size=(flag_w, flag_h))
+    if flag is None:
+        flag = make_iso_badge(country_code or "??", small_font).resize((flag_w, flag_h), Image.Resampling.LANCZOS)
+    base.paste(flag, (flag_x, flag_y), flag)
+
+    name = country_name_from_code(country_code, country_name)
+    name = _fit_text(draw, name, font, max(40, x2 - (flag_x + flag_w + int(h * 0.36)) - int(h * 0.35)))
+    draw.text((flag_x + flag_w + int(h * 0.35), y1 + int(h * 0.19)), name, font=font, fill=(255, 255, 255, 250), stroke_width=1, stroke_fill=(0, 0, 0, 255))
+
 # ============================================================
 # STATS IMAGE GENERATOR
 # ============================================================
@@ -1404,8 +1657,10 @@ def generate_stats_image(
     current_mmr: int,
     season_name: str,
     last10_mmr_delta: int = 0,
+    country_code: str | None = None,
+    country_name: str | None = None,
 ) -> io.BytesIO:
-    """Genera la imagen de /stats y /stats_user."""
+    """Genera la imagen de /stats y /stats_user con UI sci-fi/gamer."""
 
     if not STATS_BACKGROUND_PATH.exists():
         raise FileNotFoundError(f"Missing stats background: {STATS_BACKGROUND_PATH}")
@@ -1413,7 +1668,11 @@ def generate_stats_image(
     rank = normalize_rank_name(rank, current_mmr, False)
     rank_display = _rank_display_text(rank).upper()
     start_rgb, end_rgb = _rank_theme(rank)
-    rank_stroke = (*end_rgb, 255)
+    # Mantiene el feeling de la imagen de referencia: bordes azules + acentos dorados del rango.
+    blue_rgb = (70, 185, 255)
+    deep_blue = (12, 43, 104)
+    gold_rgb = end_rgb if rank.lower().startswith("gold") else (245, 175, 61)
+    rank_stroke = (*gold_rgb, 255)
     white = (255, 255, 255, 255)
     green = (58, 231, 125, 255)
     red = (255, 92, 92, 255)
@@ -1422,61 +1681,71 @@ def generate_stats_image(
     draw = ImageDraw.Draw(img)
     w, h = img.size
 
+    # Diseño basado en la imagen generada: 1672 x 941.
     def sx(x: float) -> int:
-        return int(x * w / 1699)
+        return int(x * w / 1672)
 
     def sy(y: float) -> int:
-        return int(y * h / 926)
+        return int(y * h / 941)
 
-    title_font = _stats_font(sy(56))
-    username_size = sy(66)
-    username_font = _fit_font_size_for_text(player_name or "Unknown", sx(520), username_size, min_size=sy(34))
-    label_font = _stats_font(sy(22))
-    top_value_font = _stats_font(sy(30))
-    top_small_value_font = _stats_font(sy(26))
-    bottom_label_font = _stats_font(sy(24))
-    value_font = _stats_font(sy(40))
-    mmr_font = _stats_font(sy(40))
-    rank_font = _stats_font(sy(42))
+    title_font = _stats_font(sy(58))
+    username_font = _fit_font_size_for_text(player_name or "Unknown", sx(610), sy(72), min_size=sy(38))
+    country_font = _stats_font(sy(34))
+    country_small_font = _stats_font(sy(18))
+    label_font = _stats_font(sy(24))
+    top_value_font = _stats_font(sy(38))
+    top_small_value_font = _stats_font(sy(34))
+    bottom_label_font = _stats_font(sy(25))
+    value_font = _stats_font(sy(46))
+    mmr_font = _stats_font(sy(56))
+    rank_label_font = _stats_font(sy(25))
+    rank_font = _fit_font_size_for_text(rank_display, sx(205), sy(58), min_size=sy(30))
 
-    # Main panel with border style closer to reference
+    # subtle dark glass overlay so text always reads well on the generated background
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
-    panel = (sx(225), sy(106), sx(1474), sy(844))
-    od.rounded_rectangle(
-        panel,
-        radius=sy(34),
-        fill=(5, 8, 28, 198),
-        outline=(*end_rgb, 205),
-        width=max(2, sy(3)),
-    )
-    inner = (sx(240), sy(121), sx(1459), sy(829))
-    od.rounded_rectangle(
-        inner,
-        radius=sy(28),
-        outline=(*start_rgb, 95),
-        width=max(1, sy(2)),
-    )
-    # header decorative side lines
-    od.line((sx(323), sy(130), sx(718), sy(130)), fill=(*start_rgb, 230), width=max(2, sy(3)))
-    od.line((sx(983), sy(130), sx(1378), sy(130)), fill=(*end_rgb, 230), width=max(2, sy(3)))
-    od.line((sx(760), sy(130), sx(812), sy(130)), fill=(*start_rgb, 190), width=max(1, sy(2)))
-    od.line((sx(888), sy(130), sx(940), sy(130)), fill=(*end_rgb, 190), width=max(1, sy(2)))
+    od.rectangle((0, 0, w, h), fill=(0, 0, 8, 30))
+    # thin external sci-fi rails; background already has the outer crystals
+    outer = (sx(55), sy(63), sx(1615), sy(908))
+    od.rounded_rectangle(outer, radius=sy(32), outline=(*blue_rgb, 70), width=max(1, sy(2)))
+    # top gold rails around title
+    od.line((sx(425), sy(85), sx(642), sy(85)), fill=(*gold_rgb, 180), width=max(2, sy(3)))
+    od.line((sx(1030), sy(85), sx(1247), sy(85)), fill=(*gold_rgb, 180), width=max(2, sy(3)))
     img = Image.alpha_composite(img, overlay)
     draw = ImageDraw.Draw(img)
 
-    _center_text(draw, (sx(850), sy(150)), "PJSK LOUNGE STATS", title_font, fill=white, stroke_width=max(2, sy(3)), stroke_fill=rank_stroke)
+    # Header
+    _center_text(
+        draw,
+        (sx(836), sy(78)),
+        "PJSK LOUNGE STATS",
+        title_font,
+        fill=(245, 247, 255, 255),
+        stroke_width=max(2, sy(3)),
+        stroke_fill=(30, 48, 88, 255),
+    )
 
-    # Avatar + name
-    avatar_size = sy(190)
-    avatar_x = sx(305)
-    avatar_y = sy(215)
-    glow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    gd = ImageDraw.Draw(glow_layer)
-    gd.ellipse((avatar_x - sy(16), avatar_y - sy(16), avatar_x + avatar_size + sy(16), avatar_y + avatar_size + sy(16)), fill=(*start_rgb, 46))
-    img = Image.alpha_composite(img, glow_layer)
-    ring = _make_ellipse_ring(avatar_size + sy(16), max(6, sy(10)), start_rgb, end_rgb)
-    img.paste(ring, (avatar_x - sy(8), avatar_y - sy(8)), ring)
+    # Avatar ring
+    avatar_size = sy(250)
+    avatar_x = sx(225)
+    avatar_y = sy(126)
+    glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse(
+        (avatar_x - sy(24), avatar_y - sy(24), avatar_x + avatar_size + sy(24), avatar_y + avatar_size + sy(24)),
+        fill=(*blue_rgb, 38),
+    )
+    gd.ellipse(
+        (avatar_x - sy(14), avatar_y - sy(14), avatar_x + avatar_size + sy(14), avatar_y + avatar_size + sy(14)),
+        outline=(*gold_rgb, 150),
+        width=max(2, sy(4)),
+    )
+    img = Image.alpha_composite(img, glow)
+
+    ring_outer = _make_ellipse_ring(avatar_size + sy(24), max(7, sy(10)), blue_rgb, gold_rgb)
+    img.paste(ring_outer, (avatar_x - sy(12), avatar_y - sy(12)), ring_outer)
+    ring_inner = _make_ellipse_ring(avatar_size + sy(4), max(3, sy(4)), (255, 229, 150), gold_rgb)
+    img.paste(ring_inner, (avatar_x - sy(2), avatar_y - sy(2)), ring_inner)
 
     avatar_drawn = False
     if avatar_bytes:
@@ -1493,101 +1762,171 @@ def generate_stats_image(
 
     draw = ImageDraw.Draw(img)
     if not avatar_drawn:
-        draw.ellipse((avatar_x + sy(65), avatar_y + sy(45), avatar_x + sy(125), avatar_y + sy(105)), fill=(115, 113, 155, 255))
-        draw.pieslice((avatar_x + sy(45), avatar_y + sy(105), avatar_x + sy(145), avatar_y + sy(205)), start=180, end=360, fill=(115, 113, 155, 255))
+        draw.ellipse((avatar_x + sy(82), avatar_y + sy(58), avatar_x + sy(168), avatar_y + sy(144)), fill=(74, 93, 146, 255))
+        draw.pieslice((avatar_x + sy(60), avatar_y + sy(142), avatar_x + sy(190), avatar_y + sy(275)), start=180, end=360, fill=(74, 93, 146, 255))
 
-    safe_name = player_name or "Unknown"
-    _draw_glow_text(draw, (sx(560), sy(250)), safe_name, username_font, fill=white, glow=(*start_rgb, 120), stroke_width=max(2, sy(3)))
-    draw.line((sx(555), sy(330), sx(1030), sy(330)), fill=(*end_rgb, 115), width=max(1, sy(2)))
+    # Username and country badge
+    safe_name = str(player_name or "Unknown").strip() or "Unknown"
+    _draw_glow_text(
+        draw,
+        (sx(570), sy(198)),
+        safe_name,
+        username_font,
+        fill=(245, 248, 255, 255),
+        glow=(*blue_rgb, 105),
+        stroke_width=max(2, sy(3)),
+    )
+    draw.line((sx(565), sy(292), sx(1138), sy(292)), fill=(*gold_rgb, 210), width=max(2, sy(3)))
+    _draw_country_badge(
+        img,
+        (sx(545), sy(318), sx(935), sy(382)),
+        country_code=country_code,
+        country_name=country_name,
+        font=country_font,
+        small_font=country_small_font,
+        outline_rgb=blue_rgb,
+    )
+    draw = ImageDraw.Draw(img)
 
-    # Rank box
-    rank_box = (sx(1120), sy(212), sx(1378), sy(445))
-    draw.rounded_rectangle(rank_box, radius=sy(20), fill=(7, 10, 26, 225), outline=(*end_rgb, 205), width=max(2, sy(3)))
-    inner_rank = (sx(1132), sy(224), sx(1366), sy(433))
-    draw.rounded_rectangle(inner_rank, radius=sy(16), outline=(*start_rgb, 90), width=max(1, sy(2)))
-    _center_text(draw, (sx(1248), sy(245)), "RANK", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
+    # Rank box on the right
+    rank_box = (sx(1210), sy(128), sx(1460), sy(398))
+    _draw_sci_fi_card(draw, rank_box, gold_rgb, fill=(5, 7, 19, 218), radius=sy(22), width=max(2, sy(3)), cut=sy(18))
+    inner_rank = (rank_box[0] + sx(14), rank_box[1] + sy(15), rank_box[2] - sx(14), rank_box[3] - sy(15))
+    draw.rounded_rectangle(inner_rank, radius=sy(18), outline=(*gold_rgb, 95), width=max(1, sy(2)))
+    _center_text(draw, (sx(1335), sy(170)), "RANK", rank_label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     rank_logo = _load_rank_logo(rank)
     if rank_logo:
-        rank_logo = ImageOps.contain(rank_logo, (sx(145), sy(116)), method=Image.Resampling.LANCZOS)
-        _paste_centered(img, rank_logo, (sx(1248), sy(320)))
+        rank_logo = ImageOps.contain(rank_logo, (sx(162), sy(124)), method=Image.Resampling.LANCZOS)
+        _paste_centered(img, rank_logo, (sx(1335), sy(258)))
+    else:
+        _draw_shield_icon(draw, sx(1335), sy(258), sy(108), gold_rgb, star=True)
 
-    _draw_gradient_text_centered(img, (sx(1248), sy(405)), rank_display, rank_font, start_rgb, end_rgb, stroke_fill=rank_stroke, stroke_width=max(2, sy(3)))
+    _draw_gradient_text_centered(
+        img,
+        (sx(1335), sy(355)),
+        rank_display,
+        rank_font,
+        start_rgb,
+        end_rgb,
+        stroke_fill=(30, 25, 10, 255),
+        stroke_width=max(2, sy(3)),
+    )
     draw = ImageDraw.Draw(img)
 
-    # Top stat cards - smaller text and cleaner spacing
+    # Top stat cards with icons
     cards = [
-        (sx(330), sy(455), sx(558), sy(572)),
-        (sx(585), sy(455), sx(813), sy(572)),
-        (sx(840), sy(455), sx(1068), sy(572)),
-        (sx(1095), sy(455), sx(1323), sy(572)),
+        (sx(155), sy(463), sx(468), sy(585)),
+        (sx(500), sy(463), sx(813), sy(585)),
+        (sx(845), sy(463), sx(1158), sy(585)),
+        (sx(1190), sy(463), sx(1503), sy(585)),
     ]
     for rect in cards:
-        _draw_stat_group(draw, rect, end_rgb, radius=sy(14), width=max(1, sy(2)), fill=(5, 8, 24, 150))
+        _draw_sci_fi_card(draw, rect, blue_rgb, fill=(4, 10, 30, 188), radius=sy(16), width=max(1, sy(2)), cut=sy(16))
 
-    _center_text(draw, (sx(444), sy(488)), "POSITION", label_font, fill=white)
-    _center_text(draw, (sx(444), sy(529)), f"{int(position)} / {int(total_players)}", top_value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
+    icon_y = sy(525)
+    _draw_position_icon(draw, sx(222), icon_y, sy(56), blue_rgb)
+    _draw_swords_icon(draw, sx(568), icon_y, sy(56), blue_rgb)
+    _draw_target_icon(draw, sx(912), icon_y, sy(56), blue_rgb)
+    _draw_chart_icon(draw, sx(1258), icon_y, sy(56), blue_rgb)
 
-    _center_text(draw, (sx(699), sy(488)), "MATCHES PLAYED", label_font, fill=white)
-    _center_text(draw, (sx(699), sy(529)), str(int(matches_played)), top_value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
+    _center_text(draw, (sx(378), sy(505)), "POSITION", label_font, fill=(220, 232, 255, 245))
+    _center_text(draw, (sx(378), sy(552)), f"{int(position)} / {int(total_players)}", top_value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
-    _center_text(draw, (sx(954), sy(488)), "LAST 10", label_font, fill=white)
-    _draw_centered_segments(draw, (sx(954), sy(529)), [(f"{int(last10_wins)}W", green), (" - ", white), (f"{int(last10_losses)}L", red)], top_value_font, gap=0, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
+    _center_text(draw, (sx(708), sy(505)), "MATCHES PLAYED", label_font, fill=(220, 232, 255, 245))
+    _center_text(draw, (sx(708), sy(552)), str(int(matches_played)), top_value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
-    _center_text(draw, (sx(1209), sy(488)), "LAST 10 ± MMR", label_font, fill=white)
+    _center_text(draw, (sx(1053), sy(505)), "LAST 10", label_font, fill=(220, 232, 255, 245))
+    _draw_centered_segments(
+        draw,
+        (sx(1053), sy(552)),
+        [(f"{int(last10_wins)}W", green), (" - ", white), (f"{int(last10_losses)}L", red)],
+        top_value_font,
+        gap=0,
+        stroke_width=max(1, sy(2)),
+        stroke_fill=(0, 0, 0, 255),
+    )
+
+    _center_text(draw, (sx(1400), sy(505)), "LAST 10 ± MMR", label_font, fill=(220, 232, 255, 245))
     delta_value = int(last10_mmr_delta or 0)
     if delta_value > 0:
-        segs = [(f"+{delta_value}", green), (" MMR", green)]
+        delta_segs = [(f"+{delta_value}", green), (" MMR", green)]
     elif delta_value < 0:
-        segs = [(str(delta_value), red), (" MMR", red)]
+        delta_segs = [(str(delta_value), red), (" MMR", red)]
     else:
-        segs = [("0", white), (" MMR", white)]
-    _draw_centered_segments(draw, (sx(1209), sy(529)), segs, top_small_value_font, gap=0, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
+        delta_segs = [("0", white), (" MMR", white)]
+    _draw_centered_segments(
+        draw,
+        (sx(1400), sy(552)),
+        delta_segs,
+        top_small_value_font,
+        gap=0,
+        stroke_width=max(1, sy(2)),
+        stroke_fill=(0, 0, 0, 255),
+    )
 
-    # MMR progress panel
-    bar_panel = (sx(275), sy(602), sx(1424), sy(718))
-    draw.rounded_rectangle(bar_panel, radius=sy(18), fill=(5, 8, 24, 228), outline=(*end_rgb, 200), width=max(2, sy(3)))
-    inner_bar_panel = (sx(288), sy(614), sx(1411), sy(706))
-    draw.rounded_rectangle(inner_bar_panel, radius=sy(14), outline=(*start_rgb, 88), width=max(1, sy(2)))
-    _center_text(draw, (sx(850), sy(626)), "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
+    # MMR progress panel/bar
+    bar_panel = (sx(130), sy(615), sx(1542), sy(742))
+    _draw_sci_fi_card(draw, bar_panel, gold_rgb, fill=(5, 8, 20, 202), radius=sy(20), width=max(2, sy(3)), cut=sy(22))
+    _center_text(draw, (sx(836), sy(638)), "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
-    bar_x1, bar_y1, bar_x2, bar_y2 = sx(370), sy(652), sx(1330), sy(704)
-    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(20), fill=(4, 9, 26, 248), outline=(*end_rgb, 230), width=max(2, sy(3)))
+    bar_x1, bar_y1, bar_x2, bar_y2 = sx(280), sy(663), sx(1392), sy(720)
+    draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(22), fill=(2, 9, 30, 245), outline=(*gold_rgb, 230), width=max(2, sy(3)))
     progress_text, progress = _rank_progress(rank, current_mmr)
     fill_x2 = bar_x1 + int((bar_x2 - bar_x1) * progress)
-    if fill_x2 > bar_x1 + sy(10):
-        fill_w = max(1, fill_x2 - (bar_x1 + sy(6)))
-        fill_h = max(1, (bar_y2 - sy(6)) - (bar_y1 + sy(6)))
+    if fill_x2 > bar_x1 + sy(12):
+        pad = sy(6)
+        fill_w = max(1, fill_x2 - (bar_x1 + pad))
+        fill_h = max(1, (bar_y2 - pad) - (bar_y1 + pad))
         fill_grad = _make_horizontal_gradient((fill_w, fill_h), start_rgb, end_rgb)
         fill_mask = Image.new("L", (fill_w, fill_h), 0)
         fmd = ImageDraw.Draw(fill_mask)
-        fmd.rounded_rectangle((0, 0, fill_w - 1, fill_h - 1), radius=sy(16), fill=255)
-        img.paste(fill_grad, (bar_x1 + sy(6), bar_y1 + sy(6)), fill_mask)
-        shine = Image.new("RGBA", (fill_w, max(1, sy(12))), (255, 255, 255, 0))
+        fmd.rounded_rectangle((0, 0, fill_w - 1, fill_h - 1), radius=sy(18), fill=255)
+        img.paste(fill_grad, (bar_x1 + pad, bar_y1 + pad), fill_mask)
+        # shine and end glow
+        shine = Image.new("RGBA", (fill_w, max(1, sy(16))), (255, 255, 255, 0))
         sd = ImageDraw.Draw(shine)
-        sd.rectangle((0, 0, fill_w, max(1, sy(12))), fill=(255, 255, 255, 65))
-        img.paste(shine, (bar_x1 + sy(6), bar_y1 + sy(8)), shine)
+        sd.rounded_rectangle((0, 0, fill_w, max(1, sy(16))), radius=sy(8), fill=(255, 255, 255, 70))
+        img.paste(shine, (bar_x1 + pad, bar_y1 + sy(8)), shine)
+        end_glow = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        eg = ImageDraw.Draw(end_glow)
+        eg.ellipse((fill_x2 - sy(38), bar_y1 - sy(14), fill_x2 + sy(42), bar_y2 + sy(14)), fill=(*end_rgb, 32))
+        img = Image.alpha_composite(img, end_glow)
 
     draw = ImageDraw.Draw(img)
-    _center_text(draw, (sx(850), sy(678)), progress_text, mmr_font, fill=white, stroke_width=max(2, sy(3)), stroke_fill=rank_stroke)
+    _center_text(
+        draw,
+        (sx(836), sy(691)),
+        progress_text,
+        mmr_font,
+        fill=(255, 255, 255, 255),
+        stroke_width=max(2, sy(3)),
+        stroke_fill=rank_stroke,
+    )
 
     # Bottom cards
     bottom_cards = [
-        (sx(300), sy(742), sx(630), sy(830)),
-        (sx(685), sy(742), sx(1015), sy(830)),
-        (sx(1070), sy(742), sx(1400), sy(830)),
+        (sx(150), sy(770), sx(570), sy(888)),
+        (sx(625), sy(770), sx(1047), sy(888)),
+        (sx(1098), sy(770), sx(1518), sy(888)),
     ]
     for rect in bottom_cards:
-        _draw_stat_group(draw, rect, end_rgb, radius=sy(14), width=max(1, sy(2)), fill=(5, 8, 24, 150))
+        _draw_sci_fi_card(draw, rect, blue_rgb, fill=(4, 10, 30, 188), radius=sy(16), width=max(1, sy(2)), cut=sy(16))
 
-    _center_text(draw, (sx(465), sy(770)), "PEAK MMR", bottom_label_font, fill=white)
-    _center_text(draw, (sx(465), sy(810)), str(int(peak_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
+    _draw_crown_icon(draw, sx(230), sy(830), sy(56), blue_rgb)
+    _draw_shield_icon(draw, sx(700), sy(830), sy(60), blue_rgb, star=True)
+    _draw_shield_icon(draw, sx(1174), sy(830), sy(60), blue_rgb, star=True)
 
-    _center_text(draw, (sx(850), sy(770)), "CURRENT MMR", bottom_label_font, fill=white)
-    _center_text(draw, (sx(850), sy(810)), str(int(current_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0,0,0,255))
+    _center_text(draw, (sx(425), sy(805)), "PEAK MMR", bottom_label_font, fill=(220, 232, 255, 245))
+    _center_text(draw, (sx(425), sy(855)), str(int(peak_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
-    _center_text(draw, (sx(1235), sy(770)), "CURRENT SEASON", bottom_label_font, fill=white)
-    _center_text(draw, (sx(1235), sy(810)), str(season_name).upper(), value_font, fill=white, stroke_width=max(1, sy(2)), stroke_fill=(0,0,0,255))
+    _center_text(draw, (sx(902), sy(805)), "CURRENT MMR", bottom_label_font, fill=(220, 232, 255, 245))
+    _center_text(draw, (sx(902), sy(855)), str(int(current_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
+
+    _center_text(draw, (sx(1370), sy(805)), "CURRENT SEASON", bottom_label_font, fill=(220, 232, 255, 245))
+    season_text = str(season_name or "").upper()
+    season_font = _fit_font_size_for_text(season_text, sx(270), sy(48), min_size=sy(30))
+    _center_text(draw, (sx(1370), sy(855)), season_text, season_font, fill=white, stroke_width=max(1, sy(2)), stroke_fill=(0, 0, 0, 255))
 
     out = io.BytesIO()
     img.save(out, format="PNG")

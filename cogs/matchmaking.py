@@ -2906,8 +2906,12 @@ class Matchmaking(commands.Cog):
         async with self.db_pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT sp.mmr, sp.role
+                SELECT
+                    sp.mmr,
+                    sp.role,
+                    COALESCE(p.country, '') AS country
                 FROM seasonplayers sp
+                LEFT JOIN players p ON p.user_id = sp.user_id
                 WHERE sp.season_id = $1 AND sp.user_id = $2
                 """,
                 season_id,
@@ -2994,6 +2998,7 @@ class Matchmaking(commands.Cog):
             "last10_losses": last10_losses,
             "last10_mmr_delta": last10_delta,
             "peak_mmr": visible_peak,
+            "country_code": str(row["country"] or "").upper().strip(),
         }
     async def resolve_member_name(self, guild: discord.Guild, user_id: int) -> str:
         """Nick del servidor > global display name > username."""
@@ -5348,6 +5353,7 @@ class Matchmaking(commands.Cog):
             current_mmr=int(data["mmr"]),
             season_name=str(season_name),
             last10_mmr_delta=int(data.get("last10_mmr_delta", 0)),
+            country_code=str(data.get("country_code") or ""),
         )
 
         file = discord.File(
