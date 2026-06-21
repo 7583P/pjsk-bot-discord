@@ -1958,20 +1958,54 @@ def generate_stats_image(
     for rect in bottom_cards:
         _draw_sci_fi_card(draw, rect, blue_rgb, fill=(4, 10, 30, 188), radius=sy(16), width=max(1, sy(2)), cut=sy(16))
 
-    _draw_crown_icon(draw, sx(230), sy(830), sy(56), blue_rgb)
-    _draw_shield_icon(draw, sx(700), sy(830), sy(60), blue_rgb, star=True)
-    _draw_shield_icon(draw, sx(1174), sy(830), sy(60), blue_rgb, star=True)
+    bottom_specs = [
+        {
+            "rect": bottom_cards[0],
+            "label": "PEAK MMR",
+            "value": str(int(peak_mmr)),
+            "icon": lambda d, cx, cy, sz: _draw_crown_icon(d, cx, cy, sz, blue_rgb),
+        },
+        {
+            "rect": bottom_cards[1],
+            "label": "CURRENT MMR",
+            "value": str(int(current_mmr)),
+            "icon": lambda d, cx, cy, sz: _draw_shield_icon(d, cx, cy, sz, blue_rgb, star=True),
+        },
+        {
+            "rect": bottom_cards[2],
+            "label": "CURRENT SEASON",
+            "value": str(season_name or "").upper(),
+            "icon": lambda d, cx, cy, sz: _draw_shield_icon(d, cx, cy, sz, blue_rgb, star=True),
+        },
+    ]
 
-    _center_text(draw, (sx(425), sy(805)), "PEAK MMR", bottom_label_font, fill=(220, 232, 255, 245))
-    _center_text(draw, (sx(425), sy(855)), str(int(peak_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
+    for spec in bottom_specs:
+        x1, y1, x2, y2 = spec["rect"]
+        card_w = x2 - x1
+        card_h = y2 - y1
 
-    _center_text(draw, (sx(902), sy(805)), "CURRENT MMR", bottom_label_font, fill=(220, 232, 255, 245))
-    _center_text(draw, (sx(902), sy(855)), str(int(current_mmr)), value_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
+        icon_cx = x1 + int(card_w * 0.19)
+        icon_cy = y1 + int(card_h * 0.50)
+        spec["icon"](draw, icon_cx, icon_cy, sy(56))
 
-    _center_text(draw, (sx(1370), sy(805)), "CURRENT SEASON", bottom_label_font, fill=(220, 232, 255, 245))
-    season_text = str(season_name or "").upper()
-    season_font = _fit_font_size_for_text(season_text, sx(270), sy(48), min_size=sy(30))
-    _center_text(draw, (sx(1370), sy(855)), season_text, season_font, fill=white, stroke_width=max(1, sy(2)), stroke_fill=(0, 0, 0, 255))
+        text_center_x = x1 + int(card_w * 0.62)
+        label_y = y1 + int(card_h * 0.30)
+        value_y = y1 + int(card_h * 0.68)
+        text_max_w = int(card_w * 0.58)
+
+        label_font_fit = _fit_font_size_for_text(spec["label"], text_max_w, sy(25), min_size=sy(18))
+        value_font_fit = _fit_font_size_for_text(spec["value"], text_max_w, sy(48), min_size=sy(28))
+
+        _center_text(draw, (text_center_x, label_y), spec["label"], label_font_fit, fill=(220, 232, 255, 245))
+        _center_text(
+            draw,
+            (text_center_x, value_y),
+            spec["value"],
+            value_font_fit,
+            fill=white,
+            stroke_width=max(1, sy(2)),
+            stroke_fill=(0, 0, 0, 255),
+        )
 
     out = io.BytesIO()
     img.save(out, format="PNG")
