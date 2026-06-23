@@ -937,6 +937,28 @@ class Matchmaking(commands.Cog):
                 return rid, info
         return None, None
 
+    @staticmethod
+    def _room_is_locked_for_player_exit(info: dict | None) -> bool:
+        """
+        True cuando el jugador ya no puede salirse voluntariamente de la room.
+
+        Lockdown empieza cuando el bot crea el hilo/room y manda
+        "You are locked in for this slot". Desde ese momento:
+        - /d ya no puede remover jugadores del room.
+        - Si alguien sale del server, sigue contando hasta submit.
+        - El submit debe seguir esperando las 5 líneas.
+        """
+        if not info or info.get("finished", False):
+            return False
+
+        phase = info.get("phase")
+        return bool(
+            info.get("locked_in_thread", False)
+            or info.get("slot_start_ts") is not None
+            or info.get("started", False)
+            or phase in (PHASE_FUTURE, PHASE_PREPARED, PHASE_STARTED)
+        )
+
 
     def _current_prep_slot_ts(self, now: dt.datetime) -> int | None:
         """
@@ -2313,6 +2335,11 @@ class Matchmaking(commands.Cog):
             "join_channel_id": join_channel.id,
             "server": server_code,
             "players": [],
+            # user_id -> snapshot visual. Esto permite mantener al jugador en la sala
+            # aunque salga del servidor y Discord lo saque automáticamente del hilo.
+            "player_snapshots": {},
+            # user_ids que salieron del servidor, pero siguen contando para submit.
+            "left_server_user_ids": set(),
             "phase": PHASE_FUTURE,  # FUTURE: thread listo, songs aún NO
             "locked_in_thread": True,  # si quieres que estén bloqueados desde PREP
             "started": False,
@@ -2363,10 +2390,55 @@ class Matchmaking(commands.Cog):
     def _disp(self, info: dict, fallback_rid: int) -> int:
         return int(info.get("display_num") or fallback_rid)
 
+    def _remember_room_player_snapshot(self, info: dict, member: discord.Member):
+        """
+        Guarda datos mínimos del jugador para que la sala no pierda su identidad
+        si sale del servidor antes del submit.
+        """
+        snapshots = info.setdefault("player_snapshots", {})
+        snapshots[int(member.id)] = {
+            "display_name": member.display_name,
+            "mention": member.mention,
+            "is_placement": bool(self._is_placement_member(member)),
+            "is_season_placement": bool(self._has_season_placement_role(member)),
+        }
+
+    def _replace_room_player_object(self, info: dict, member: discord.Member) -> bool:
+        """
+        Reemplaza el objeto Member viejo por el nuevo cuando el usuario reingresa.
+        Devuelve True si el usuario ya estaba listado en la sala.
+        """
+        players = info.setdefault("players", [])
+        for i, p in enumerate(players):
+            if int(getattr(p, "id", 0) or 0) == int(member.id):
+                players[i] = member
+                self._remember_room_player_snapshot(info, member)
+                info.setdefault("left_server_user_ids", set()).discard(int(member.id))
+                return True
+        return False
+
     async def _add_member_to_room(self, member: discord.Member, rid: int, info: dict):
-        if member in info.get("players", []):
-            return
-        info["players"].append(member)
+        players = info.setdefault("players", [])
+
+        # Comparar por ID, no por identidad de objeto. Si el usuario salió y volvió,
+        # Discord entrega otro objeto Member, pero sigue siendo el mismo jugador.
+        existing_idx = next(
+            (
+                i
+                for i, p in enumerate(players)
+                if int(getattr(p, "id", 0) or 0) == int(member.id)
+            ),
+            None,
+        )
+
+        if existing_idx is None:
+            players.append(member)
+        else:
+            players[existing_idx] = member
+
+        self._remember_room_player_snapshot(info, member)
+        info.setdefault("left_server_user_ids", set()).discard(int(member.id))
+
         try:
             await self.bot.get_channel(info["join_channel_id"]).get_thread(
                 info["thread"]
@@ -2391,9 +2463,21 @@ class Matchmaking(commands.Cog):
     async def _remove_member_from_room(
         self, member: discord.Member, rid: int, info: dict
     ):
-        if member not in info.get("players", []):
+        players = info.setdefault("players", [])
+        before = len(players)
+        info["players"] = [
+            p for p in players
+            if int(getattr(p, "id", 0) or 0) != int(member.id)
+        ]
+        if len(info["players"]) == before:
             return
-        info["players"].remove(member)
+
+        try:
+            info.setdefault("player_snapshots", {}).pop(int(member.id), None)
+            info.setdefault("left_server_user_ids", set()).discard(int(member.id))
+        except Exception:
+            pass
+
         try:
             await self.bot.get_channel(info["join_channel_id"]).get_thread(
                 info["thread"]
@@ -2401,6 +2485,59 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
         await self.update_room_board(member.guild, rid)
+
+    async def _reattach_member_to_active_room_threads(self, member: discord.Member):
+        """
+        Si un usuario salió del servidor estando locked/started en una sala, Discord
+        lo saca del hilo privado. Al reingresar, lo volvemos a agregar al hilo
+        original y NO se crea una sala/queue nueva.
+        """
+        touched = False
+
+        for rid, info in list(self.rooms.items()):
+            if info.get("finished", False):
+                continue
+
+            players = info.get("players", []) or []
+            if not any(int(getattr(p, "id", 0) or 0) == int(member.id) for p in players):
+                continue
+
+            self._replace_room_player_object(info, member)
+
+            thread = self.bot.get_channel(info["join_channel_id"]).get_thread(info["thread"])
+            if thread is None:
+                continue
+
+            try:
+                await thread.add_user(member)
+            except Exception:
+                pass
+
+            try:
+                await thread.send(
+                    f"✅ {member.mention} rejoined the server and was added back to this room.",
+                    allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                )
+            except Exception:
+                pass
+
+            try:
+                await self.update_room_board(member.guild, rid)
+            except Exception:
+                pass
+
+            try:
+                self.bot.dispatch("room_updated", rid)
+            except Exception:
+                pass
+
+            touched = True
+
+        if touched:
+            try:
+                self.bot.dispatch("room_updated", None)
+            except Exception:
+                pass
 
     async def _cascade_insert(
         self,
@@ -3038,11 +3175,21 @@ class Matchmaking(commands.Cog):
             return ""
 
         players = [m for m in (info.get("players", []) or []) if m and not m.bot]
+        snapshots = info.setdefault("player_snapshots", {})
+        left_server_ids = set(info.get("left_server_user_ids") or set())
 
-        # ✅ usa MMR “display” (SeasonPlacement => prev-100)
+        # ✅ usa MMR “display” (SeasonPlacement => prev-50)
         mmr_map = await self._effective_display_mmrs(players)
 
-        rows = [{"user_id": m.id, "mmr": int(mmr_map.get(m.id, 0))} for m in players]
+        rows = []
+        seen_ids: set[int] = set()
+        for m in players:
+            uid = int(m.id)
+            if uid in seen_ids:
+                continue
+            seen_ids.add(uid)
+            rows.append({"user_id": uid, "mmr": int(mmr_map.get(uid, 0))})
+
         rows.sort(key=lambda r: r["mmr"], reverse=True)
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
@@ -3069,10 +3216,24 @@ class Matchmaking(commands.Cog):
 
         lines = []
         for r in rows:
-            member = guild.get_member(r["user_id"])
-            name = await self.resolve_member_name(guild, r["user_id"])
-            label = await self._mmr_label_for_member(member, int(r['mmr']))
-            lines.append(f"• {name} ({label})")
+            uid = int(r["user_id"])
+            member = guild.get_member(uid)
+
+            if member is not None:
+                name = await self.resolve_member_name(guild, uid)
+                label = await self._mmr_label_for_member(member, int(r["mmr"]))
+            else:
+                snap = snapshots.get(uid) or snapshots.get(str(uid)) or {}
+                name = str(snap.get("display_name") or f"ID:{uid}")
+                if bool(snap.get("is_season_placement")):
+                    label = f"{int(r['mmr'])} Starting MMR"
+                elif bool(snap.get("is_placement")):
+                    label = "Placement"
+                else:
+                    label = f"{int(r['mmr'])} MMR"
+
+            suffix = " — left server, kept for submit" if uid in left_server_ids else ""
+            lines.append(f"• {name} ({label}){suffix}")
 
         ts = int(datetime.datetime.utcnow().timestamp())
         return header + ("\n" + "\n".join(lines) if lines else "") + f"\n\nLast Update <t:{ts}:R>"
@@ -3503,6 +3664,29 @@ class Matchmaking(commands.Cog):
                     return
 
     @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        # Discord borra todos los roles cuando alguien sale del servidor.
+        # Al volver, restauramos el rol competitivo usando seasonplayers como fuente de verdad.
+        if member.guild.id != GUILD_ID:
+            return
+
+        try:
+            await self._sync_member_rank_role_from_current_season(
+                member.guild,
+                member,
+                reason="Member rejoined -> sync current-season rank role",
+            )
+        except Exception:
+            pass
+
+        # Si salió del servidor estando en una room, NO perdió su slot.
+        # Al volver, lo agregamos al hilo original y actualizamos su objeto Member.
+        try:
+            await self._reattach_member_to_active_room_threads(member)
+        except Exception:
+            pass
+
+    @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member):
         # cambio de nickname en el servidor
         if before.nick != after.nick:
@@ -3522,16 +3706,19 @@ class Matchmaking(commands.Cog):
             return
 
         # =========================================================
-        # (A) NUEVO: si se fue mientras estaba en queue → sacarlo + anunciar Dropped
-        #     + best-effort: removerlo de rooms no-finished para evitar "ghosts"
+        # (A) Si se fue del servidor:
+        #     - si estaba en queue normal, sí se saca de la queue.
+        #     - si ya estaba en room/locked thread, NO se remueve de la sala.
+        #       Debe seguir contando como jugador hasta submit.
         # =========================================================
         try:
             async with self._join_lock:
-                # A1) Remover de cualquier queue (EN/JP) y anunciar en su canal
+                # A1) Remover de cualquier queue EN/JP porque todavía no tenía slot locked.
                 for join_id in list(ALLOWED_JOIN_CHANNELS):
                     q = self.queues.get(join_id, set())
                     if member.id in q:
                         q.discard(member.id)
+                        self.queue_join_order.get(join_id, {}).pop(member.id, None)
 
                         ch = member.guild.get_channel(join_id)
                         if isinstance(ch, discord.TextChannel):
@@ -3543,118 +3730,51 @@ class Matchmaking(commands.Cog):
                             except Exception:
                                 pass
 
-                # A2) Remover del listado de players de cualquier room activa (si estaba)
-                #     (Esto evita que una sala quede "llena" con un usuario que ya no existe)
-                affected_parent_ids: set[int] = set()
-
+                # A2) Si ya estaba dentro de una room, mantenerlo en info["players"].
+                # Discord puede sacarlo automáticamente del hilo privado al salir del server,
+                # pero el bot NO debe hacer remove_user, NO debe bajar 5/5 a 4/5 y NO debe
+                # rebalancear. El submit seguirá exigiendo sus 5 líneas.
                 for rid, info in list(self.rooms.items()):
                     if info.get("finished", False):
                         continue
 
                     players = info.get("players", []) or []
-                    # players suelen ser discord.Member, pero comparamos por id por seguridad
                     hit = next(
-                        (p for p in players if getattr(p, "id", None) == member.id),
+                        (p for p in players if int(getattr(p, "id", 0) or 0) == int(member.id)),
                         None,
                     )
                     if not hit:
                         continue
 
-                    # remover del array
                     try:
-                        info["players"] = [
-                            p for p in players if getattr(p, "id", None) != member.id
-                        ]
-                    except Exception:
-                        # fallback ultra seguro
-                        try:
-                            players.remove(hit)
-                        except Exception:
-                            pass
-
-                    # intentar remover del thread (best effort)
-                    try:
-                        th = info.get("thread")
-                        if isinstance(th, discord.Thread):
-                            await th.remove_user(member)
+                        if isinstance(hit, discord.Member):
+                            self._remember_room_player_snapshot(info, hit)
                     except Exception:
                         pass
 
-                    # si el room estaba en countdown/starting y se cayó de 5, cancela countdown si existe
-                    if (
-                        info.get("starting", False)
-                        and len(info.get("players", [])) < ROOM_CAPACITY
-                    ):
+                    info.setdefault("left_server_user_ids", set()).add(int(member.id))
+
+                    thread = self.bot.get_channel(info["join_channel_id"]).get_thread(info["thread"])
+                    if thread is not None:
                         try:
-                            if hasattr(self, "_cancel_countdown_if_any"):
-                                await self._cancel_countdown_if_any(
-                                    info,
-                                    reason="Countdown canceled (player left the server).",
-                                )
+                            await thread.send(
+                                f"⚠️ <@{member.id}> left the server, but remains listed in this room until submit. "
+                                f"If they rejoin, I will add them back to this thread.",
+                                allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
+                            )
                         except Exception:
                             pass
 
-                    # si queda vacío y aún no empezó, elimina el thread y saca el room del dict
-                    try:
-                        th = info.get("thread")
-                        if (
-                            not info.get("started", False)
-                            and len(info.get("players", [])) == 0
-                            and isinstance(th, discord.Thread)
-                        ):
-                            try:
-                                await th.delete(
-                                    reason="Empty room after member left server"
-                                )
-                            except Exception:
-                                pass
-                            self.rooms.pop(rid, None)
-                            try:
-                                self.bot.dispatch("room_finished", rid)
-                            except Exception:
-                                pass
-                            continue
-                    except Exception:
-                        pass
-
-                    # refrescar tablero del room
                     try:
                         await self.update_room_board(member.guild, rid)
                     except Exception:
                         pass
 
-                    # marcar parent para rebalance (si aplica)
-                    try:
-                        th = info.get("thread")
-                        if isinstance(th, discord.Thread) and isinstance(
-                            th.parent_id, int
-                        ):
-                            affected_parent_ids.add(th.parent_id)
-                    except Exception:
-                        pass
-
-                    # notificar a Rooms cog
                     try:
                         self.bot.dispatch("room_updated", rid)
                     except Exception:
                         pass
 
-                # A3) Si afectó algún parent (#join / #jp-join), intenta rebalance
-                for parent_id in list(affected_parent_ids):
-                    if parent_id in ALLOWED_JOIN_CHANNELS:
-                        parent_ch = member.guild.get_channel(parent_id)
-                        if isinstance(parent_ch, discord.TextChannel):
-                            try:
-                                # Rebalance en background para reordenar rooms y quitar huecos
-                                asyncio.create_task(
-                                    self._rebalance_parent_queue(
-                                        member.guild, parent_ch
-                                    )
-                                )
-                            except Exception:
-                                pass
-
-                # A4) refrescar #rooms global
                 try:
                     self.bot.dispatch("room_updated", None)
                 except Exception:
@@ -3662,6 +3782,22 @@ class Matchmaking(commands.Cog):
 
         except Exception:
             # No bloqueamos el resto del cleanup si falla algo acá
+            pass
+
+        # Si estaba en una room activa, no hacemos cleanup de DB.
+        # Debe permanecer como jugador válido hasta que la sala haga submit/forfeit.
+        try:
+            still_listed_in_room = any(
+                not info.get("finished", False)
+                and any(
+                    int(getattr(p, "id", 0) or 0) == int(member.id)
+                    for p in (info.get("players", []) or [])
+                )
+                for info in self.rooms.values()
+            )
+            if still_listed_in_room:
+                return
+        except Exception:
             pass
 
         # =========================================================
@@ -4671,6 +4807,18 @@ class Matchmaking(commands.Cog):
 
         member: discord.Member = interaction.user  # type: ignore
 
+        # Fail-safe: si el usuario salió del servidor, Discord le borra los roles.
+        # Al volver o al usar /c, sincronizamos su rol desde seasonplayers antes de
+        # calcular Season Placement / Placement / MMR.
+        try:
+            await self._sync_member_rank_role_from_current_season(
+                guild,
+                member,
+                reason="Sync current-season role before queue join",
+            )
+        except Exception:
+            pass
+
         async with self._join_lock:
             # Guard: ya estás en una sala activa (cualquier fase no-finished)
             already_room = self._find_player_room_id(member)
@@ -4753,10 +4901,11 @@ class Matchmaking(commands.Cog):
             if unlock_dt is not None:
                 unlock_ts = int(unlock_dt.timestamp())
                 extra = f" Next slot: <t:{unlock_ts}:T> (<t:{unlock_ts}:R>)."
-            member_mmr_map = await self._effective_display_mmrs([member])
-            member_mmr_label = await self._mmr_label_for_member(member, int(member_mmr_map.get(member.id, 0)))
+            queue_word = "player" if qcount == 1 else "players"
+            verb = "is" if qcount == 1 else "are"
             await ch.send(
-                f"{ping_part}({member.mention}) Joined the queue ({member_mmr_label}). Queue: `{qcount}`.{extra}",
+                f"{ping_part}({member.mention}) Joined the queue. "
+                f"There {verb} **{qcount}** {queue_word} in queue.{extra}",
                 allowed_mentions=discord.AllowedMentions(
                     users=True,
                     roles=should_ping_tag,
@@ -4769,7 +4918,7 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="d",
-        description="Drop queue in #join/#jp-join OR leave your current room thread",
+        description="Drop queue before lockdown. Locked rooms cannot be left.",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     async def leave_queue(self, interaction: discord.Interaction):
@@ -4793,19 +4942,27 @@ class Matchmaking(commands.Cog):
                         "ℹ️ This thread is not an active room.", ephemeral=True
                     )
 
-                if member not in (info.get("players", []) or []):
+                player_ids = {
+                    int(getattr(p, "id", 0) or 0)
+                    for p in (info.get("players", []) or [])
+                }
+                if int(member.id) not in player_ids:
                     return await interaction.followup.send(
                         "ℹ️ You are not listed as a player in this room.", ephemeral=True
                     )
 
-                # Si ya empezó, no permitir /d (usa /forfeit según tu flujo)
-                if info.get("phase") == PHASE_STARTED or info.get("started", False):
+                # Lockdown real:
+                # Después de que el bot creó la room/thread y mandó
+                # "You are locked in for this slot", nadie puede salirse con /d.
+                # Esto mantiene la room como 5/5 y el submit seguirá pidiendo 5 líneas.
+                if self._room_is_locked_for_player_exit(info):
                     return await interaction.followup.send(
-                        "❌ This match already started. Use `/forfeit` if everyone agrees to close the room.",
+                        "❌ This room is already locked in. You cannot leave after lockdown; "
+                        "you stay listed until submit.",
                         ephemeral=True,
                     )
 
-                # Remover del room + del thread
+                # Remover del room + del thread solo si todavía NO estaba locked.
                 await self._remove_member_from_room(member, int(rid), info)
 
                 # Best-effort: quitar roles de queue (por si acaso)
@@ -4852,11 +5009,21 @@ class Matchmaking(commands.Cog):
         # ------------------------------------------------------------
         if not isinstance(ch, discord.TextChannel) or ch.id not in ALLOWED_JOIN_CHANNELS:
             return await interaction.followup.send(
-                "This command works in #join/#jp-join (drop queue) or inside a room thread (leave room).",
+                "This command only drops queue before lockdown. Locked rooms cannot be left.",
                 ephemeral=True,
             )
 
         async with self._join_lock:
+            active_rid = self._find_player_room_id(member)
+            if active_rid is not None:
+                active_info = self.rooms.get(int(active_rid))
+                if self._room_is_locked_for_player_exit(active_info):
+                    return await interaction.followup.send(
+                        "❌ You are already locked in a room. You cannot drop after lockdown; "
+                        "you stay listed until submit.",
+                        ephemeral=True,
+                    )
+
             q = self.queues.get(ch.id, set())
             if member.id not in q:
                 return await interaction.followup.send(
@@ -7219,11 +7386,10 @@ class Matchmaking(commands.Cog):
                 matches_played_before = int(matches_played_before_map.get(uid, 0))
 
                 # Visual solamente para results.png:
-                # Placement normal + primera partida de la season.
-                # Season Placement no usa este badge.
+                # Placement normal y Season Placement deben usar el mismo tratamiento
+                # visual de placement en la primera partida de la season.
                 show_placement_badge = bool(
-                    is_rank_placement
-                    and not is_season_placement
+                    (is_rank_placement or is_season_placement)
                     and matches_played_before == 0
                 )
 
@@ -7517,6 +7683,111 @@ class Matchmaking(commands.Cog):
         finally:
             room["vote_in_progress"] = False
 
+    async def _apply_exact_rank_role_id(
+        self,
+        guild: discord.Guild,
+        member_or_id,
+        target_role_id: int,
+        reason: str = "",
+    ) -> bool:
+        """
+        Aplica exactamente un rol competitivo y limpia los demás roles competitivos.
+        Esto permite restaurar Season Placement al reingresar al servidor, porque
+        Discord elimina roles cuando alguien sale del guild.
+        """
+        rank_role_ids = set(RANK_ROLE_IDS.values()) | {SEASON_PLACEMENT_ROLE_ID}
+
+        member = (
+            member_or_id
+            if isinstance(member_or_id, discord.Member)
+            else guild.get_member(int(member_or_id))
+        )
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(member_or_id))
+            except Exception:
+                return False
+
+        target_role = guild.get_role(int(target_role_id))
+        if not target_role:
+            return False
+
+        keep = [r for r in member.roles if r.id not in rank_role_ids]
+        new_roles = list(dict.fromkeys(keep + [target_role]))
+
+        try:
+            await member.edit(
+                roles=new_roles,
+                reason=reason or "Sync current-season rank role",
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+
+    async def _sync_member_rank_role_from_current_season(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        reason: str = "",
+    ) -> bool:
+        """
+        Fuente de verdad: seasonplayers de la season activa.
+
+        - is_season_placement=true y 0 matches en la season actual -> rol Season Placement.
+        - role='Placement' -> rol Placement.
+        - cualquier otro role -> rol de rango correspondiente.
+
+        No cambia MMR ni escribe la DB; solo repara roles en Discord.
+        """
+        if member.bot or self.db_pool is None:
+            return False
+
+        season_row = await self.get_current_season()
+        if not season_row:
+            return False
+
+        season_id = int(season_row["id"])
+
+        async with self.db_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(sp.role, 'Placement') AS role,
+                    COALESCE(sp.is_season_placement, false) AS is_season_placement,
+                    COALESCE(mh.matches_played, 0)::int AS matches_played
+                FROM seasonplayers sp
+                LEFT JOIN (
+                    SELECT user_id, COUNT(*)::int AS matches_played
+                    FROM match_history
+                    WHERE season_id = $1 AND user_id = $2
+                    GROUP BY user_id
+                ) mh ON mh.user_id = sp.user_id
+                WHERE sp.season_id = $1
+                  AND sp.user_id = $2
+                """,
+                season_id,
+                int(member.id),
+            )
+
+        if not row:
+            return False
+
+        role_name = str(row["role"] or "Placement").strip()
+        is_season_placement = bool(row["is_season_placement"])
+        matches_played = int(row["matches_played"] or 0)
+
+        if is_season_placement and matches_played == 0:
+            target_role_id = SEASON_PLACEMENT_ROLE_ID
+        else:
+            target_role_id = RANK_ROLE_IDS.get(role_name, PLACEMENT_ROLE_ID)
+
+        return await self._apply_exact_rank_role_id(
+            guild,
+            member,
+            int(target_role_id),
+            reason=reason or "Sync current-season rank role",
+        )
+
     async def _apply_rank_role(
         self, guild: discord.Guild, member_or_id, role_name: str, reason: str = ""
     ) -> bool:
@@ -7598,28 +7869,15 @@ class Matchmaking(commands.Cog):
             if not season_row:
                 return await ctx.reply("❌ No active season found.")
 
-            season_id = int(season_row["id"])
-
-            result = await self.db_pool.fetchrow(
-                """
-                SELECT role
-                FROM seasonplayers
-                WHERE season_id = $1
-                  AND user_id = $2
-                """,
-                season_id,
-                member.id,
-            )
-
-            if not result:
-                return await ctx.reply("❌ User has no row in current season.")
-
-            await self._apply_rank_role(
+            ok = await self._sync_member_rank_role_from_current_season(
                 ctx.guild,
                 member,
-                str(result["role"]),
-                reason="Fixing user's ranked roles",
+                reason="Manual fix_user_rank_roles",
             )
+
+            if not ok:
+                return await ctx.reply("❌ User has no row in current season or I could not edit the role.")
+
             await ctx.reply("Done!")
         except Exception as e:
             await ctx.reply(str(e))
