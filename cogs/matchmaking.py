@@ -566,6 +566,12 @@ SEASON_CHOICES = [
     app_commands.Choice(name="Alpha Test Season", value="alpha test season"),
 ]
 
+# Solo para /mmr_user: permite ver una season concreta o el historial completo.
+MMR_USER_SEASON_CHOICES = [
+    app_commands.Choice(name="All Seasons", value="all"),
+    *SEASON_CHOICES,
+]
+
 class Top100View(View):
     def __init__(self, cog, db_pool, interaction, season_id, season_name):
         super().__init__(timeout=180)
@@ -5601,7 +5607,7 @@ class Matchmaking(commands.Cog):
         await interaction.followup.send(board)
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="mmr", description="Shows your MMR")
+    @app_commands.command(name="mmr", description="Muestra tu MMR actual")
     async def mmr_self(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
@@ -5632,57 +5638,213 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="mmr_user",
-        description="Shows the MMR of a user",
+        description="Muestra el MMR de un usuario por season o en todas las seasons",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.describe(user="Usuario a consultar")
-    async def mmr_user(self, interaction: discord.Interaction, user: discord.Member):
+    @app_commands.describe(
+        user="Usuario a consultar",
+        season="Temporada a consultar. Usa All Seasons para ver todas.",
+    )
+    @app_commands.choices(season=MMR_USER_SEASON_CHOICES)
+    async def mmr_user(
+        self,
+        interaction: discord.Interaction,
+        user: discord.Member,
+        season: app_commands.Choice[str] | None = None,
+    ):
         await interaction.response.defer()
 
+        season_val = (season.value if season else "current")
+        name = user.display_name
+
+        def _season_sort_key(row) -> tuple[int, int, str]:
+            """
+            Orden visual del historial:
+            - Season activa primero.
+            - Luego por startdate/id descendente.
+            """
+            active = 1 if bool(row.get("active", False)) else 0
+            sid = int(row.get("season_id") or 0)
+            return (active, sid, str(row.get("season_name") or ""))
+
+        def _is_test_season_name(season_name: str | None) -> bool:
+            """
+            TEST Seasons = Season 1 y anteriores/pre-test.
+            Esto permite insertar el separador entre Season 2 y Season 1
+            cuando se selecciona All Seasons.
+            """
+            s = str(season_name or "").strip().lower()
+            if not s:
+                return False
+
+            m = re.search(r"\bseason\s*(\d+)\b", s)
+            if m:
+                return int(m.group(1)) <= 1
+
+            return s in {
+                "pre season",
+                "preseason",
+                "beta test season",
+                "alpha test season",
+            }
+
+        def _format_mmr_line(row, *, include_season_name: bool) -> str:
+            season_name = str(row.get("season_name") or "N/A")
+            mmr_val = int(row.get("mmr") or 0)
+            starting_raw = row.get("starting_mmr")
+            starting_mmr = int(starting_raw) if starting_raw is not None else mmr_val
+            role = str(row.get("role") or get_rank_from_mmr(mmr_val)).strip()
+            matches_played = int(row.get("matches_played") or 0)
+
+            is_season_placement = bool(
+                matches_played == 0
+                and (
+                    bool(row.get("is_season_placement", False))
+                    or role == "Season Placement"
+                )
+            )
+
+            prefix = f"**{season_name}**: " if include_season_name else ""
+
+            # Misma lógica visual que /mmr: Placement, Season Placement o MMR normal.
+            if is_season_placement:
+                return f"{prefix}{name} has {starting_mmr} Starting MMR and rank Season Placement."
+
+            if role == "Placement" and mmr_val <= 0:
+                return f"{prefix}{name} is in Placement."
+
+            return f"{prefix}{name} has {mmr_val} MMR and rank {role}."
+
+        if str(season_val).lower().strip() in {"all", "all seasons", "todas", "todas las seasons"}:
+            async with self.db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """
+                    SELECT
+                        s.id AS season_id,
+                        s.name AS season_name,
+                        COALESCE(s.active, false) AS active,
+                        COALESCE(sp.mmr, 0) AS mmr,
+                        COALESCE(sp.role, 'Placement') AS role,
+                        COALESCE(sp.is_season_placement, false) AS is_season_placement,
+                        sp.starting_mmr,
+                        COALESCE(mh.matches_played, 0) AS matches_played
+                    FROM seasons s
+                    LEFT JOIN seasonplayers sp
+                      ON sp.season_id = s.id
+                     AND sp.user_id = $1
+                    LEFT JOIN (
+                        SELECT season_id, user_id, COUNT(*)::int AS matches_played
+                        FROM match_history
+                        WHERE user_id = $1
+                        GROUP BY season_id, user_id
+                    ) mh ON mh.season_id = s.id AND mh.user_id = $1
+                    ORDER BY COALESCE(s.active, false) DESC,
+                             s.startdate DESC NULLS LAST,
+                             s.id DESC
+                    """,
+                    int(user.id),
+                )
+
+            if not rows:
+                return await interaction.followup.send(
+                    f"No seasons were found for {name}.",
+                    ephemeral=True,
+                )
+
+            rows = [dict(r) for r in rows]
+            # El ORDER BY de SQL ya es el orden principal; este sort mantiene activo primero
+            # y estabiliza si la DB tiene startdate repetido.
+            rows.sort(key=_season_sort_key, reverse=True)
+
+            lines = [f"**MMR history — {name}**"]
+            inserted_test_divider = False
+
+            for row in rows:
+                season_name = str(row.get("season_name") or "")
+                if not inserted_test_divider and _is_test_season_name(season_name):
+                    lines.append("-----TEST Seasons-----")
+                    inserted_test_divider = True
+
+                lines.append(_format_mmr_line(row, include_season_name=True))
+
+            # Evita pasar el límite de Discord si hay demasiadas seasons.
+            message = "\n".join(lines)
+            if len(message) <= 1900:
+                return await interaction.followup.send(message)
+
+            chunks: list[str] = []
+            current_chunk = ""
+            for line in lines:
+                candidate = line if not current_chunk else current_chunk + "\n" + line
+                if len(candidate) > 1900:
+                    chunks.append(current_chunk)
+                    current_chunk = line
+                else:
+                    current_chunk = candidate
+            if current_chunk:
+                chunks.append(current_chunk)
+
+            await interaction.followup.send(chunks[0])
+            for chunk in chunks[1:]:
+                await interaction.followup.send(chunk)
+            return
+
+        season_id, season_name = await self._resolve_season_id(season_val)
+
+        if not season_id:
+            return await interaction.followup.send(
+                "⚠️ No encontré la temporada seleccionada.",
+                ephemeral=True,
+            )
+
         async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(
+            row = await conn.fetchrow(
                 """
                 SELECT
                     s.id AS season_id,
                     s.name AS season_name,
                     COALESCE(s.active, false) AS active,
-                    sp.mmr,
-                    sp.role,
-                    COALESCE(mh.matches_played, 0) AS matches_played,
+                    COALESCE(sp.mmr, 0) AS mmr,
+                    COALESCE(sp.role, 'Placement') AS role,
                     COALESCE(sp.is_season_placement, false) AS is_season_placement,
-                    sp.starting_mmr
-                FROM seasonplayers sp
-                INNER JOIN seasons s ON s.id = sp.season_id
+                    sp.starting_mmr,
+                    COALESCE(mh.matches_played, 0) AS matches_played
+                FROM seasons s
+                LEFT JOIN seasonplayers sp
+                  ON sp.season_id = s.id
+                 AND sp.user_id = $1
                 LEFT JOIN (
                     SELECT season_id, user_id, COUNT(*)::int AS matches_played
                     FROM match_history
                     WHERE user_id = $1
                     GROUP BY season_id, user_id
-                ) mh ON mh.season_id = sp.season_id AND mh.user_id = sp.user_id
-                WHERE sp.user_id = $1
-                ORDER BY s.id DESC
+                ) mh ON mh.season_id = s.id AND mh.user_id = $1
+                WHERE s.id = $2
+                LIMIT 1
                 """,
-                user.id,
+                int(user.id),
+                int(season_id),
             )
 
-        if not rows:
-            return await interaction.followup.send(f"{user.display_name} doesn't have MMR history.")
+        if not row:
+            return await interaction.followup.send(
+                f"{name} is in Placement for {season_name}."
+            )
 
-        lines = [f"MMR history — {user.display_name}", "```"]
-        for r in rows:
-            mmr = int(r["mmr"] or 0)
-            role = str(r["role"] or get_rank_from_mmr(mmr))
-            matches = int(r["matches_played"] or 0)
-            is_sp = bool(r["active"] and matches == 0 and (r["is_season_placement"] or role != "Placement") and mmr > 0)
-            if is_sp:
-                label = f"{mmr} Starting MMR — Season Placement"
-            elif role == "Placement" and mmr <= 0:
-                label = "Placement"
-            else:
-                label = f"{mmr} MMR — {role}"
-            lines.append(f"{str(r['season_name'])[:24]:<24} | {label}")
-        lines.append("```")
-        await interaction.followup.send("\n".join(lines))
+        row = dict(row)
+        row["season_name"] = str(season_name)
+
+        # Para la season activa, si el usuario tiene el rol de Discord de Season Placement,
+        # también se respeta aunque la DB todavía no haya quedado marcada.
+        is_current_season = await self._is_current_season_id(int(season_id))
+        if is_current_season and self._has_season_placement_role(user):
+            row["is_season_placement"] = True
+            row["role"] = "Season Placement"
+            if row.get("starting_mmr") is None:
+                row["starting_mmr"] = int(row.get("mmr") or 0)
+
+        message = _format_mmr_line(row, include_season_name=False)
+        await interaction.followup.send(f"{message} ({season_name})")
 
     @app_commands.command(
         name="top100", description="Shows the top 100 players by MMR."
