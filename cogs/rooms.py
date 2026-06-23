@@ -460,6 +460,17 @@ class Rooms(commands.Cog):
         # Mención clickeable, pero NO pingea (allowed_mentions=none)
         return f"<@{uid}>"
 
+    def _display_mmr_label(self, mm, guild: discord.Guild, uid: int, mmr: int) -> str:
+        member = guild.get_member(int(uid)) if guild else None
+        try:
+            if member is not None and hasattr(mm, "_has_season_placement_role") and mm._has_season_placement_role(member):
+                return "Season Placement" if int(mmr or 0) <= 0 else f"{int(mmr)} Starting MMR"
+            if member is not None and hasattr(mm, "_is_placement_member") and mm._is_placement_member(member):
+                return "Placement"
+        except Exception:
+            pass
+        return str(int(mmr or 0))
+
     def _build_content(self, lines: list[str], now_ts: int) -> str:
         footer = f"{HUMAN_LAST_UPDATE_LABEL}: <t:{now_ts}:T> (<t:{now_ts}:R>) {BOARD_MARKER}"
         if not lines or BOARD_MARKER not in (lines[-1] if lines else ""):
@@ -806,7 +817,8 @@ class Rooms(commands.Cog):
 
                     pdata_ids_sorted = sorted(pdata_ids, key=lambda t: t[1], reverse=True)
                     for uid, mmr in pdata_ids_sorted:
-                        lines.append(f"- {self._user_label(guild, uid)} ({mmr})")
+                        label = self._display_mmr_label(mm, guild, uid, mmr)
+                        lines.append(f"- {self._user_label(guild, uid)} ({label})")
 
                     if SHOW_EMPTY_SLOTS and count < ROOM_CAPACITY:
                         for _ in range(ROOM_CAPACITY - count):
