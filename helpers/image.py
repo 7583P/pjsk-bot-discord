@@ -1691,14 +1691,15 @@ def generate_stats_image(
     last10_mmr_delta: int = 0,
     country_code: str | None = None,
     country_name: str | None = None,
+    is_season_placement: bool = False,
 ) -> io.BytesIO:
     """Genera la imagen de /stats y /stats_user con UI sci-fi/gamer."""
 
     if not STATS_BACKGROUND_PATH.exists():
         raise FileNotFoundError(f"Missing stats background: {STATS_BACKGROUND_PATH}")
 
-    rank = normalize_rank_name(rank, current_mmr, False)
-    rank_display = _rank_display_text(rank).upper()
+    rank = "Season Placement" if is_season_placement else normalize_rank_name(rank, current_mmr, False)
+    rank_display = "SEASON PLACEMENT" if is_season_placement else _rank_display_text(rank).upper()
     start_rgb, end_rgb = _rank_theme(rank)
     # Mantiene el feeling gamer/sci-fi, pero los elementos pedidos por el usuario
     # usan el color/degradado real del rango del jugador.
@@ -1912,12 +1913,14 @@ def generate_stats_image(
     bar_panel = (sx(130), sy(615), sx(1542), sy(742))
     _draw_sci_fi_card(draw, bar_panel, accent_rgb, fill=(5, 8, 20, 202), radius=sy(20), width=max(2, sy(3)), cut=sy(22))
     _paste_gradient_rounded_border(img, bar_panel, start_rgb, end_rgb, thickness=max(2, sy(3)), radius=sy(20), alpha=245)
-    _center_text(draw, (sx(836), sy(638)), "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
+    _center_text(draw, (sx(836), sy(638)), "STARTING MMR" if is_season_placement else "MMR PROGRESS", label_font, fill=white, stroke_width=1, stroke_fill=(0, 0, 0, 255))
 
     bar_x1, bar_y1, bar_x2, bar_y2 = sx(280), sy(663), sx(1392), sy(720)
     draw.rounded_rectangle((bar_x1, bar_y1, bar_x2, bar_y2), radius=sy(22), fill=(2, 9, 30, 245), outline=(*accent_rgb, 140), width=1)
     _paste_gradient_rounded_border(img, (bar_x1, bar_y1, bar_x2, bar_y2), start_rgb, end_rgb, thickness=max(2, sy(3)), radius=sy(22), alpha=245)
     progress_text, progress = _rank_progress(rank, current_mmr)
+    if is_season_placement:
+        progress_text = f"{int(current_mmr)} Starting MMR"
     fill_x2 = bar_x1 + int((bar_x2 - bar_x1) * progress)
     if fill_x2 > bar_x1 + sy(12):
         pad = sy(6)
@@ -1967,7 +1970,7 @@ def generate_stats_image(
         },
         {
             "rect": bottom_cards[1],
-            "label": "CURRENT MMR",
+            "label": "STARTING MMR" if is_season_placement else "CURRENT MMR",
             "value": str(int(current_mmr)),
             "icon": lambda d, cx, cy, sz: _draw_shield_icon(d, cx, cy, sz, blue_rgb, star=True),
         },
