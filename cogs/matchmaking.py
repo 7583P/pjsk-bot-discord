@@ -5601,7 +5601,7 @@ class Matchmaking(commands.Cog):
         await interaction.followup.send(board)
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
-    @app_commands.command(name="mmr", description="Muestra tu MMR actual")
+    @app_commands.command(name="mmr", description="Shows your MMR")
     async def mmr_self(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
@@ -5632,7 +5632,7 @@ class Matchmaking(commands.Cog):
 
     @app_commands.command(
         name="mmr_user",
-        description="Muestra el MMR de un usuario en todas las temporadas",
+        description="Shows the MMR of a user",
     )
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.describe(user="Usuario a consultar")
