@@ -362,6 +362,8 @@ SEASONS_HAS_ENDS_AT: bool = False
 SP_HAS_WINS: bool = False
 SP_HAS_LOSSES: bool = False
 SP_HAS_GAMES_PLAYED: bool = False
+SP_HAS_IS_SEASON_PLACEMENT: bool = False
+SP_HAS_STARTING_MMR: bool = False
 
 # matches / match_history
 HAS_MATCHES_TABLE: bool = False
@@ -411,7 +413,7 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
     global HAS_DISCORD_ID_COL, PLAYERS_HAS_IN_GUILD
     global SEASONS_HAS_ACTIVE, SEASONS_HAS_NAME
     global SEASONS_HAS_STARTS_AT, SEASONS_HAS_ENDS_AT, USER_ID_SQLTYPE, DISCORD_ID_SQLTYPE
-    global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED
+    global SP_HAS_WINS, SP_HAS_LOSSES, SP_HAS_GAMES_PLAYED, SP_HAS_IS_SEASON_PLACEMENT, SP_HAS_STARTING_MMR
     global HAS_MATCHES_TABLE, HAS_MATCHPLAYERS_TABLE, RESULTS_TEXT_COL
 
     try:
@@ -430,6 +432,8 @@ async def _detect_schema(conn: asyncpg.Connection) -> None:
         SP_HAS_GAMES_PLAYED = (
             await _has_col(conn, "seasonplayers", "games_played")
         ) or (await _has_col(conn, "seasonplayers", "games"))
+        SP_HAS_IS_SEASON_PLACEMENT = await _has_col(conn, "seasonplayers", "is_season_placement")
+        SP_HAS_STARTING_MMR = await _has_col(conn, "seasonplayers", "starting_mmr")
 
         # matches / match_history
         HAS_MATCHES_TABLE = await _has_col(conn, "match_history", "season_id")
@@ -606,6 +610,8 @@ async def startup():
         # Asegura que el backend pueda enlazar Discord -> player sin cambios manuales en DB.
         try:
             await conn.execute("ALTER TABLE IF EXISTS public.players ADD COLUMN IF NOT EXISTS discord_id TEXT")
+            await conn.execute("ALTER TABLE IF EXISTS public.seasonplayers ADD COLUMN IF NOT EXISTS is_season_placement BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE IF EXISTS public.seasonplayers ADD COLUMN IF NOT EXISTS starting_mmr INTEGER")
         except Exception:
             logger.exception("Could not ensure public.players.discord_id column")
 
@@ -2578,6 +2584,10 @@ async def get_players(
                     select_cols.append("sp.games_played AS games_played")
                 elif await _has_col(conn, "seasonplayers", "games"):
                     select_cols.append("sp.games AS games_played")
+            if SP_HAS_IS_SEASON_PLACEMENT:
+                select_cols.append("sp.is_season_placement AS is_season_placement_db")
+            if SP_HAS_STARTING_MMR:
+                select_cols.append("sp.starting_mmr AS starting_mmr_db")
 
             q = f"""
                 WITH sp_one AS (
@@ -2804,17 +2814,19 @@ async def get_players(
         rank_value = _rget(r, "rank") or _rank_from_mmr_for_api(real_mmr)
         matches_count = int(games_played or 0)
 
-        # Mismo criterio visual que el frontend:
-        # en la season activa, un jugador seed de Season Placement sin partidas
-        # se muestra con MMR 0 y no cuenta como cutoff real.
-        is_season_placement = (
-            bool(picked_is_current)
+        # Season Placement explícito. No usar visible_mmr=0 como señal porque eso
+        # confundía a todos los Placement normales con Season Placement.
+        db_sp = bool(_rget(r, "is_season_placement_db", False)) if SP_HAS_IS_SEASON_PLACEMENT else False
+        is_season_placement = bool(
+            picked_is_current
             and matches_count == 0
-            and str(rank_value or "").strip() != "Placement"
+            and real_mmr > 0
+            and (db_sp or str(rank_value or "").strip() != "Placement")
         )
 
-        visible_mmr = 0 if is_season_placement else real_mmr
-        visible_peak_mmr = 0 if is_season_placement else real_peak_mmr
+        starting_mmr = int(_rget(r, "starting_mmr_db") or real_mmr) if is_season_placement else None
+        visible_mmr = real_mmr
+        visible_peak_mmr = real_peak_mmr
 
         out.append(
             {
@@ -2826,6 +2838,10 @@ async def get_players(
                 "mmr": real_mmr,
                 "visible_mmr": visible_mmr,
                 "display_mmr": visible_mmr,
+                "starting_mmr": starting_mmr,
+                "startingMmr": starting_mmr,
+                "mmr_label": "Starting MMR" if is_season_placement else "MMR",
+                "mmrLabel": "Starting MMR" if is_season_placement else "MMR",
                 "peakMmr": real_peak_mmr,
                 "peak_mmr": real_peak_mmr,
                 "visible_peak_mmr": visible_peak_mmr,
