@@ -3725,7 +3725,7 @@ class Matchmaking(commands.Cog):
                             try:
                                 qcount = len(q)
                                 await ch.send(
-                                    f"(<@{member.id}>) Dropped the queue (`{qcount}`)"
+                                    f"(<@{member.id}>) Dropped the queue ({qcount})"
                                 )
                             except Exception:
                                 pass
@@ -4889,26 +4889,16 @@ class Matchmaking(commands.Cog):
         )
 
         # Mensaje público en #join / #jp-join.
-        # Si el primer jugador entra durante la ventana de 5..1 minutos,
-        # se hace ping al tag correcto del canal (enTags o jpTags).
+        # Formato corto solicitado:
+        # (<@user>) Joined the queue (N)
+        # Sin MMR, sin "Queue: N", sin Next slot extra.
         try:
             qcount = len(self.queues.get(ch.id, set()))
-            ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(ch.id)
-            unlock_dt = self._lock_unlock_dt_for_current_prep(now)
-            should_ping_tag = bool(queue_was_empty and ping_role_id and unlock_dt is not None)
-            ping_part = f"<@&{ping_role_id}> " if should_ping_tag else ""
-            extra = ""
-            if unlock_dt is not None:
-                unlock_ts = int(unlock_dt.timestamp())
-                extra = f" Next slot: <t:{unlock_ts}:T> (<t:{unlock_ts}:R>)."
-            queue_word = "player" if qcount == 1 else "players"
-            verb = "is" if qcount == 1 else "are"
             await ch.send(
-                f"{ping_part}({member.mention}) Joined the queue. "
-                f"There {verb} **{qcount}** {queue_word} in queue.{extra}",
+                f"({member.mention}) Joined the queue ({qcount})",
                 allowed_mentions=discord.AllowedMentions(
                     users=True,
-                    roles=should_ping_tag,
+                    roles=False,
                     everyone=False,
                 ),
             )
@@ -5047,7 +5037,7 @@ class Matchmaking(commands.Cog):
             # Mensaje público
             try:
                 qcount = len(q)
-                await ch.send(f"({member.mention}) Dropped the queue (`{qcount}`)")
+                await ch.send(f"({member.mention}) Dropped the queue ({qcount})")
             except Exception:
                 pass
 
