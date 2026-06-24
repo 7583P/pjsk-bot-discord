@@ -462,14 +462,15 @@ class Rooms(commands.Cog):
 
     def _display_mmr_label(self, mm, guild: discord.Guild, uid: int, mmr: int) -> str:
         member = guild.get_member(int(uid)) if guild else None
+        value = int(mmr or 0)
         try:
             if member is not None and hasattr(mm, "_has_season_placement_role") and mm._has_season_placement_role(member):
-                return "Season Placement" if int(mmr or 0) <= 0 else f"{int(mmr)} Starting MMR"
+                return f"{value} MMR · Season Placement"
             if member is not None and hasattr(mm, "_is_placement_member") and mm._is_placement_member(member):
                 return "Placement"
         except Exception:
             pass
-        return str(int(mmr or 0))
+        return str(value)
 
     def _build_content(self, lines: list[str], now_ts: int) -> str:
         footer = f"{HUMAN_LAST_UPDATE_LABEL}: <t:{now_ts}:T> (<t:{now_ts}:R>) {BOARD_MARKER}"
