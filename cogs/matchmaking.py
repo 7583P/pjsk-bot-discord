@@ -1304,14 +1304,23 @@ class Matchmaking(commands.Cog):
         *,
         with_unit: bool = False,
     ) -> str:
-        """Texto único para rooms/#join/mmr: Placement no sale como 0."""
+        """Texto único para rooms/#join/mmr.
+
+        Season Placement debe seguir visible hasta que el submit confirme la partida.
+        Por eso el label no se reduce a Starting MMR: también conserva el estado.
+        """
+        mmr = int(real_mmr or 0)
+
         if member is not None and self._has_season_placement_role(member):
-            suffix = " Starting MMR" if with_unit else ""
-            return f"{int(real_mmr)}{suffix}"
+            if with_unit:
+                return f"{mmr} MMR · Season Placement"
+            return f"{mmr} · Season Placement"
+
         if member is not None and self._is_placement_member(member):
             return "Placement"
+
         suffix = " MMR" if with_unit else ""
-        return f"{int(real_mmr)}{suffix}"
+        return f"{mmr}{suffix}"
 
 
     async def _build_visible_leaderboard_rows(
@@ -2227,7 +2236,7 @@ class Matchmaking(commands.Cog):
                 if status == "placement":
                     lines.append(f"{name} Placement")
                 elif status == "season_placement":
-                    lines.append(f"{name} {mmr}MMR — Season Placement")
+                    lines.append(f"{name} {mmr} MMR · Season Placement")
                 else:
                     lines.append(f"{name} {mmr}MMR")
             lines.append("")  # blank line entre rooms
@@ -2249,7 +2258,7 @@ class Matchmaking(commands.Cog):
                     if self._is_placement_member(m):
                         lines.append(f"{m.display_name} Placement")
                     elif self._has_season_placement_role(m):
-                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))} Starting MMR — Season Placement")
+                        lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))} MMR · Season Placement")
                     else:
                         lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
 
@@ -2281,7 +2290,7 @@ class Matchmaking(commands.Cog):
         label = self._next_start_minute_label(now)
         lines = [f"----------------- Future Room (starting at {label})"]
         for m in ordered:
-            label = await self._mmr_label_for_member(m, int(mmr_map.get(m.id, 0)))
+            label = await self._mmr_label_for_member(m, int(mmr_map.get(m.id, 0)), with_unit=True)
             lines.append(f"{m.display_name} ({label})")
 
         return "\n".join(lines)
@@ -3221,12 +3230,12 @@ class Matchmaking(commands.Cog):
 
             if member is not None:
                 name = await self.resolve_member_name(guild, uid)
-                label = await self._mmr_label_for_member(member, int(r["mmr"]))
+                label = await self._mmr_label_for_member(member, int(r["mmr"]), with_unit=True)
             else:
                 snap = snapshots.get(uid) or snapshots.get(str(uid)) or {}
                 name = str(snap.get("display_name") or f"ID:{uid}")
                 if bool(snap.get("is_season_placement")):
-                    label = f"{int(r['mmr'])} Starting MMR"
+                    label = f"{int(r['mmr'])} MMR · Season Placement"
                 elif bool(snap.get("is_placement")):
                     label = "Placement"
                 else:
@@ -4808,13 +4817,15 @@ class Matchmaking(commands.Cog):
         member: discord.Member = interaction.user  # type: ignore
 
         # Fail-safe: si el usuario salió del servidor, Discord le borra los roles.
-        # Al volver o al usar /c, sincronizamos su rol desde seasonplayers antes de
-        # calcular Season Placement / Placement / MMR.
+        # Al volver o al usar /c, sincronizamos su rol desde seasonplayers.
+        # IMPORTANTE: si ya trae Season Placement, NO se reemplaza por Gold/Rank aquí.
+        # Ese rol solo debe salir después de un submit aprobado.
         try:
             await self._sync_member_rank_role_from_current_season(
                 guild,
                 member,
                 reason="Sync current-season role before queue join",
+                preserve_existing_season_placement=True,
             )
         except Exception:
             pass
@@ -7653,6 +7664,7 @@ class Matchmaking(commands.Cog):
                         role_name,  # color del board basado en el rango FINAL
                         p["country_code"],  # ISO2 o __UNKNOWN_FLAG__ para assets/flags/unknown.jpg
                         p.get("show_placement_badge", False),  # SOLO visual en results.png
+                        p.get("is_season_placement", False),  # distingue [SEASON PLACEMENT] en results.png
                     )
                 )
 
@@ -7849,6 +7861,8 @@ class Matchmaking(commands.Cog):
         guild: discord.Guild,
         member: discord.Member,
         reason: str = "",
+        *,
+        preserve_existing_season_placement: bool = False,
     ) -> bool:
         """
         Fuente de verdad: seasonplayers de la season activa.
@@ -7861,6 +7875,11 @@ class Matchmaking(commands.Cog):
         """
         if member.bot or self.db_pool is None:
             return False
+
+        # /c no debe convertir Season Placement -> rango antes de jugar.
+        # El cambio real de rol se hace después del submit aprobado.
+        if preserve_existing_season_placement and self._has_season_placement_role(member):
+            return True
 
         season_row = await self.get_current_season()
         if not season_row:
