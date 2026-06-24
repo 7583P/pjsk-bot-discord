@@ -912,9 +912,25 @@ def _load_rank_logo(rank: str) -> Image.Image | None:
 
 def normalize_summary_row(row: tuple) -> dict:
     """
-    Soporta 4 formatos:
+    Soporta 5 formatos:
 
-    Nuevo recomendado con badge visual:
+    Nuevo recomendado con badge visual y Season Placement:
+      (
+        pos,
+        name,
+        total_points,
+        stats_list,
+        mmr_prev,
+        mmr_delta,
+        mmr_final,
+        was_placement,
+        final_rank_name,
+        country_code,
+        show_placement_badge,
+        is_season_placement
+      )
+
+    Compatible con badge visual:
       (
         pos,
         name,
@@ -971,8 +987,25 @@ def normalize_summary_row(row: tuple) -> dict:
     country_code = None
     rank_name = None
     show_placement_badge = False
+    is_season_placement = False
 
-    if len(row) >= 11:
+    if len(row) >= 12:
+        (
+            pos,
+            name,
+            points,
+            results,
+            mmr_old,
+            mmr_delta,
+            mmr_new,
+            was_placement,
+            rank_name,
+            country_code,
+            show_placement_badge,
+            is_season_placement,
+        ) = row[:12]
+
+    elif len(row) >= 11:
         (
             pos,
             name,
@@ -1028,9 +1061,9 @@ def normalize_summary_row(row: tuple) -> dict:
 
     else:
         raise ValueError(
-            "summary row must have 8, 9, 10 or 11 values: "
+            "summary row must have 8, 9, 10, 11 or 12 values: "
             "(pos, name, points, results, mmr_old, mmr_delta, mmr_new, "
-            "was_placement, rank_name?, country_code?, show_placement_badge?)"
+            "was_placement, rank_name?, country_code?, show_placement_badge?, is_season_placement?)"
         )
 
     name = str(name or "").strip()
@@ -1064,6 +1097,7 @@ def normalize_summary_row(row: tuple) -> dict:
         "rank_name": final_rank,
         "country_code": country_code,
         "show_placement_badge": bool(show_placement_badge),
+        "is_season_placement": bool(is_season_placement),
     }
 
 
@@ -1092,7 +1126,8 @@ def generate_results_image(
             was_placement,
             final_rank_name,
             country_code,
-            show_placement_badge
+            show_placement_badge,
+            is_season_placement
         ),
         ...
     ]
@@ -1275,6 +1310,7 @@ def generate_results_image(
             t_y = y + 5
 
         show_placement_badge = bool(row.get("show_placement_badge", False))
+        is_season_placement = bool(row.get("is_season_placement", False))
 
         # Preparar bandera antes de dibujar para poder calcular el borde.
         flag_img = None
@@ -1295,11 +1331,14 @@ def generate_results_image(
                 flag_x = X_NAME + name_img.width + FLAG_GAP
                 flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
 
-        # Badge [PLACEMENT] debajo del usuario.
+        # Badge [PLACEMENT] / [SEASON PLACEMENT] debajo del usuario.
         # IMPORTANTE: el rectángulo NO tiene fill para evitar el fondo negro.
-        placement_badge_text = "[PLACEMENT]"
+        placement_badge_text = "[SEASON PLACEMENT]" if is_season_placement else "[PLACEMENT]"
         placement_badge_font = smallist_font
-        placement_badge_color = (255, 112, 0, 255)  # naranja Placement
+        if is_season_placement:
+            placement_badge_color = (*hex_to_rgb(rank_colors["Season Placement"][0]), 255)
+        else:
+            placement_badge_color = (255, 112, 0, 255)  # naranja Placement
 
         badge_bbox = draw.textbbox((0, 0), placement_badge_text, font=placement_badge_font)
         badge_w = badge_bbox[2] - badge_bbox[0]
