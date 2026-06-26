@@ -4830,6 +4830,8 @@ class Matchmaking(commands.Cog):
         except Exception:
             pass
 
+        first_prep_ping_role_id: int | None = None
+
         async with self._join_lock:
             # Guard: ya estás en una sala activa (cualquier fase no-finished)
             already_room = self._find_player_room_id(member)
@@ -4870,6 +4872,11 @@ class Matchmaking(commands.Cog):
             self._queue_counter += 1
             self.queue_join_order[ch.id][member.id] = self._queue_counter
 
+            # Si entra durante la ventana PREP de 5 minutos y era el primero del queue,
+            # hacer ping al tag correspondiente: enTags para #join, jpTags para #jp-join.
+            if queue_was_empty and self._in_prep_window(now) is not None:
+                first_prep_ping_role_id = PING_ROLES_BY_JOIN_CHANNEL.get(ch.id)
+
             # Rol de queue según canal
             await self._assign_queue_role_for_join(member, ch.id)
 
@@ -4900,16 +4907,20 @@ class Matchmaking(commands.Cog):
         )
 
         # Mensaje público en #join / #jp-join.
-        # Formato corto solicitado:
-        # (<@user>) Joined the queue (N)
-        # Sin MMR, sin "Queue: N", sin Next slot extra.
+        # Si fue el primer jugador dentro de la ventana PREP, se hace ping al tag del server.
         try:
             qcount = len(self.queues.get(ch.id, set()))
+            ping_part = (
+                f"<@&{first_prep_ping_role_id}> "
+                if first_prep_ping_role_id is not None
+                else ""
+            )
+
             await ch.send(
-                f"({member.mention}) Joined the queue (`{qcount}`)",
+                f"{ping_part}({member.mention}) Joined the queue (`{qcount}`)",
                 allowed_mentions=discord.AllowedMentions(
                     users=True,
-                    roles=False,
+                    roles=first_prep_ping_role_id is not None,
                     everyone=False,
                 ),
             )
@@ -5813,19 +5824,79 @@ class Matchmaking(commands.Cog):
             "alpha test season",
         }
 
-    def _format_mmr_row_block(
-        self,
-        row: dict,
-        *,
-        user_name: str,
-        include_header: bool,
-        include_season_line: bool,
-        include_matches: bool,
-    ) -> str:
-        """
-        Formato único para /mmr y /mmr_user.
-        Usa valores en `inline code` y una estructura legible.
-        """
+    _MMR_EMBED_RANK_COLORS = {
+        "Placement": 0x7F8C8D,
+        "Season Placement": 0xF39C12,
+        "Iron": 0x707B7C,
+        "Iron ⬆": 0x85929E,
+        "Bronze": 0xA97142,
+        "Bronze ⬆": 0xC27C4A,
+        "Silver": 0xC0C7D1,
+        "Silver ⬆": 0xD6DCE5,
+        "Gold": 0xD4AF37,
+        "Gold ⬆": 0xE6C34A,
+        "Platinum": 0x48C9B0,
+        "Platinum ⬆": 0x5DE2C8,
+        "Diamond": 0x5B8CFF,
+        "Diamond ⬆": 0x7AA5FF,
+        "Crystal": 0x8E6BFF,
+        "Crystal ⬆": 0xA98BFF,
+        "Master": 0xB06CFF,
+        "Master ⬆": 0xC58BFF,
+        "Champion": 0xFF6B6B,
+        "Grand Champion": 0xFF8A65,
+        "Star": 0xFF66C4,
+        "Divine Star": 0xFF84E1,
+        "Legend": 0xFFB347,
+    }
+
+    def _mmr_card_user_name(self, user: discord.Member) -> str:
+        return (
+            getattr(user, "display_name", None)
+            or getattr(user, "global_name", None)
+            or getattr(user, "name", None)
+            or f"User {getattr(user, 'id', 'unknown')}"
+        )
+
+    def _mmr_card_visual_rank(self, row: dict) -> str:
+        mmr_val = int(row.get("mmr") or 0)
+        role = str(row.get("role") or "").strip()
+        matches_played = int(row.get("matches_played") or 0)
+
+        is_season_placement = bool(
+            matches_played == 0
+            and (
+                bool(row.get("is_season_placement", False))
+                or role == "Season Placement"
+            )
+        )
+
+        if is_season_placement:
+            if mmr_val > 0:
+                return get_rank_from_mmr(mmr_val)
+            return "Season Placement"
+
+        if role == "Placement" and mmr_val <= 0:
+            return "Placement"
+
+        if role:
+            return role
+
+        if mmr_val > 0:
+            return get_rank_from_mmr(mmr_val)
+
+        return "Placement"
+
+    def _mmr_embed_color(self, row: dict) -> int:
+        visual_rank = self._mmr_card_visual_rank(row)
+        return int(
+            self._MMR_EMBED_RANK_COLORS.get(
+                visual_rank,
+                self._MMR_EMBED_RANK_COLORS["Placement"],
+            )
+        )
+
+    def _mmr_card_value_label_role(self, row: dict) -> tuple[str, str, str]:
         season_name = str(row.get("season_name") or "Current")
         mmr_val = int(row.get("mmr") or 0)
         starting_raw = row.get("starting_mmr")
@@ -5841,29 +5912,71 @@ class Matchmaking(commands.Cog):
             )
         )
 
-        lines: list[str] = []
-        if include_header:
-            lines.append(f"**MMR — {user_name}**")
-        else:
-            lines.append(f"**{season_name}**")
-
-        if include_season_line:
-            lines.append(f"• Season: {self._inline_code(season_name)}")
-
         if is_season_placement:
-            lines.append(f"• Starting MMR: {self._inline_code(starting_mmr)}")
-            lines.append(f"• Rank: {self._inline_code('Season Placement')}")
-        elif role == "Placement" and mmr_val <= 0:
-            lines.append(f"• Status: {self._inline_code('Placement')}")
-            lines.append(f"• Rank: {self._inline_code('Placement')}")
-        else:
-            lines.append(f"• MMR: {self._inline_code(mmr_val)}")
-            lines.append(f"• Rank: {self._inline_code(role)}")
+            return (
+                str(starting_mmr),
+                "Starting MMR",
+                "Season Placement",
+            )
 
+        if role == "Placement" and mmr_val <= 0:
+            return (
+                "Placement",
+                "Status",
+                "Placement",
+            )
+
+        display_role = role or get_rank_from_mmr(mmr_val)
+        return (
+            str(mmr_val),
+            "MMR",
+            display_role,
+        )
+
+    def _mmr_footer_text(self, interaction: discord.Interaction | None = None) -> str:
+        now = self._now_lima()
+        return f"PJSK Lounge • creado hoy a las {now:%H:%M}"
+
+    def _build_mmr_embed(
+        self,
+        *,
+        interaction: discord.Interaction | None,
+        user: discord.Member,
+        row: dict,
+        include_matches: bool = False,
+    ) -> discord.Embed:
+        season_name = str(row.get("season_name") or "Current")
+        user_name = self._mmr_card_user_name(user)
+        value_text, value_label, role_text = self._mmr_card_value_label_role(row)
+        matches_played = int(row.get("matches_played") or 0)
+
+        embed = discord.Embed(
+            title=f"PJSK LOUNGE - {season_name}",
+            color=self._mmr_embed_color(row),
+        )
+
+        # Se usa un field para imitar el bloque visual tipo input de Discord.
+        embed.add_field(
+            name=user_name,
+            value=f"```{value_text}```",
+            inline=False,
+        )
+
+        description_lines = [f"**{value_label}:** `{value_text}`", f"**Rank:** `{role_text}`"]
         if include_matches:
-            lines.append(f"• Matches: {self._inline_code(matches_played)}")
+            description_lines.append(f"**Matches:** `{matches_played}`")
+        embed.description = "\n".join(description_lines)
 
-        return "\n".join(lines)
+        icon_url = None
+        guild = getattr(interaction, "guild", None) if interaction else None
+        try:
+            if guild and guild.icon:
+                icon_url = guild.icon.url
+        except Exception:
+            icon_url = None
+
+        embed.set_footer(text=self._mmr_footer_text(interaction), icon_url=icon_url)
+        return embed
 
     async def _fetch_mmr_rows_for_user_all_seasons(self, user_id: int) -> list[dict]:
         """
@@ -5969,34 +6082,12 @@ class Matchmaking(commands.Cog):
                 row["starting_mmr"] = int(row.get("mmr") or 0)
         return row
 
-    async def _send_mmr_chunks(self, interaction: discord.Interaction, lines: list[str]):
-        message = "\n".join(lines).strip()
-        if len(message) <= 1900:
-            return await interaction.followup.send(message)
-
-        chunks: list[str] = []
-        current_chunk = ""
-        for line in lines:
-            candidate = line if not current_chunk else current_chunk + "\n" + line
-            if len(candidate) > 1900:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = line
-            else:
-                current_chunk = candidate
-        if current_chunk:
-            chunks.append(current_chunk)
-
-        await interaction.followup.send(chunks[0])
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk)
-
     async def _send_mmr_all_seasons(
         self,
         interaction: discord.Interaction,
         user: discord.Member,
     ):
-        name = user.display_name
+        name = self._mmr_card_user_name(user)
         rows = await self._fetch_mmr_rows_for_user_all_seasons(int(user.id))
 
         current = await self.get_current_season()
@@ -6013,28 +6104,44 @@ class Matchmaking(commands.Cog):
                 ephemeral=True,
             )
 
-        lines = [f"**MMR History — {name}**"]
-        inserted_test_divider = False
+        normal_rows: list[dict] = []
+        test_rows: list[dict] = []
 
         for row in rows:
             season_name = str(row.get("season_name") or "")
-            if not inserted_test_divider and self._is_test_season_name(season_name):
-                lines.append("")
-                lines.append("**-----TEST Seasons-----**")
-                inserted_test_divider = True
+            if self._is_test_season_name(season_name):
+                test_rows.append(row)
+            else:
+                normal_rows.append(row)
 
-            lines.append("")
-            lines.append(
-                self._format_mmr_row_block(
-                    row,
-                    user_name=name,
-                    include_header=False,
-                    include_season_line=False,
-                    include_matches=True,
-                )
+        normal_embeds = [
+            self._build_mmr_embed(interaction=interaction, user=user, row=row, include_matches=True)
+            for row in normal_rows
+        ]
+        test_embeds = [
+            self._build_mmr_embed(interaction=interaction, user=user, row=row, include_matches=True)
+            for row in test_rows
+        ]
+
+        header = f"**MMR History — {name}**"
+        sent_header = False
+
+        for idx in range(0, len(normal_embeds), 10):
+            await interaction.followup.send(
+                content=header if not sent_header else None,
+                embeds=normal_embeds[idx : idx + 10],
             )
+            sent_header = True
 
-        await self._send_mmr_chunks(interaction, lines)
+        if test_embeds:
+            await interaction.followup.send(
+                content=(header + "\n**-----TEST Seasons-----**") if not sent_header else "**-----TEST Seasons-----**",
+                embeds=test_embeds[:10],
+            )
+            sent_header = True
+
+            for idx in range(10, len(test_embeds), 10):
+                await interaction.followup.send(embeds=test_embeds[idx : idx + 10])
 
     async def _send_mmr_single_season(
         self,
@@ -6043,7 +6150,7 @@ class Matchmaking(commands.Cog):
         season_id: int,
         season_name: str,
     ):
-        name = user.display_name
+        name = self._mmr_card_user_name(user)
         row = await self._fetch_mmr_row_for_user_season(int(user.id), int(season_id))
 
         if row is None:
@@ -6070,14 +6177,8 @@ class Matchmaking(commands.Cog):
         row["season_name"] = str(season_name or row.get("season_name") or "Current")
         row = await self._apply_current_season_placement_override(user, row, int(season_id))
 
-        message = self._format_mmr_row_block(
-            row,
-            user_name=name,
-            include_header=True,
-            include_season_line=True,
-            include_matches=False,
-        )
-        await interaction.followup.send(message)
+        embed = self._build_mmr_embed(interaction=interaction, user=user, row=row)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="mmr", description="Shows your MMR and Rank")
     @app_commands.guilds(discord.Object(id=GUILD_ID))
