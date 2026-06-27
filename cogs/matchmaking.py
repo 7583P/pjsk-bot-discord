@@ -5282,6 +5282,34 @@ class Matchmaking(commands.Cog):
             """
         )
 
+    async def _player_title_inventory_uses_text_user_id(self, conn) -> bool:
+        """
+        Deploy-safe compatibility guard.
+
+        Some existing databases already created public.player_title_inventory.user_id
+        as TEXT before this code version. CREATE TABLE IF NOT EXISTS will not change
+        that existing type. asyncpg then expects str for $1 in executemany().
+
+        New clean databases use BIGINT. This helper keeps both schemas working
+        without forcing a risky ALTER TABLE during bot startup.
+        """
+        row = await conn.fetchrow(
+            """
+            SELECT data_type, udt_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'player_title_inventory'
+              AND column_name = 'user_id'
+            LIMIT 1
+            """
+        )
+        if not row:
+            return False
+
+        data_type = str(row.get("data_type") or "").lower()
+        udt_name = str(row.get("udt_name") or "").lower()
+        return data_type in {"text", "character varying", "character"} or udt_name in {"text", "varchar", "bpchar"}
+
     async def _grant_finished_season_titles(self, conn, season_id: int, season_name: str) -> dict:
         """
         Otorga rewards de la season terminada de forma idempotente:
@@ -5293,6 +5321,11 @@ class Matchmaking(commands.Cog):
         ON CONFLICT evita duplicados si se ejecuta más de una vez.
         """
         await self._ensure_player_title_inventory_schema(conn)
+        inventory_user_id_as_text = await self._player_title_inventory_uses_text_user_id(conn)
+
+        def inventory_user_id_value(uid: int):
+            uid = int(uid)
+            return str(uid) if inventory_user_id_as_text else uid
 
         season_id = int(season_id)
         season_name = str(season_name or f"Season {season_id}").strip() or f"Season {season_id}"
@@ -5369,7 +5402,7 @@ class Matchmaking(commands.Cog):
                 current_to_final_selected_keys.append((uid, current_key, title_key))
                 place_payload.append(
                     (
-                        uid,
+                        inventory_user_id_value(uid),
                         season_id,
                         season_name,
                         title_key,
@@ -5390,7 +5423,7 @@ class Matchmaking(commands.Cog):
             current_to_final_selected_keys.append((uid, current_key, title_key))
             top_payload.append(
                 (
-                    uid,
+                    inventory_user_id_value(uid),
                     season_id,
                     season_name,
                     title_key,
@@ -5440,7 +5473,7 @@ class Matchmaking(commands.Cog):
             title_label = self._season_title_label_for_rank(season_name, reached_rank)
             rank_payload.append(
                 (
-                    uid,
+                    inventory_user_id_value(uid),
                     season_id,
                     season_name,
                     title_key,
@@ -5525,6 +5558,11 @@ class Matchmaking(commands.Cog):
         estos CURRENT y deja los títulos finales Season X ...
         """
         await self._ensure_player_title_inventory_schema(conn)
+        inventory_user_id_as_text = await self._player_title_inventory_uses_text_user_id(conn)
+
+        def inventory_user_id_value(uid: int):
+            uid = int(uid)
+            return str(uid) if inventory_user_id_as_text else uid
 
         season_id = int(season_id)
         season_name = str(season_name or f"Season {season_id}").strip() or f"Season {season_id}"
@@ -5596,7 +5634,7 @@ class Matchmaking(commands.Cog):
                 title_label = self._season_title_label_for_place(season_name, place, current=True)
                 current_payload.append(
                     (
-                        uid,
+                        inventory_user_id_value(uid),
                         season_id,
                         season_name,
                         title_key,
@@ -5616,7 +5654,7 @@ class Matchmaking(commands.Cog):
             title_label = self._season_title_label_for_top_cutoff(season_name, cutoff, current=True)
             current_payload.append(
                 (
-                    uid,
+                    inventory_user_id_value(uid),
                     season_id,
                     season_name,
                     title_key,
