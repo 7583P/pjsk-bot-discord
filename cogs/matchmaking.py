@@ -811,7 +811,54 @@ class Matchmaking(commands.Cog):
 
     def _has_season_placement_role(self, member: discord.Member) -> bool:
         return any(r.id == SEASON_PLACEMENT_ROLE_ID for r in getattr(member, "roles", []))
-    
+
+    def _is_legacy_placement_for_sort(self, member: discord.Member | None) -> bool:
+        """
+        Placement normal debe quedar por debajo de cualquier MMR numérico,
+        incluso por debajo de 0 MMR.
+
+        Season Placement NO entra aquí: se ordena por su MMR visible.
+        """
+        if member is None:
+            return False
+        return bool(
+            self._is_placement_member(member)
+            and not self._has_season_placement_role(member)
+        )
+
+    def _queue_member_sort_key(
+        self,
+        member: discord.Member,
+        mmr_map: dict[int, int],
+        join_order: dict[int, int] | None = None,
+    ) -> tuple[int, int, int, int]:
+        """
+        Orden global para queue/future rooms:
+        1) Jugadores con MMR numérico, de mayor a menor.
+        2) Empate: orden real de entrada a la queue.
+        3) Placement normal al final, debajo de 0 MMR.
+        """
+        join_order = join_order or {}
+        joined_at = int(join_order.get(member.id, 10**18))
+
+        if self._is_legacy_placement_for_sort(member):
+            return (1, 0, joined_at, int(member.id))
+
+        return (0, -int(mmr_map.get(member.id, 0)), joined_at, int(member.id))
+
+    @staticmethod
+    def _room_row_sort_key(row: dict) -> tuple[int, int, str, int]:
+        """
+        Orden visual dentro de un room board:
+        Placement normal siempre debajo de cualquier MMR numérico, incluido 0.
+        """
+        status = str(row.get("status") or "")
+        is_legacy_placement = 1 if status == "placement" else 0
+        mmr = int(row.get("mmr") or 0)
+        name = str(row.get("name") or "").lower()
+        uid = int(row.get("user_id") or 0)
+        return (is_legacy_placement, -mmr, name, uid)
+
     @staticmethod
     def _clamp_mmr(value: int) -> int:
         return max(0, int(value))
@@ -1241,22 +1288,17 @@ class Matchmaking(commands.Cog):
             if m:
                 members.append(m)
 
-        placements = [m for m in members if self._is_placement_member(m)]
-        nonplacements = [m for m in members if not self._is_placement_member(m)]
+        if not members:
+            return []
 
-        mmr_map = await self._effective_display_mmrs(nonplacements)
+        mmr_map = await self._effective_display_mmrs(members)
         join_order = self.queue_join_order.get(join_channel_id, {})
 
-        nonplacements.sort(
-            key=lambda m: (
-                -int(mmr_map.get(m.id, 0)),
-                join_order.get(m.id, 10**18),  # 👈 desempate por orden real de join
-            )
+        members.sort(
+            key=lambda m: self._queue_member_sort_key(m, mmr_map, join_order)
         )
 
-        placements.sort(key=lambda m: join_order.get(m.id, 10**18))
-
-        return nonplacements + placements
+        return members
 
     async def _is_unplayed_season_placement(
         self,
@@ -1877,17 +1919,13 @@ class Matchmaking(commands.Cog):
                     self.rooms.pop(rid, None)
             return
 
-        # Clasificar placement vs no-placement
-        placements = [m for m in members_all if self._is_placement_member(m)]
-        nonplacements = [m for m in members_all if not self._is_placement_member(m)]
+        mmr_map = await self._effective_display_mmrs(members_all)
+        join_order = self.queue_join_order.get(parent_id, {})
 
-        mmr_map = await self._effective_display_mmrs(nonplacements)
-
-        nonplacements.sort(key=lambda m: (-int(mmr_map.get(m.id, 0)), m.id))
-        # Placement al final, estable por id
-        placements.sort(key=lambda m: m.id)
-
-        ordered = nonplacements + placements
+        ordered = sorted(
+            members_all,
+            key=lambda m: self._queue_member_sort_key(m, mmr_map, join_order),
+        )
 
         # Agrupar en chunks de 5
         groups: list[list[discord.Member]] = [
@@ -2197,16 +2235,10 @@ class Matchmaking(commands.Cog):
         started_rooms.sort(key=lambda t: int(t[1].get("display_num") or 999999))
 
         # batch mmr para players de rooms started
-        started_member_ids: list[int] = []
-        for _rid, info in started_rooms:
-            for m in info.get("players", []) or []:
-                if m and not m.bot and not self._is_placement_member(m):
-                    started_member_ids.append(m.id)
-
         started_members = []
         for _rid, info in started_rooms:
             for m in info.get("players", []) or []:
-                if m and not m.bot and not self._is_placement_member(m):
+                if m and not m.bot:
                     started_members.append(m)
 
         started_mmr_map = await self._effective_display_mmrs(started_members)
@@ -2223,16 +2255,27 @@ class Matchmaking(commands.Cog):
             players = [m for m in (info.get("players", []) or []) if m and not m.bot]
             rows = []
             for m in players:
-                if self._is_placement_member(m):
-                    rows.append((m.display_name, -1, "placement"))
-                elif self._has_season_placement_role(m):
-                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "season_placement"))
+                mmr = int(started_mmr_map.get(m.id, 0))
+                if self._has_season_placement_role(m):
+                    status = "season_placement"
+                elif self._is_placement_member(m):
+                    status = "placement"
                 else:
-                    rows.append((m.display_name, int(started_mmr_map.get(m.id, 0)), "regular"))
-            
-            rows.sort(key=lambda x: (x[2] == "placement", -x[1], x[0].lower()))
-            
-            for name, mmr, status in rows:
+                    status = "regular"
+
+                rows.append({
+                    "user_id": int(m.id),
+                    "name": m.display_name,
+                    "mmr": mmr,
+                    "status": status,
+                })
+
+            rows.sort(key=self._room_row_sort_key)
+
+            for row in rows:
+                name = str(row["name"])
+                mmr = int(row["mmr"])
+                status = str(row["status"])
                 if status == "placement":
                     lines.append(f"{name} Placement")
                 elif status == "season_placement":
@@ -2255,10 +2298,10 @@ class Matchmaking(commands.Cog):
             for idx, g in enumerate(groups, start=1):
                 lines.append(f"ROOM {idx}")
                 for m in g:
-                    if self._is_placement_member(m):
-                        lines.append(f"{m.display_name} Placement")
-                    elif self._has_season_placement_role(m):
+                    if self._has_season_placement_role(m):
                         lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))} MMR · Season Placement")
+                    elif self._is_placement_member(m):
+                        lines.append(f"{m.display_name} Placement")
                     else:
                         lines.append(f"{m.display_name} {int(mmr_map.get(m.id, 0))}MMR")
 
@@ -3197,9 +3240,22 @@ class Matchmaking(commands.Cog):
             if uid in seen_ids:
                 continue
             seen_ids.add(uid)
-            rows.append({"user_id": uid, "mmr": int(mmr_map.get(uid, 0))})
 
-        rows.sort(key=lambda r: r["mmr"], reverse=True)
+            if self._has_season_placement_role(m):
+                status = "season_placement"
+            elif self._is_placement_member(m):
+                status = "placement"
+            else:
+                status = "regular"
+
+            rows.append({
+                "user_id": uid,
+                "name": m.display_name,
+                "mmr": int(mmr_map.get(uid, 0)),
+                "status": status,
+            })
+
+        rows.sort(key=self._room_row_sort_key)
 
         avg = round(sum(r["mmr"] for r in rows) / len(rows)) if rows else 0
 
@@ -5070,6 +5126,8 @@ class Matchmaking(commands.Cog):
     # Season title rewards
     # =========================
     SEASON_TITLE_RANKS = ("Star", "Divine Star", "Legend")
+    SEASON_TITLE_EXACT_PLACE_LIMIT = 10
+    SEASON_TITLE_TOP_CUTOFFS = (20, 30, 40, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 
     @staticmethod
     def _season_title_slug(value: str) -> str:
@@ -5078,13 +5136,11 @@ class Matchmaking(commands.Cog):
     @staticmethod
     def _season_title_place_suffix(place: int) -> str:
         place = int(place or 0)
-        if place == 1:
-            return "1st"
-        if place == 2:
-            return "2nd"
-        if place == 3:
-            return "3rd"
-        return str(place)
+        if 10 <= (place % 100) <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(place % 10, "th")
+        return f"{place}{suffix}"
 
     @staticmethod
     def _is_test_season_name(season_name: str | None) -> bool:
@@ -5102,12 +5158,30 @@ class Matchmaking(commands.Cog):
         return False
 
     @classmethod
-    def _season_title_label_for_place(cls, season_name: str, place: int) -> str:
-        base = f"{season_name} {cls._season_title_place_suffix(place)} Place".strip()
+    def _season_title_label_for_place(cls, season_name: str, place: int, *, current: bool = False) -> str:
+        prefix = "CURRENT " if current else ""
+        base = f"{prefix}{season_name} {cls._season_title_place_suffix(place)} Place".strip()
         base = re.sub(r"\s+", " ", base)
         if cls._is_test_season_name(season_name) and not base.upper().startswith("TEST "):
             base = f"TEST {base}"
         return base
+
+    @classmethod
+    def _season_title_label_for_top_cutoff(cls, season_name: str, cutoff: int, *, current: bool = False) -> str:
+        prefix = "CURRENT " if current else ""
+        base = f"{prefix}{season_name} TOP {int(cutoff)}".strip()
+        base = re.sub(r"\s+", " ", base)
+        if cls._is_test_season_name(season_name) and not base.upper().startswith("TEST "):
+            base = f"TEST {base}"
+        return base
+
+    @classmethod
+    def _season_title_top_cutoff_for_place(cls, place: int) -> int:
+        place = max(1, int(place or 0))
+        for cutoff in cls.SEASON_TITLE_TOP_CUTOFFS:
+            if place <= int(cutoff):
+                return int(cutoff)
+        return int(cls.SEASON_TITLE_TOP_CUTOFFS[-1])
 
     @classmethod
     def _season_title_label_for_rank(cls, season_name: str, rank: str) -> str:
@@ -5126,7 +5200,13 @@ class Matchmaking(commands.Cog):
             return "silver"
         if p == 3:
             return "bronze"
-        return "gold"
+        if p == 4:
+            return "place-4"
+        if p == 5:
+            return "place-5"
+        if 6 <= p <= 10:
+            return "place-6-10"
+        return "top-white"
 
     @staticmethod
     def _season_title_style_for_rank(rank: str) -> str:
@@ -5183,7 +5263,8 @@ class Matchmaking(commands.Cog):
     async def _grant_finished_season_titles(self, conn, season_id: int, season_name: str) -> dict:
         """
         Otorga rewards de la season terminada de forma idempotente:
-        - Top 1/2/3 final.
+        - Puestos exactos Top 1 al Top 10.
+        - Cutoff titles desde Top 11: TOP 20/30/40/50, luego TOP 100/200/.../1000.
         - Peak rank alcanzado: Star / Divine Star / Legend.
 
         Es seguro llamarlo desde /seasonreset y desde /migrate_players_to_newseason.
@@ -5196,7 +5277,9 @@ class Matchmaking(commands.Cog):
         is_test = self._is_test_season_name(season_name)
 
         place_payload: list[tuple] = []
+        top_payload: list[tuple] = []
         rank_payload: list[tuple] = []
+        current_to_final_selected_keys: list[tuple[int, str, str]] = []
 
         try:
             top_rows = await conn.fetch(
@@ -5231,7 +5314,6 @@ class Matchmaking(commands.Cog):
                 )
                 SELECT user_id, place, mmr, role
                 FROM ranked
-                WHERE place <= 3
                 ORDER BY place ASC
                 """,
                 season_id,
@@ -5248,7 +5330,6 @@ class Matchmaking(commands.Cog):
                 WHERE season_id = $1
                   AND mmr > 0
                 ORDER BY place ASC
-                LIMIT 3
                 """,
                 season_id,
             )
@@ -5256,19 +5337,46 @@ class Matchmaking(commands.Cog):
         for r in top_rows:
             uid = int(r["user_id"])
             place = int(r["place"])
-            title_key = f"season:{season_id}:place:{place}"
-            title_label = self._season_title_label_for_place(season_name, place)
-            place_payload.append(
+            if place > 1000:
+                continue
+
+            if place <= self.SEASON_TITLE_EXACT_PLACE_LIMIT:
+                title_key = f"season:{season_id}:place:{place}"
+                current_key = f"current:{season_id}:place:{place}"
+                title_label = self._season_title_label_for_place(season_name, place)
+                current_to_final_selected_keys.append((uid, current_key, title_key))
+                place_payload.append(
+                    (
+                        uid,
+                        season_id,
+                        season_name,
+                        title_key,
+                        title_label,
+                        "place",
+                        place,
+                        None,
+                        self._season_title_style_for_place(place),
+                        is_test,
+                    )
+                )
+                continue
+
+            cutoff = self._season_title_top_cutoff_for_place(place)
+            title_key = f"season:{season_id}:top:{cutoff}"
+            current_key = f"current:{season_id}:top:{cutoff}"
+            title_label = self._season_title_label_for_top_cutoff(season_name, cutoff)
+            current_to_final_selected_keys.append((uid, current_key, title_key))
+            top_payload.append(
                 (
                     uid,
                     season_id,
                     season_name,
                     title_key,
                     title_label,
-                    "place",
-                    place,
+                    "top",
                     None,
-                    self._season_title_style_for_place(place),
+                    f"TOP {cutoff}",
+                    "top-white",
                     is_test,
                 )
             )
@@ -5339,17 +5447,217 @@ class Matchmaking(commands.Cog):
                 is_test_season = EXCLUDED.is_test_season
         """
 
-        if place_payload:
-            await conn.executemany(insert_sql, place_payload)
-        if rank_payload:
-            await conn.executemany(insert_sql, rank_payload)
+        for payload in (place_payload, top_payload, rank_payload):
+            if payload:
+                await conn.executemany(insert_sql, payload)
+
+        # Si el usuario tenía seleccionado un título CURRENT de esta season,
+        # al cerrar la season lo convertimos al título final equivalente.
+        # Ejemplo: current:3:top:50 -> season:3:top:50.
+        for uid, current_key, final_key in current_to_final_selected_keys:
+            await conn.execute(
+                """
+                UPDATE public.players
+                SET selected_title_key = $3
+                WHERE user_id = $1
+                  AND selected_title_key = $2
+                """,
+                uid,
+                current_key,
+                final_key,
+            )
+
+        # Los títulos CURRENT son temporales. Una vez cerrada la season,
+        # se eliminan del inventario y quedan los definitivos Season X ...
+        await conn.execute(
+            """
+            DELETE FROM public.player_title_inventory
+            WHERE season_id = $1
+              AND title_key LIKE $2
+            """,
+            season_id,
+            f"current:{season_id}:%",
+        )
 
         return {
             "season_id": season_id,
             "season_name": season_name,
             "place_titles": len(place_payload),
+            "top_titles": len(top_payload),
             "rank_titles": len(rank_payload),
-            "total_titles": len(place_payload) + len(rank_payload),
+            "total_titles": len(place_payload) + len(top_payload) + len(rank_payload),
+        }
+
+    async def _sync_current_season_top_titles(self, conn, season_id: int, season_name: str) -> dict:
+        """
+        Mantiene títulos temporales CURRENT de la season activa.
+
+        Ejemplos:
+        - CURRENT Season 3 1st Place
+        - CURRENT Season 3 7th Place
+        - CURRENT Season 3 TOP 20 / 30 / 40 / 50 / 100 / 200 / ... / 1000
+
+        Se recalcula de forma idempotente después de cada submit. Si un jugador
+        baja de cutoff o sale del Top, su título CURRENT anterior se elimina.
+        Al cerrar la season, _grant_finished_season_titles convierte/elimina
+        estos CURRENT y deja los títulos finales Season X ...
+        """
+        await self._ensure_player_title_inventory_schema(conn)
+
+        season_id = int(season_id)
+        season_name = str(season_name or f"Season {season_id}").strip() or f"Season {season_id}"
+        is_test = self._is_test_season_name(season_name)
+
+        try:
+            top_rows = await conn.fetch(
+                """
+                WITH played AS (
+                    SELECT DISTINCT user_id
+                    FROM public.match_history
+                    WHERE season_id = $1
+                ), tied AS (
+                    SELECT
+                        sp.user_id,
+                        MIN(mh.played_at) AS first_reached_current_mmr
+                    FROM public.seasonplayers sp
+                    LEFT JOIN public.match_history mh
+                      ON mh.season_id = sp.season_id
+                     AND mh.user_id = sp.user_id
+                     AND mh.mmr_after = sp.mmr
+                    WHERE sp.season_id = $1
+                    GROUP BY sp.user_id
+                ), ranked AS (
+                    SELECT
+                        sp.user_id,
+                        sp.mmr,
+                        sp.role,
+                        ROW_NUMBER() OVER (
+                            ORDER BY sp.mmr DESC, tied.first_reached_current_mmr ASC NULLS LAST, sp.user_id ASC
+                        ) AS place
+                    FROM public.seasonplayers sp
+                    INNER JOIN played p ON p.user_id = sp.user_id
+                    LEFT JOIN tied ON tied.user_id = sp.user_id
+                    WHERE sp.season_id = $1
+                )
+                SELECT user_id, place, mmr, role
+                FROM ranked
+                WHERE place <= 1000
+                ORDER BY place ASC
+                """,
+                season_id,
+            )
+        except Exception:
+            top_rows = await conn.fetch(
+                """
+                SELECT user_id,
+                       ROW_NUMBER() OVER (ORDER BY mmr DESC, user_id ASC) AS place,
+                       mmr,
+                       role
+                FROM public.seasonplayers
+                WHERE season_id = $1
+                  AND mmr > 0
+                ORDER BY place ASC
+                LIMIT 1000
+                """,
+                season_id,
+            )
+
+        current_payload: list[tuple] = []
+        current_keys: list[str] = []
+
+        for r in top_rows:
+            uid = int(r["user_id"])
+            place = int(r["place"])
+
+            if place <= self.SEASON_TITLE_EXACT_PLACE_LIMIT:
+                title_key = f"current:{season_id}:place:{place}"
+                title_label = self._season_title_label_for_place(season_name, place, current=True)
+                current_payload.append(
+                    (
+                        uid,
+                        season_id,
+                        season_name,
+                        title_key,
+                        title_label,
+                        "current_place",
+                        place,
+                        None,
+                        self._season_title_style_for_place(place),
+                        is_test,
+                    )
+                )
+                current_keys.append(title_key)
+                continue
+
+            cutoff = self._season_title_top_cutoff_for_place(place)
+            title_key = f"current:{season_id}:top:{cutoff}"
+            title_label = self._season_title_label_for_top_cutoff(season_name, cutoff, current=True)
+            current_payload.append(
+                (
+                    uid,
+                    season_id,
+                    season_name,
+                    title_key,
+                    title_label,
+                    "current_top",
+                    None,
+                    f"TOP {cutoff}",
+                    "top-white",
+                    is_test,
+                )
+            )
+            current_keys.append(title_key)
+
+        keep_keys = current_keys or ["__none__"]
+        current_pattern = f"current:{season_id}:%"
+
+        # Limpia selección si apuntaba a un CURRENT que ya no corresponde.
+        await conn.execute(
+            """
+            UPDATE public.players
+            SET selected_title_key = NULL
+            WHERE selected_title_key LIKE $1
+              AND selected_title_key <> ALL($2::text[])
+            """,
+            current_pattern,
+            keep_keys,
+        )
+
+        # Elimina CURRENT obsoletos del inventario.
+        await conn.execute(
+            """
+            DELETE FROM public.player_title_inventory
+            WHERE season_id = $1
+              AND title_key LIKE $2
+              AND title_key <> ALL($3::text[])
+            """,
+            season_id,
+            current_pattern,
+            keep_keys,
+        )
+
+        insert_sql = """
+            INSERT INTO public.player_title_inventory (
+                user_id, season_id, season_name, title_key, title_label,
+                title_type, place, rank, style_key, is_test_season
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (user_id, title_key) DO UPDATE SET
+                season_name = EXCLUDED.season_name,
+                title_label = EXCLUDED.title_label,
+                title_type = EXCLUDED.title_type,
+                place = EXCLUDED.place,
+                rank = EXCLUDED.rank,
+                style_key = EXCLUDED.style_key,
+                is_test_season = EXCLUDED.is_test_season
+        """
+        if current_payload:
+            await conn.executemany(insert_sql, current_payload)
+
+        return {
+            "season_id": season_id,
+            "season_name": season_name,
+            "current_titles": len(current_payload),
         }
 
 
@@ -5419,7 +5727,7 @@ class Matchmaking(commands.Cog):
         # Solo jugadores registrados que sigan estando en el servidor
         guild_member_ids = {m.id for m in guild.members if not m.bot}
 
-        title_summary = {"place_titles": 0, "rank_titles": 0, "total_titles": 0}
+        title_summary = {"place_titles": 0, "top_titles": 0, "rank_titles": 0, "total_titles": 0}
 
         async with self.db_pool.acquire() as conn:
             async with conn.transaction():
@@ -7768,6 +8076,13 @@ class Matchmaking(commands.Cog):
                         p.get("is_season_placement", False),  # distingue [SEASON PLACEMENT] en results.png
                     )
                 )
+
+            # Actualizar títulos temporales CURRENT de la season activa después de recalcular MMR.
+            try:
+                async with self.db_pool.acquire() as conn:
+                    await self._sync_current_season_top_titles(conn, season_id, season_name)
+            except Exception:
+                log.exception("No se pudo sincronizar CURRENT season top titles después del submit")
 
             # =========================
             # PUBLICAR RESULTADOS 1 SOLA VEZ
