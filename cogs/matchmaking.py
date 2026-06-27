@@ -4277,6 +4277,28 @@ class Matchmaking(commands.Cog):
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_seasonplayers_season_mmr ON seasonplayers(season_id, mmr DESC);"
             )
+
+            # Al iniciar el bot, recalcula los títulos CURRENT de la season activa.
+            # Esto evita que el selector de títulos quede vacío hasta que haya otro submit.
+            try:
+                current_season_row = await conn.fetchrow(
+                    """
+                    SELECT id, name
+                    FROM seasons
+                    WHERE active = true
+                    ORDER BY startdate DESC
+                    LIMIT 1
+                    """
+                )
+                if current_season_row:
+                    await self._sync_current_season_top_titles(
+                        conn,
+                        int(current_season_row["id"]),
+                        str(current_season_row["name"]),
+                    )
+            except Exception:
+                log.exception("No se pudo sincronizar CURRENT season top titles en cog_load")
+
             # Índices útiles
             await conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_songs_level_server ON songs(level, server);"
@@ -5579,7 +5601,7 @@ class Matchmaking(commands.Cog):
                         season_name,
                         title_key,
                         title_label,
-                        "current_place",
+                        "place",
                         place,
                         None,
                         self._season_title_style_for_place(place),
@@ -5599,7 +5621,7 @@ class Matchmaking(commands.Cog):
                     season_name,
                     title_key,
                     title_label,
-                    "current_top",
+                    "top",
                     None,
                     f"TOP {cutoff}",
                     "top-white",
@@ -5608,32 +5630,44 @@ class Matchmaking(commands.Cog):
             )
             current_keys.append(title_key)
 
-        keep_keys = current_keys or ["__none__"]
         current_pattern = f"current:{season_id}:%"
+        valid_user_ids = [int(row[0]) for row in current_payload] or [0]
+        valid_title_keys = [str(row[3]) for row in current_payload] or ["__none__"]
 
-        # Limpia selección si apuntaba a un CURRENT que ya no corresponde.
+        # Limpia selección si apuntaba a un CURRENT que ya no corresponde
+        # para ESE usuario. No basta validar solo por title_key, porque
+        # muchos usuarios comparten current:<season>:top:<cutoff>.
         await conn.execute(
             """
-            UPDATE public.players
+            WITH valid AS (
+                SELECT *
+                FROM unnest($2::bigint[], $3::text[]) AS v(user_id, title_key)
+            )
+            UPDATE public.players p
             SET selected_title_key = NULL
-            WHERE selected_title_key LIKE $1
-              AND selected_title_key <> ALL($2::text[])
+            WHERE p.selected_title_key LIKE $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM valid v
+                  WHERE v.user_id = p.user_id
+                    AND v.title_key = p.selected_title_key
+              )
             """,
             current_pattern,
-            keep_keys,
+            valid_user_ids,
+            valid_title_keys,
         )
 
-        # Elimina CURRENT obsoletos del inventario.
+        # Recalcular CURRENT de cero evita títulos stale.
+        # Ejemplo: si alguien baja de TOP 40 a TOP 50, se elimina el CURRENT viejo.
         await conn.execute(
             """
             DELETE FROM public.player_title_inventory
             WHERE season_id = $1
               AND title_key LIKE $2
-              AND title_key <> ALL($3::text[])
             """,
             season_id,
             current_pattern,
-            keep_keys,
         )
 
         insert_sql = """
@@ -5659,6 +5693,44 @@ class Matchmaking(commands.Cog):
             "season_name": season_name,
             "current_titles": len(current_payload),
         }
+
+
+    @app_commands.command(
+        name="sync_current_titles",
+        description="Recalculate CURRENT season title rewards."
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sync_current_titles(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async with self.db_pool.acquire() as conn:
+            current_season_row = await conn.fetchrow(
+                """
+                SELECT id, name
+                FROM seasons
+                WHERE active = true
+                ORDER BY startdate DESC
+                LIMIT 1
+                """
+            )
+            if not current_season_row:
+                return await interaction.followup.send(
+                    "❌ No hay una season activa.",
+                    ephemeral=True,
+                )
+
+            summary = await self._sync_current_season_top_titles(
+                conn,
+                int(current_season_row["id"]),
+                str(current_season_row["name"]),
+            )
+
+        await interaction.followup.send(
+            f"✅ CURRENT titles sincronizados para **{summary['season_name']}**: "
+            f"`{summary['current_titles']}` títulos temporales.",
+            ephemeral=True,
+        )
 
 
     @app_commands.command(
