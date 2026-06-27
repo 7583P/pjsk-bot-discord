@@ -5147,13 +5147,66 @@ class Matchmaking(commands.Cog):
     # =========================
     # Season title rewards
     # =========================
-    SEASON_TITLE_RANKS = ("Star", "Divine Star", "Legend")
+    # Rank titles are now archived exactly like place/top titles.
+    # Every rank a player reaches as peak MMR in a season can be earned,
+    # not only Star / Divine Star / Legend.
+    SEASON_TITLE_RANKS = (
+        "Iron",
+        "Iron ⬆",
+        "Bronze",
+        "Bronze ⬆",
+        "Silver",
+        "Silver ⬆",
+        "Gold",
+        "Gold ⬆",
+        "Platinum",
+        "Platinum ⬆",
+        "Diamond",
+        "Diamond ⬆",
+        "Crystal",
+        "Crystal ⬆",
+        "Master",
+        "Master ⬆",
+        "Champion",
+        "Grand Champion",
+        "Star",
+        "Divine Star",
+        "Legend",
+    )
+
+    SEASON_TITLE_RANK_STYLE_BY_RANK = {
+        "Iron": "rank-Iron",
+        "Iron ⬆": "rank-IronUp",
+        "Bronze": "rank-Bronze",
+        "Bronze ⬆": "rank-BronzeUp",
+        "Silver": "rank-Silver",
+        "Silver ⬆": "rank-SilverUp",
+        "Gold": "rank-Gold",
+        "Gold ⬆": "rank-GoldUp",
+        "Platinum": "rank-Platinum",
+        "Platinum ⬆": "rank-PlatinumUp",
+        "Diamond": "rank-Diamond",
+        "Diamond ⬆": "rank-DiamondUp",
+        "Crystal": "rank-Crystal",
+        "Crystal ⬆": "rank-CrystalUp",
+        "Master": "rank-Master",
+        "Master ⬆": "rank-MasterUp",
+        "Champion": "rank-Champion",
+        "Grand Champion": "rank-GrandChampion",
+        "Star": "rank-Star",
+        "Divine Star": "rank-DivineStar",
+        "Legend": "rank-Legend",
+    }
+
     SEASON_TITLE_EXACT_PLACE_LIMIT = 10
     SEASON_TITLE_TOP_CUTOFFS = (20, 30, 40, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
 
     @staticmethod
     def _season_title_slug(value: str) -> str:
-        return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+        # Keep Up-rank titles unique: "Diamond ⬆" must become diamond-up,
+        # not diamond, otherwise it collides with regular Diamond.
+        raw = str(value or "").replace("⬆", " up").replace("↑", " up")
+        return re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
 
     @staticmethod
     def _season_title_place_suffix(place: int) -> str:
@@ -5206,8 +5259,9 @@ class Matchmaking(commands.Cog):
         return int(cls.SEASON_TITLE_TOP_CUTOFFS[-1])
 
     @classmethod
-    def _season_title_label_for_rank(cls, season_name: str, rank: str) -> str:
-        base = f"{season_name} {rank}".strip()
+    def _season_title_label_for_rank(cls, season_name: str, rank: str, *, current: bool = False) -> str:
+        prefix = "CURRENT " if current else ""
+        base = f"{prefix}{season_name} {rank}".strip()
         base = re.sub(r"\s+", " ", base)
         if cls._is_test_season_name(season_name) and not base.upper().startswith("TEST "):
             base = f"TEST {base}"
@@ -5230,25 +5284,16 @@ class Matchmaking(commands.Cog):
             return "place-6-10"
         return "top-white"
 
-    @staticmethod
-    def _season_title_style_for_rank(rank: str) -> str:
-        key = str(rank or "").replace(" ", "")
-        if key == "DivineStar":
-            return "rank-DivineStar"
-        if key == "Legend":
-            return "rank-Legend"
-        return "rank-Star"
+    @classmethod
+    def _season_title_style_for_rank(cls, rank: str) -> str:
+        rank = str(rank or "").strip()
+        return cls.SEASON_TITLE_RANK_STYLE_BY_RANK.get(rank, "rank-Star")
 
     @staticmethod
     def _season_rank_from_peak_mmr(peak_mmr: int | None) -> str | None:
-        mmr = int(peak_mmr or 0)
-        if mmr >= 1000:
-            return "Legend"
-        if mmr >= 950:
-            return "Divine Star"
-        if mmr >= 900:
-            return "Star"
-        return None
+        if peak_mmr is None:
+            return None
+        return get_rank_from_mmr(max(0, int(peak_mmr)))
 
     async def _ensure_player_title_inventory_schema(self, conn) -> None:
         """
@@ -5439,23 +5484,22 @@ class Matchmaking(commands.Cog):
         try:
             peak_rows = await conn.fetch(
                 """
-                SELECT
-                    user_id,
-                    MAX(
-                        CASE
-                            WHEN was_placement THEN mmr_after
-                            ELSE GREATEST(mmr_before, mmr_after)
-                        END
-                    )::int AS peak_mmr
-                FROM public.match_history
-                WHERE season_id = $1
-                GROUP BY user_id
-                HAVING MAX(
-                    CASE
-                        WHEN was_placement THEN mmr_after
-                        ELSE GREATEST(mmr_before, mmr_after)
-                    END
-                ) >= 900
+                WITH peaks AS (
+                    SELECT
+                        user_id,
+                        MAX(
+                            CASE
+                                WHEN was_placement THEN mmr_after
+                                ELSE GREATEST(mmr_before, mmr_after)
+                            END
+                        )::int AS peak_mmr
+                    FROM public.match_history
+                    WHERE season_id = $1
+                    GROUP BY user_id
+                )
+                SELECT user_id, peak_mmr
+                FROM peaks
+                WHERE peak_mmr IS NOT NULL
                 ORDER BY peak_mmr DESC, user_id ASC
                 """,
                 season_id,
@@ -5468,9 +5512,16 @@ class Matchmaking(commands.Cog):
             reached_rank = self._season_rank_from_peak_mmr(r["peak_mmr"])
             if not reached_rank:
                 continue
+
             slug = self._season_title_slug(reached_rank)
             title_key = f"season:{season_id}:rank:{slug}"
+            current_key = f"current:{season_id}:rank:{slug}"
             title_label = self._season_title_label_for_rank(season_name, reached_rank)
+
+            # If the user had the CURRENT rank title selected, keep it selected
+            # by converting it to the permanent final title when the season closes.
+            current_to_final_selected_keys.append((uid, current_key, title_key))
+
             rank_payload.append(
                 (
                     inventory_user_id_value(uid),
@@ -5668,6 +5719,58 @@ class Matchmaking(commands.Cog):
             )
             current_keys.append(title_key)
 
+        try:
+            peak_rows = await conn.fetch(
+                """
+                WITH peaks AS (
+                    SELECT
+                        user_id,
+                        MAX(
+                            CASE
+                                WHEN was_placement THEN mmr_after
+                                ELSE GREATEST(mmr_before, mmr_after)
+                            END
+                        )::int AS peak_mmr
+                    FROM public.match_history
+                    WHERE season_id = $1
+                    GROUP BY user_id
+                )
+                SELECT user_id, peak_mmr
+                FROM peaks
+                WHERE peak_mmr IS NOT NULL
+                ORDER BY peak_mmr DESC, user_id ASC
+                """,
+                season_id,
+            )
+        except Exception:
+            peak_rows = []
+
+        for r in peak_rows:
+            uid = int(r["user_id"])
+            reached_rank = self._season_rank_from_peak_mmr(r["peak_mmr"])
+            if not reached_rank:
+                continue
+
+            slug = self._season_title_slug(reached_rank)
+            title_key = f"current:{season_id}:rank:{slug}"
+            title_label = self._season_title_label_for_rank(season_name, reached_rank, current=True)
+
+            current_payload.append(
+                (
+                    inventory_user_id_value(uid),
+                    season_id,
+                    season_name,
+                    title_key,
+                    title_label,
+                    "rank",
+                    None,
+                    reached_rank,
+                    self._season_title_style_for_rank(reached_rank),
+                    is_test,
+                )
+            )
+            current_keys.append(title_key)
+
         current_pattern = f"current:{season_id}:%"
         valid_user_ids = [int(row[0]) for row in current_payload] or [0]
         valid_title_keys = [str(row[3]) for row in current_payload] or ["__none__"]
@@ -5769,6 +5872,76 @@ class Matchmaking(commands.Cog):
             f"`{summary['current_titles']}` títulos temporales.",
             ephemeral=True,
         )
+
+
+    @app_commands.command(
+        name="backfill_finished_titles",
+        description="Backfill permanent title rewards for all finished seasons."
+    )
+    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    @app_commands.checks.has_permissions(administrator=True)
+    async def backfill_finished_titles(self, interaction: discord.Interaction):
+        """
+        Rebuilds the permanent title inventory for all inactive seasons.
+        Use this once after deploying the rank-title update so old archived
+        ranks appear in Edit Profile like the other earned titles.
+        """
+        await interaction.response.defer(ephemeral=True)
+
+        if self.db_pool is None:
+            return await interaction.followup.send("DB not ready.", ephemeral=True)
+
+        async with self.db_pool.acquire() as conn:
+            seasons = await conn.fetch(
+                """
+                SELECT id, name
+                FROM public.seasons
+                WHERE active = false
+                ORDER BY id ASC
+                """
+            )
+
+            if not seasons:
+                return await interaction.followup.send(
+                    "⚠️ No hay seasons cerradas para procesar.",
+                    ephemeral=True,
+                )
+
+            totals = {"place_titles": 0, "top_titles": 0, "rank_titles": 0, "total_titles": 0}
+            lines: list[str] = []
+
+            async with conn.transaction():
+                for s in seasons:
+                    summary = await self._grant_finished_season_titles(
+                        conn,
+                        int(s["id"]),
+                        str(s["name"]),
+                    )
+
+                    for key in totals:
+                        totals[key] += int(summary.get(key, 0) or 0)
+
+                    lines.append(
+                        f"{summary['season_name']}: "
+                        f"{summary['place_titles']} place, "
+                        f"{summary['top_titles']} top, "
+                        f"{summary['rank_titles']} rank"
+                    )
+
+        details = "\n".join(lines[:20])
+        if len(lines) > 20:
+            details += f"\n...y {len(lines) - 20} seasons más."
+
+        msg = (
+            "✅ Backfill completado.\n"
+            f"Place titles: `{totals['place_titles']}`\n"
+            f"Top cutoff titles: `{totals['top_titles']}`\n"
+            f"Rank titles: `{totals['rank_titles']}`\n"
+            f"Total titles touched: `{totals['total_titles']}`\n\n"
+            f"{details}"
+        )
+
+        await interaction.followup.send(msg[:1900], ephemeral=True)
 
 
     @app_commands.command(
