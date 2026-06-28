@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_TITLES_TOP_CUTOFFS_RANKS_V20_2026_06_27"
+PJSK_DEPLOY_VERSION = "PJSK_TITLES_TOP_ONLY_CUTOFFS_V21_2026_06_27"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -1254,7 +1254,7 @@ def _place_suffix(place: int) -> str:
 
 
 SEASON_TITLE_EXACT_PLACE_LIMIT = 10
-SEASON_TITLE_TOP_CUTOFFS = (20, 30, 40, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000)
+SEASON_TITLE_TOP_CUTOFFS = (20, 30, 40, 50, 100, 200, 300, 400, 500, 1000)
 
 SEASON_TITLE_RANKS = (
     "Iron",
@@ -1470,9 +1470,10 @@ def _top_cutoff_for_place(place: Any) -> int:
 def _top_cutoff_from_any(value: Any) -> Optional[int]:
     raw = str(value or "")
     m = re.search(r"\bTOP\s*(\d+)\b", raw, flags=re.I)
-    if m:
-        return int(m.group(1))
-    return None
+    if not m:
+        return None
+    cutoff = int(m.group(1))
+    return cutoff if cutoff in SEASON_TITLE_TOP_CUTOFFS else None
 
 
 def _format_title_label(
@@ -1541,14 +1542,17 @@ def _parse_title_key(title_key: Optional[str]) -> Optional[Dict[str, Any]]:
             "current": current,
         }
 
-    # Top cutoff keys: season/current/reward:<id>:top:<20|30|...>
+    # Top cutoff keys: season/current/reward:<id>:top:<20|30|...|500|1000>
     m = re.fullmatch(r"(?:season|reward|current):([^:]+):top:(\d+)", key, flags=re.I)
     if m:
+        cutoff = int(m.group(2))
+        if cutoff not in SEASON_TITLE_TOP_CUTOFFS:
+            return None
         return {
             "season_id": m.group(1),
             "title_type": "top",
             "place": None,
-            "top_cutoff": int(m.group(2)),
+            "top_cutoff": cutoff,
             "rank": None,
             "current": current,
         }
@@ -1791,6 +1795,8 @@ def _title_payload_from_selected_row(row: Any) -> Optional[Dict[str, Any]]:
         return None
 
     if parsed["title_type"] == "top":
+        if int(parsed.get("top_cutoff") or 0) not in SEASON_TITLE_TOP_CUTOFFS:
+            return None
         return _title_payload(
             key=str(title_key),
             season_id=parsed["season_id"],
@@ -1918,6 +1924,8 @@ async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[
         return None
 
     if parsed["title_type"] == "top":
+        if int(parsed.get("top_cutoff") or 0) not in SEASON_TITLE_TOP_CUTOFFS:
+            return None
         return _title_payload(
             key=str(title_key),
             season_id=parsed["season_id"],
@@ -2046,15 +2054,10 @@ async def _generated_titles_for_user_id(conn: asyncpg.Connection, user_id: str) 
             SELECT *
             FROM prepared
             WHERE COALESCE(mmr, 0) > 0
-              AND NOT (
-                COALESCE(season_active, FALSE)
-                AND COALESCE(is_season_placement, FALSE)
-                AND COALESCE(games_played, 0) = 0
-              )
-              AND NOT (
-                lower(COALESCE(role, '')) = 'placement'
-                AND COALESCE(mmr, 0) <= 0
-              )
+              AND COALESCE(games_played, 0) > 0
+              AND NOT COALESCE(is_season_placement, FALSE)
+              AND COALESCE(NULLIF(trim(role), ''), '') <> ''
+              AND lower(replace(replace(COALESCE(role, ''), '_', ' '), '-', ' ')) NOT IN ('placement', 'season placement')
         ),
         ranked AS (
             SELECT
@@ -2217,6 +2220,8 @@ async def _eligible_titles_for_user_id(conn: asyncpg.Connection, user_id: str) -
 
         parsed = _parse_title_key(key)
         if parsed and parsed.get("title_type") == "rank":
+            continue
+        if parsed and parsed.get("title_type") == "top" and int(parsed.get("top_cutoff") or 0) not in SEASON_TITLE_TOP_CUTOFFS:
             continue
         if str(r["title_type"] or "").lower() == "rank":
             continue
