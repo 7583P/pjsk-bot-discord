@@ -62,7 +62,7 @@ app = FastAPI()
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
-PJSK_DEPLOY_VERSION = "PJSK_TITLES_TOP_ONLY_CUTOFFS_V21_2026_06_27"
+PJSK_DEPLOY_VERSION = "PJSK_TITLES_PREVIOUS_SEASONS_V22_2026_06_27"
 
 # SECURITY DEFAULTS:
 # - Do not allow users to freely claim an unlinked leaderboard player from the web.
@@ -2054,7 +2054,10 @@ async def _generated_titles_for_user_id(conn: asyncpg.Connection, user_id: str) 
             SELECT *
             FROM prepared
             WHERE COALESCE(mmr, 0) > 0
-              AND COALESCE(games_played, 0) > 0
+              -- Current season titles require at least one real played match.
+              -- Closed legacy/test seasons may have 0 stored matches but still keep
+              -- valid final standings, so they can still receive TOP/place titles.
+              AND (NOT COALESCE(season_active, FALSE) OR COALESCE(games_played, 0) > 0)
               AND NOT COALESCE(is_season_placement, FALSE)
               AND COALESCE(NULLIF(trim(role), ''), '') <> ''
               AND lower(replace(replace(COALESCE(role, ''), '_', ' '), '-', ' ')) NOT IN ('placement', 'season placement')
