@@ -233,154 +233,39 @@ NON_APPEND_POOL_LIMIT = 10
 # Siempre intentamos meter hasta 5 canciones append en el pool
 APPEND_POOL_LIMIT = 10
 
-# Probabilidad (en %) de que la sala tenga appends (al menos 1) según el rango del room
+# Probabilidad (%) POR CADA CANCIÓN de ser Append.
+# Cada uno de los 5 slots tira su propio random.
+# Ejemplos:
+# - Diamond = cada canción tiene 1% de chance de ser Append.
+# - Crystal = cada canción tiene 4% de chance de ser Append.
+# - Legend = cada canción tiene 20% de chance de ser Append.
 APPEND_PROBABILITIES_PERCENT = {
-    "Diamond": 1,  # 10% de salas con append
-    "Diamond ⬆": 5,
-    "Crystal": 10,
-    "Crystal ⬆": 15,
-    "Master": 20,
-    "Master ⬆": 25,
-    "Champion": 30,
-    "Grand Champion": 35,
-    "Star": 40,
-    "Divine Star": 45,
-    "Legend": 50,
+    "Diamond": 1,
+    "Diamond ⬆": 2,
+    "Crystal": 4,
+    "Crystal ⬆": 6,
+    "Master": 8,
+    "Master ⬆": 10,
+    "Champion": 12,
+    "Grand Champion": 14,
+    "Star": 16,
+    "Divine Star": 18,
+    "Legend": 20,
 }
 
 
 def get_append_probability_for_rank(rank: str) -> float:
     """
-    Devuelve la probabilidad de que la selección final tenga
-    appends (al menos 1), como valor entre 0.0 y 1.0.
+    Devuelve la probabilidad POR CANCIÓN de que un slot sea Append,
+    como valor entre 0.0 y 1.0.
     """
     pct = APPEND_PROBABILITIES_PERCENT.get(rank, 0)
-    return pct / 100.0
+    return float(pct) / 100.0
 
 
-# Distribución de cuántos appends quiero CUANDO toca append.
-# En este ejemplo:
-# - Diamond: 70% de esas salas tendrán 1 append, 30% tendrán 2 appends.
-APPEND_COUNTS_DISTRIB = {
-    "Diamond": {
-        1: 1,  # 10% de los rooms con append → 1 append
-        2: 0.5,  # 5% → 2 appends
-        3: 0.1,  # 1% de los rooms con append → 1 append
-        4: 0.05,  # 0.5% → 2 appends
-        5: 0.01,  # 0.01% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Diamond ⬆": {
-        1: 1,  # 15% de los rooms con append → 1 append
-        2: 0.5,  # 7.5% → 2 appends
-        3: 0.1,  # 1.15% de los rooms con append → 1 append
-        4: 0.05,  # 0.15% → 2 appends
-        5: 0.01,  # 0.015% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Crystal": {
-        1: 1,  # 20% de los rooms con append → 1 append
-        2: 0.5,  # 10% → 2 appends
-        3: 0.1,  # 2% de los rooms con append → 1 append
-        4: 0.05,  # 0.20% → 2 appends
-        5: 0.01,  # 0.020% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Crystal ⬆": {
-        1: 1,  # 25% de los rooms con append → 1 append
-        2: 0.5,  # 12.5% → 2 appends
-        3: 0.1,  # 2.5% de los rooms con append → 1 append
-        4: 0.05,  # 1.25% → 2 appends
-        5: 0.01,  # 0.25% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Master": {
-        1: 1,  # 30% de los rooms con append → 1 append
-        2: 0.5,  # 15% → 2 appends
-        3: 0.1,  # 3% de los rooms con append → 1 append
-        4: 0.05,  # 1.5% → 2 appends
-        5: 0.01,  # 0.030% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Master ⬆": {
-        1: 1,  # 35% de los rooms con append → 1 append
-        2: 0.5,  # 17.5% → 2 appends
-        3: 0.1,  # 3.5% de los rooms con append → 1 append
-        4: 0.05,  # 1.75% → 2 appends
-        5: 0.01,  # 0.35% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Champion": {
-        1: 1,  # 40% de los rooms con append → 1 append
-        2: 0.5,  # 20% → 2 appends
-        3: 0.1,  # 4% de los rooms con append → 1 append
-        4: 0.05,  # 2% → 2 appends
-        5: 0.01,  # 0.40% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Grand Champion": {
-        1: 1,  # 40% de los rooms con append → 1 append
-        2: 0.5,  # 20% → 2 appends
-        3: 0.1,  # 4% de los rooms con append → 1 append
-        4: 0.05,  # 2% → 2 appends
-        5: 0.01,  # 0.40% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Star": {
-        1: 1,  # 45% de los rooms con append → 1 append
-        2: 0.5,  # 22.5% → 2 appends
-        3: 0.1,  # 4.5% de los rooms con append → 1 append
-        4: 0.05,  # 2.25% → 2 appends
-        5: 0.01,  # 0.45% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Divine Star": {
-        1: 1,  # 45% de los rooms con append → 1 append
-        2: 0.5,  # 22.5% → 2 appends
-        3: 0.1,  # 4.5% de los rooms con append → 1 append
-        4: 0.05,  # 2.25% → 2 appends
-        5: 0.01,  # 0.45% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-    "Legend": {
-        1: 1,  # 50% de los rooms con append → 1 append
-        2: 0.5,  # 25% → 2 appends
-        3: 0.1,  # 5% de los rooms con append → 1 append
-        4: 0.05,  # 2.50% → 2 appends
-        5: 0.01,  # 0.50% de los rooms con append → 1 append
-    },
-    # puedes ir definiendo otros rangos aquí si quieres
-}
-
-
-def pick_append_count_for_rank(rank: str, max_available: int) -> int:
-    """
-    El distrib se interpreta como PESOS (no como probabilidades que suman 1).
-    """
-    if max_available <= 0:
-        return 0
-
-    distrib = APPEND_COUNTS_DISTRIB.get(rank)
-    if not distrib:
-        return 1  # fallback: 1 append si hay
-
-    items = sorted(distrib.items())  # (k, weight)
-    total_w = sum(float(w) for _, w in items if float(w) > 0)
-    if total_w <= 0:
-        return 1
-
-    r = random.random() * total_w
-    acc = 0.0
-    for k, w in items:
-        w = float(w)
-        if w <= 0:
-            continue
-        acc += w
-        if r <= acc:
-            return min(int(k), max_available)
-
-    return min(int(items[-1][0]), max_available)
-
+# Nota: APPEND_COUNTS_DISTRIB y pick_append_count_for_rank fueron removidos.
+# La selección Append ahora es por canción: cada uno de los 5 slots usa
+# get_append_probability_for_rank(base_rank) de forma independiente.
 
 # Prioridad global de dificultades, ahora incluyendo hard
 DIFFICULTY_PRIORITY = ("normal", "hard", "expert", "master", "append")
@@ -4681,37 +4566,70 @@ class Matchmaking(commands.Cog):
                     exclude_titles=taken_titles,
                 )
 
+            # Probabilidad POR CANCIÓN, no por room.
+            # Cada uno de los 5 slots tira su propio random.
             prob = get_append_probability_for_rank(base_rank)
             used_append = False
             picks: list[tuple[str, int, str, int]] = []
 
-            if pool_append and random.random() < prob:
-                used_append = True
-                random.shuffle(pool_append)
-                random.shuffle(pool_non_append)
+            random.shuffle(pool_append)
+            random.shuffle(pool_non_append)
 
-                append_count = pick_append_count_for_rank(base_rank, max_available=len(pool_append))
-                append_count = max(1, min(append_count, 5))
+            append_idx = 0
+            normal_idx = 0
+            used_title_keys: set[str] = set()
 
-                picks.extend(pool_append[:append_count])
-                remaining = 5 - len(picks)
+            def take_next_unique_song(
+                pool: list[tuple[str, int, str, int]],
+                start_idx: int,
+            ) -> tuple[tuple[str, int, str, int] | None, int]:
+                idx = start_idx
 
-                if remaining > 0 and pool_non_append:
-                    picks.extend(pool_non_append[:remaining])
-                    remaining = 5 - len(picks)
+                while idx < len(pool):
+                    song = pool[idx]
+                    idx += 1
 
-                if remaining > 0 and len(pool_append) > append_count:
-                    picks.extend(pool_append[append_count : append_count + remaining])
+                    title = str(song[0])
+                    title_key = self._song_title_key(title)
 
-            else:
-                random.shuffle(pool_non_append)
-                picks = pool_non_append[:5]
-                remaining = 5 - len(picks)
+                    if title_key in used_title_keys:
+                        continue
 
-                if remaining > 0 and pool_append:
-                    used_append = True
-                    random.shuffle(pool_append)
-                    picks.extend(pool_append[:remaining])
+                    used_title_keys.add(title_key)
+                    return song, idx
+
+                return None, idx
+
+            # 5 canciones = 5 tiradas independientes.
+            # Ejemplo Crystal 4%:
+            # canción 1: 4% append
+            # canción 2: 4% append
+            # canción 3: 4% append
+            # canción 4: 4% append
+            # canción 5: 4% append
+            for _slot in range(5):
+                chosen = None
+
+                wants_append = bool(pool_append) and random.random() < prob
+
+                if wants_append:
+                    chosen, append_idx = take_next_unique_song(pool_append, append_idx)
+                    if chosen is not None:
+                        used_append = True
+
+                # Si no tocó append, o tocó pero no hay append disponible, usa canción normal.
+                if chosen is None:
+                    chosen, normal_idx = take_next_unique_song(pool_non_append, normal_idx)
+
+                # Fallback: si no hay suficientes canciones normales, rellena con append.
+                # Esto evita que la room quede con menos de 5 canciones si el catálogo normal no alcanza.
+                if chosen is None and pool_append:
+                    chosen, append_idx = take_next_unique_song(pool_append, append_idx)
+                    if chosen is not None:
+                        used_append = True
+
+                if chosen is not None:
+                    picks.append(chosen)
 
             # ✅ Relleno final si el catálogo no alcanza (evita ValueError)
             final_picks = list(picks)
