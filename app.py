@@ -1786,9 +1786,21 @@ def _title_payload_from_selected_row(row: Any) -> Optional[Dict[str, Any]]:
     if not title_key:
         return None
 
-    parsed = _parse_title_key(str(title_key))
+    raw_title_key = str(title_key).strip()
+    if raw_title_key.lower().startswith("current "):
+        # CURRENT titles are live/dynamic. Never reconstruct stale literal
+        # labels from legacy selection rows. They must come from inventory.
+        return None
+
+    parsed = _parse_title_key(raw_title_key)
     if not parsed:
-        return _literal_title_payload(str(title_key))
+        return _literal_title_payload(raw_title_key)
+
+    if parsed.get("current"):
+        # If a CURRENT key has no matching inventory row, it is stale.
+        # This prevents old badges such as CURRENT Season 3 9th Place
+        # from remaining visible after the player moved to 10th.
+        return None
 
     season_name = _rget(row, "effective_title_season_name")
     if parsed["title_type"] == "rank":
@@ -1905,9 +1917,19 @@ async def _title_payload_from_key(conn: asyncpg.Connection, title_key: Optional[
             is_test=row["is_test_season"],
         )
 
-    parsed = _parse_title_key(title_key)
+    raw_title_key = str(title_key).strip()
+    if raw_title_key.lower().startswith("current "):
+        # Stale CURRENT literal labels from legacy storage must not be rebuilt.
+        return None
+
+    parsed = _parse_title_key(raw_title_key)
     if not parsed:
-        return _literal_title_payload(title_key)
+        return _literal_title_payload(raw_title_key)
+
+    if parsed.get("current"):
+        # CURRENT keys are valid only when the inventory row exists for this user.
+        # If the query above did not find it, the selected key is stale.
+        return None
 
     season_name = None
     try:
