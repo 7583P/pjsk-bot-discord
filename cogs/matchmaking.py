@@ -5594,6 +5594,13 @@ class Matchmaking(commands.Cog):
         current_payload: list[tuple] = []
         current_keys: list[str] = []
 
+        # user_id -> CURRENT title that should stay selected if the player
+        # already had an older CURRENT place/top title selected.
+        # Example: current:3:place:9 -> current:3:place:10.
+        # Rank CURRENT titles are not used as the automatic public badge because
+        # rank titles are not exposed in the title selector.
+        current_selected_replacements: dict[int, str] = {}
+
         for r in top_rows:
             uid = int(r["user_id"])
             place = int(r["place"])
@@ -5616,6 +5623,7 @@ class Matchmaking(commands.Cog):
                     )
                 )
                 current_keys.append(title_key)
+                current_selected_replacements[uid] = title_key
                 continue
 
             cutoff = self._season_title_top_cutoff_for_place(place)
@@ -5636,6 +5644,7 @@ class Matchmaking(commands.Cog):
                 )
             )
             current_keys.append(title_key)
+            current_selected_replacements[uid] = title_key
 
         try:
             peak_rows = await conn.fetch(
@@ -5693,9 +5702,42 @@ class Matchmaking(commands.Cog):
         valid_user_ids = [int(row[0]) for row in current_payload] or [0]
         valid_title_keys = [str(row[3]) for row in current_payload] or ["__none__"]
 
-        # Limpia selección si apuntaba a un CURRENT que ya no corresponde
-        # para ESE usuario. No basta validar solo por title_key, porque
-        # muchos usuarios comparten current:<season>:top:<cutoff>.
+        replacement_user_ids = list(current_selected_replacements.keys()) or [0]
+        replacement_title_keys = list(current_selected_replacements.values()) or ["__none__"]
+
+        # Si el usuario tenía seleccionado un CURRENT viejo, se reemplaza por
+        # su CURRENT place/top nuevo. Esto evita badges stale como:
+        # current:3:place:9 cuando el jugador ya bajó a current:3:place:10.
+        await conn.execute(
+            """
+            WITH valid AS (
+                SELECT *
+                FROM unnest($4::bigint[], $5::text[]) AS v(user_id, title_key)
+            ), replacements AS (
+                SELECT *
+                FROM unnest($2::bigint[], $3::text[]) AS r(user_id, new_title_key)
+            )
+            UPDATE public.players p
+            SET selected_title_key = r.new_title_key
+            FROM replacements r
+            WHERE p.user_id = r.user_id
+              AND p.selected_title_key LIKE $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM valid v
+                  WHERE v.user_id = p.user_id
+                    AND v.title_key = p.selected_title_key
+              )
+            """,
+            current_pattern,
+            replacement_user_ids,
+            replacement_title_keys,
+            valid_user_ids,
+            valid_title_keys,
+        )
+
+        # Si queda algún CURRENT seleccionado que ya no corresponde y no tiene
+        # reemplazo visible, se limpia.
         await conn.execute(
             """
             WITH valid AS (
@@ -5716,6 +5758,61 @@ class Matchmaking(commands.Cog):
             valid_user_ids,
             valid_title_keys,
         )
+
+        # Mantener limpia la tabla legacy si existe; app.py aún la lee como
+        # fallback para compatibilidad.
+        try:
+            await conn.execute(
+                """
+                WITH valid AS (
+                    SELECT *
+                    FROM unnest($4::bigint[], $5::text[]) AS v(user_id, title_key)
+                ), replacements AS (
+                    SELECT *
+                    FROM unnest($2::bigint[], $3::text[]) AS r(user_id, new_title_key)
+                )
+                UPDATE public.player_titles pt
+                SET title_key = r.new_title_key,
+                    updated_at = now()
+                FROM replacements r
+                WHERE pt.user_id::text = r.user_id::text
+                  AND pt.title_key LIKE $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM valid v
+                      WHERE v.user_id::text = pt.user_id::text
+                        AND v.title_key = pt.title_key
+                  )
+                """,
+                current_pattern,
+                replacement_user_ids,
+                replacement_title_keys,
+                valid_user_ids,
+                valid_title_keys,
+            )
+
+            await conn.execute(
+                """
+                WITH valid AS (
+                    SELECT *
+                    FROM unnest($2::bigint[], $3::text[]) AS v(user_id, title_key)
+                )
+                DELETE FROM public.player_titles pt
+                WHERE pt.title_key LIKE $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM valid v
+                      WHERE v.user_id::text = pt.user_id::text
+                        AND v.title_key = pt.title_key
+                  )
+                """,
+                current_pattern,
+                valid_user_ids,
+                valid_title_keys,
+            )
+        except Exception:
+            # Algunas instalaciones no tienen la tabla legacy player_titles.
+            pass
 
         # Recalcular CURRENT de cero evita títulos stale.
         # Ejemplo: si alguien baja de TOP 40 a TOP 50, se elimina el CURRENT viejo.
@@ -5751,6 +5848,7 @@ class Matchmaking(commands.Cog):
             "season_id": season_id,
             "season_name": season_name,
             "current_titles": len(current_payload),
+            "selected_replacements": len(current_selected_replacements),
         }
 
 
