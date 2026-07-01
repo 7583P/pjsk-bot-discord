@@ -443,6 +443,7 @@ SEASON_RESET_PENALTY = 50
 
 SEASON_CHOICES = [
     app_commands.Choice(name="Current", value="current"),
+    app_commands.Choice(name="Season 4", value="season 4"),
     app_commands.Choice(name="Season 3", value="season 3"),
     app_commands.Choice(name="Season 2", value="season 2"),
     app_commands.Choice(name="Season 1", value="season 1"),
@@ -1270,6 +1271,8 @@ class Matchmaking(commands.Cog):
                     sp.role,
                     tie.first_reached_current_mmr,
                     COALESCE(mh.matches_played, 0) AS matches_played,
+                    COALESCE(sp.is_season_placement, FALSE) AS is_season_placement_db,
+                    sp.starting_mmr AS starting_mmr_db,
                     prev.prev_mmr,
                     prev.prev_pos
                 FROM seasonplayers sp
@@ -1321,11 +1324,16 @@ class Matchmaking(commands.Cog):
             matches_played = int(r["matches_played"] or 0)
             mmr = int(r["mmr"] or 0)
 
-            is_unplayed_sp = await self._is_unplayed_season_placement(
+            # DB flag is the source of truth after seasonreset.
+            # Discord role is only a fallback because guild cache can miss members.
+            db_is_sp = bool(r["is_season_placement_db"])
+            role_is_sp = await self._is_unplayed_season_placement(
                 member,
                 season_id,
                 matches_played,
             )
+            is_unplayed_sp = bool(matches_played == 0 and is_current and (db_is_sp or role_is_sp))
+            starting_mmr = int(r["starting_mmr_db"] if r["starting_mmr_db"] is not None else mmr) if is_unplayed_sp else None
 
             out.append(
                 {
@@ -1336,7 +1344,7 @@ class Matchmaking(commands.Cog):
                     "mmr": mmr,
                     "visible_mmr": mmr,
                     "display_mmr": mmr,
-                    "starting_mmr": mmr if is_unplayed_sp else None,
+                    "starting_mmr": starting_mmr,
                     "mmr_label": "Starting MMR" if is_unplayed_sp else "MMR",
                     "season_status": "Season Placement" if is_unplayed_sp else None,
                     "tie_reached_at": r["first_reached_current_mmr"],
@@ -2945,6 +2953,7 @@ class Matchmaking(commands.Cog):
             return (row["id"], row["name"]) if row else (None, "N/A")
 
         aliases = {
+            "season 4": ["season 4"],
             "season 3": ["season 3"],
             "season 2": ["season 2"],
             "season 1": ["season 1"],
@@ -6977,12 +6986,14 @@ class Matchmaking(commands.Cog):
                     FROM seasonplayers sp
                     WHERE sp.season_id = $1
                     AND (
-                            sp.mmr > 0
+                            COALESCE(sp.mmr, 0) > 0
+                            OR COALESCE(sp.is_season_placement, FALSE) = TRUE
+                            OR COALESCE(sp.starting_mmr, 0) > 0
                             OR EXISTS (
                                 SELECT 1
                                 FROM match_history mh
                                 WHERE mh.season_id = sp.season_id
-                                AND mh.user_id = sp.user_id
+                                  AND mh.user_id = sp.user_id
                             )
                         )
                     """,
