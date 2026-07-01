@@ -766,17 +766,29 @@ async def list_seasons():
 
     out = []
     for r in rows:
-        item = {"id": r["id"]}
+        item = {
+            "id": r["id"],
+            "seasonId": r["id"],
+            "season_id": r["id"],
+        }
         if SEASONS_HAS_NAME:
             item["name"] = _rget(r, "name")
+            item["seasonName"] = _rget(r, "name")
+            item["season_name"] = _rget(r, "name")
         if SEASONS_HAS_ACTIVE:
-            item["active"] = _rget(r, "active")
+            active = bool(_rget(r, "active"))
+            item["active"] = active
+            item["current"] = active
+            item["isCurrent"] = active
+            item["is_current"] = active
         if SEASONS_HAS_STARTS_AT:
             dt = _rget(r, "starts_at")
             item["startsAt"] = dt.isoformat() if dt else None
+            item["starts_at"] = dt.isoformat() if dt else None
         if SEASONS_HAS_ENDS_AT:
             dt = _rget(r, "ends_at")
             item["endsAt"] = dt.isoformat() if dt else None
+            item["ends_at"] = dt.isoformat() if dt else None
         out.append(item)
     return out
 
@@ -3395,24 +3407,32 @@ async def get_players(
         except Exception:
             tie_reached_value = str(tie_reached_at) if tie_reached_at else None
 
-        real_mmr = int(_rget(r, "mmr") or 0)
-        real_peak_mmr = int(peak_mmr or real_mmr)
+        # Never let the page receive a negative MMR. Season reset penalty must floor at 0.
+        real_mmr = max(0, int(_rget(r, "mmr") or 0))
+        real_peak_mmr = max(0, int(peak_mmr if peak_mmr is not None else real_mmr))
         rank_value = _rget(r, "rank") or _rank_from_mmr_for_api(real_mmr)
         matches_count = int(games_played or 0)
 
-        # Season Placement explícito. No usar visible_mmr=0 como señal porque eso
-        # confundía a todos los Placement normales con Season Placement.
+        # Season Placement must be explicit and must survive even when the seeded MMR is 0.
+        # Old logic required real_mmr > 0, so players reset from 50 -> 0 disappeared
+        # because the frontend treated them as unplayed Iron 0.
         db_sp = bool(_rget(r, "is_season_placement_db", False)) if SP_HAS_IS_SEASON_PLACEMENT else False
         is_season_placement = bool(
             picked_is_current
             and matches_count == 0
-            and real_mmr > 0
-            and (db_sp or str(rank_value or "").strip() != "Placement")
+            and (
+                db_sp
+                or (
+                    real_mmr > 0
+                    and str(rank_value or "").strip() not in ("", "Placement")
+                )
+            )
         )
 
-        starting_mmr = int(_rget(r, "starting_mmr_db") or real_mmr) if is_season_placement else None
+        raw_starting_mmr = _rget(r, "starting_mmr_db")
+        starting_mmr = max(0, int(raw_starting_mmr if raw_starting_mmr is not None else real_mmr)) if is_season_placement else None
         visible_mmr = real_mmr
-        visible_peak_mmr = real_peak_mmr
+        visible_peak_mmr = 0 if is_season_placement else real_peak_mmr
 
         out.append(
             {
