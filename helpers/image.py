@@ -1112,46 +1112,15 @@ def generate_results_image(
     """
     Dibuja el board de results sobre assets/background.png.
 
-    Nuevo formato recomendado para summary_rows:
-
-    [
-        (
-            pos,
-            name,
-            total_points,
-            stats_list,
-            mmr_prev,
-            mmr_delta,
-            mmr_final,
-            was_placement,
-            final_rank_name,
-            country_code,
-            show_placement_badge,
-            is_season_placement
-        ),
-        ...
-    ]
-
-    Importante:
-    - country_code puede venir como ISO2 ([PE], [US], [JP]) o como __UNKNOWN_FLAG__.
-    - Si country_code es unknown, se dibuja assets/flags/unknown.jpg.
-    - final_rank_name debe ser el rango DESPUÉS del cálculo de MMR.
+    Actualizado para backgrounds nuevos:
+    - Lee el tamaño real de assets/background.png.
+    - Escala fuentes, coordenadas, flags y bordes en base al canvas real.
+    - Ajusta columnas para que TOTAL POINTS y MMR no se monten ni se corten.
+    - Mueve Submitted para que no choque con los headers del background.
     """
 
     rows = [normalize_summary_row(row) for row in summary_rows]
     rows = sorted(rows, key=lambda r: r["pos"])
-
-    # ======================
-    # FONTS
-    # ======================
-    title_font = ImageFont.truetype(font_path, 52)
-    invite_font = ImageFont.truetype(font_path, 40)
-    row_font = ImageFont.truetype(font_path, 40)
-    small_font = ImageFont.truetype(font_path, 28)
-    smallist_font = ImageFont.truetype(font_path, 23)
-    meta_font = ImageFont.truetype(font_path, 24)
-
-    TITLE_COLOR = (255, 255, 255)
 
     # ======================
     # CANVAS / BACKGROUND
@@ -1159,17 +1128,61 @@ def generate_results_image(
     im = Image.open("assets/background.png").convert("RGBA")
     draw = ImageDraw.Draw(im)
 
+    W, H = im.size
+
+    # El layout anterior estaba hecho para 1920x1080.
+    # Si el background nuevo tiene otra resolución, se escala automáticamente.
+    BASE_W = 1920
+    BASE_H = 1080
+
+    scale_x = W / BASE_W
+    scale_y = H / BASE_H
+    scale_font = min(scale_x, scale_y)
+
+    def PX(value: int | float) -> int:
+        return int(round(float(value) * scale_x))
+
+    def PY(value: int | float) -> int:
+        return int(round(float(value) * scale_y))
+
+    def PF(value: int, min_size: int = 12) -> int:
+        return max(min_size, int(round(value * scale_font)))
+
+    def clamp(value: int, low: int, high: int) -> int:
+        return max(low, min(high, value))
+
+    # ======================
+    # FONTS
+    # ======================
+    title_font = ImageFont.truetype(font_path, PF(52, 28))
+    invite_font = ImageFont.truetype(font_path, PF(40, 22))
+    row_font = ImageFont.truetype(font_path, PF(40, 22))
+    row_font_small = ImageFont.truetype(font_path, PF(34, 20))
+    small_font = ImageFont.truetype(font_path, PF(28, 16))
+    smallist_font = ImageFont.truetype(font_path, PF(23, 14))
+    meta_font = ImageFont.truetype(font_path, PF(24, 14))
+
+    TITLE_COLOR = (255, 255, 255)
+
     # ======================
     # SUBMIT DATETIME
-    # BELOW "ROOM RESULT"
     # ======================
     if submitted_at_text:
+        submitted_text = f"Submitted: {submitted_at_text}"
+        submitted_bbox = draw.textbbox((0, 0), submitted_text, font=meta_font, stroke_width=max(1, PF(2, 1)))
+        submitted_w = submitted_bbox[2] - submitted_bbox[0]
+
+        # En el background nuevo, los headers están más cerca del texto.
+        # Por eso se coloca arriba y centrado en el área izquierda/media.
+        submitted_x = clamp((W - submitted_w) // 2, PX(245), PX(1030))
+        submitted_y = PY(162)
+
         draw.text(
-            (250, 180),
-            f"Submitted: {submitted_at_text}",
+            (submitted_x, submitted_y),
+            submitted_text,
             font=meta_font,
             fill=(255, 255, 255),
-            stroke_width=2,
+            stroke_width=max(1, PF(2, 1)),
             stroke_fill=(35, 45, 110),
         )
 
@@ -1184,17 +1197,19 @@ def generate_results_image(
     # ======================
     # LOUNGE INFO TOP RIGHT
     # ======================
-    side_x = 1650
-    side_y = 40
+    side_w = max(110, PX(249))
+    side_h = max(92, PY(210))
+    side_x = W - side_w - PX(20)
+    side_y = PY(40)
 
     side = ImageOps.fit(
         side_image.convert("RGBA"),
-        (249, 210),
+        (side_w, side_h),
         method=Image.Resampling.LANCZOS,
     )
     im.paste(side, (side_x, side_y), side)
 
-    text_anchor_x = side_x - 50
+    text_anchor_x = side_x - PX(50)
 
     draw.text(
         (text_anchor_x, side_y),
@@ -1205,7 +1220,7 @@ def generate_results_image(
     )
 
     draw.text(
-        (text_anchor_x, side_y + 60),
+        (text_anchor_x, side_y + PY(60)),
         str(average_mmr),
         font=title_font,
         fill=TITLE_COLOR,
@@ -1223,29 +1238,47 @@ def generate_results_image(
             hex_to_rgb(invite_color_right),
             direction="right",
         ),
-        2,
+        max(1, PF(2, 1)),
     )
 
-    im.paste(
-        invite_img,
-        (text_anchor_x - invite_img.width, side_y + 120),
-        invite_img,
-    )
+    invite_x = text_anchor_x - invite_img.width
+    invite_y = side_y + PY(120)
+
+    # No dejes que el invite invada demasiado la zona de resultados.
+    invite_x = max(PX(940), invite_x)
+    invite_x = min(invite_x, W - invite_img.width - PX(12))
+
+    im.paste(invite_img, (invite_x, invite_y), invite_img)
 
     # ======================
     # PLAYER ROW LAYOUT
     # ======================
-    ROW_START_Ys = [314, 461, 603, 742, 899]
+    ROW_START_Ys = [
+        PY(314),
+        PY(461),
+        PY(603),
+        PY(742),
+        PY(899),
+    ]
 
-    X_NAME = 241
-    X_RESULTS = 739
-    X_POINTS = 1090
-    X_MMR = 1360
+    X_NAME = PX(241)
+    X_RESULTS = PX(739)
+    X_POINTS = PX(1090)
 
-    FLAG_GAP = 12
-    FLAG_SIZE = (42, 30)
+    # La columna MMR se calcula desde el borde derecho para evitar recortes
+    # cuando el nuevo background no mantiene el ancho exacto del anterior.
+    X_MMR = min(PX(1360), W - PX(395))
+    X_MMR = max(X_POINTS + PX(230), X_MMR)
 
-    NAME_MAX_PX = X_RESULTS - X_NAME - FLAG_SIZE[0] - FLAG_GAP - 35
+    FLAG_GAP = PX(12)
+    FLAG_SIZE = (max(24, PX(42)), max(18, PY(30)))
+
+    NAME_MAX_PX = X_RESULTS - X_NAME - FLAG_SIZE[0] - FLAG_GAP - PX(35)
+    NAME_MAX_PX = max(PX(170), NAME_MAX_PX)
+
+    RESULTS_MAX_PX = max(PX(210), X_POINTS - X_RESULTS - PX(35))
+    POINTS_MAX_PX = max(PX(130), X_MMR - X_POINTS - PX(45))
+    MMR_MAX_PX = max(PX(260), W - X_MMR - PX(25))
 
     # ======================
     # DRAW PLAYER ROWS
@@ -1269,7 +1302,7 @@ def generate_results_image(
         if not safe_name:
             safe_name = "Unknown"
 
-        # Nombre con color del rango FINAL
+        # Nombre con color del rango FINAL.
         name_img = add_stroke(
             make_gradient_text_image(
                 safe_name,
@@ -1277,7 +1310,7 @@ def generate_results_image(
                 hex_to_rgb(name_gradient_start),
                 hex_to_rgb(name_gradient_end),
             ),
-            3,
+            max(2, PF(3, 2)),
         )
 
         t_y = y
@@ -1291,9 +1324,9 @@ def generate_results_image(
                     hex_to_rgb(name_gradient_start),
                     hex_to_rgb(name_gradient_end),
                 ),
-                3,
+                max(2, PF(3, 2)),
             )
-            t_y += 5
+            t_y += PY(5)
 
         # Si aun así se pasa, recortar visualmente con puntos.
         while name_img.width > NAME_MAX_PX and len(safe_name) > 3:
@@ -1305,9 +1338,9 @@ def generate_results_image(
                     hex_to_rgb(name_gradient_start),
                     hex_to_rgb(name_gradient_end),
                 ),
-                3,
+                max(2, PF(3, 2)),
             )
-            t_y = y + 5
+            t_y = y + PY(5)
 
         show_placement_badge = bool(row.get("show_placement_badge", False))
         is_season_placement = bool(row.get("is_season_placement", False))
@@ -1332,13 +1365,13 @@ def generate_results_image(
                 flag_y = t_y + max(0, (name_img.height - flag_img.height) // 2)
 
         # Badge [PLACEMENT] / [SEASON PLACEMENT] debajo del usuario.
-        # IMPORTANTE: el rectángulo NO tiene fill para evitar el fondo negro.
         placement_badge_text = "[SEASON PLACEMENT]" if is_season_placement else "[PLACEMENT]"
         placement_badge_font = smallist_font
+
         if is_season_placement:
             placement_badge_color = (*hex_to_rgb(rank_colors["Season Placement"][0]), 255)
         else:
-            placement_badge_color = (255, 112, 0, 255)  # naranja Placement
+            placement_badge_color = (255, 112, 0, 255)
 
         badge_bbox = draw.textbbox((0, 0), placement_badge_text, font=placement_badge_font)
         badge_w = badge_bbox[2] - badge_bbox[0]
@@ -1349,7 +1382,7 @@ def generate_results_image(
             content_right = max(content_right, flag_x + flag_img.width)
 
         content_w = max(1, content_right - X_NAME)
-        badge_y = t_y + name_img.height + 6
+        badge_y = t_y + name_img.height + PY(6)
 
         visual_w = max(content_w, badge_w)
         visual_left = X_NAME
@@ -1360,22 +1393,21 @@ def generate_results_image(
             badge_x = visual_left + (visual_w - badge_w) // 2
 
         if show_placement_badge:
-            pad_x = 14
-            pad_y = 9
+            pad_x = PX(14)
+            pad_y = PY(9)
 
             rect_left = visual_left - pad_x
             rect_top = t_y - pad_y
             rect_right = visual_right + pad_x
-            rect_bottom = badge_y + badge_h + pad_y + 2
+            rect_bottom = badge_y + badge_h + pad_y + PY(2)
 
-            # Sin fill: interior 100% transparente.
-            # Solo se dibuja el borde blanco alrededor de nombre + bandera + [PLACEMENT].
+            # Sin fill: interior transparente.
             draw.rounded_rectangle(
                 (rect_left, rect_top, rect_right, rect_bottom),
-                radius=14,
+                radius=max(8, PX(14)),
                 fill=None,
                 outline=(255, 255, 255, 235),
-                width=3,
+                width=max(2, PF(3, 2)),
             )
 
         # Nombre
@@ -1392,23 +1424,33 @@ def generate_results_image(
                 placement_badge_text,
                 font=placement_badge_font,
                 fill=placement_badge_color,
-                stroke_width=2,
+                stroke_width=max(1, PF(2, 1)),
                 stroke_fill=(25, 10, 0, 255),
             )
 
         # Results tuple
+        results_text = "(" + ",".join(map(str, results)) + ")"
+        results_font = smallist_font
+        if draw.textlength(results_text, font=results_font) > RESULTS_MAX_PX:
+            results_text = _fit_text(draw, results_text, results_font, RESULTS_MAX_PX)
+
         draw.text(
-            (X_RESULTS, y + 10),
-            "(" + ",".join(map(str, results)) + ")",
-            font=smallist_font,
+            (X_RESULTS, y + PY(10)),
+            results_text,
+            font=results_font,
             fill=(255, 255, 255),
         )
 
         # Points
+        points_text = str(points)
+        points_font = row_font
+        if draw.textlength(points_text, font=points_font) > POINTS_MAX_PX:
+            points_font = row_font_small
+
         draw.text(
             (X_POINTS, y),
-            str(points),
-            font=row_font,
+            points_text,
+            font=points_font,
             fill=(255, 255, 255),
         )
 
@@ -1423,28 +1465,38 @@ def generate_results_image(
             delta_color = (220, 180, 30)
             delta_str = "+0"
 
+        # Si el texto completo no entra, baja la fuente solo para MMR.
+        mmr_font = row_font
+        mmr_full_text = f"{mmr_old} {delta_str} = {mmr_new}"
+
+        if draw.textlength(mmr_full_text, font=mmr_font) > MMR_MAX_PX:
+            mmr_font = row_font_small
+
+        if draw.textlength(mmr_full_text, font=mmr_font) > MMR_MAX_PX:
+            mmr_font = small_font
+
         draw.text(
             (X_MMR, y),
             f"{mmr_old} ",
-            font=row_font,
+            font=mmr_font,
             fill=(255, 255, 255),
         )
 
-        dx = draw.textlength(f"{mmr_old} ", font=row_font)
+        dx = draw.textlength(f"{mmr_old} ", font=mmr_font)
 
         draw.text(
             (X_MMR + dx, y),
             delta_str,
-            font=row_font,
+            font=mmr_font,
             fill=delta_color,
         )
 
-        dx2 = draw.textlength(f"{mmr_old} {delta_str}", font=row_font)
+        dx2 = draw.textlength(f"{mmr_old} {delta_str}", font=mmr_font)
 
         draw.text(
             (X_MMR + dx2, y),
             f" = {mmr_new}",
-            font=row_font,
+            font=mmr_font,
             fill=(255, 255, 255),
         )
 
@@ -1455,7 +1507,6 @@ def generate_results_image(
     im.save(buf, "PNG")
     buf.seek(0)
     return buf
-
 
 
 # ============================================================
