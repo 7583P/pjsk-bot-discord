@@ -1172,9 +1172,9 @@ def generate_results_image(
         submitted_bbox = draw.textbbox((0, 0), submitted_text, font=meta_font, stroke_width=max(1, PF(2, 1)))
         submitted_w = submitted_bbox[2] - submitted_bbox[0]
 
-        # En el background nuevo, los headers están más cerca del texto.
-        # Por eso se coloca arriba y centrado en el área izquierda/media.
-        submitted_x = clamp((W - submitted_w) // 2, PX(245), PX(1030))
+        # En el background nuevo, el submit time debe quedar bajo el título
+        # y más a la izquierda para no chocar visualmente con el invite/logo.
+        submitted_x = PX(140)
         submitted_y = PY(162)
 
         draw.text(
