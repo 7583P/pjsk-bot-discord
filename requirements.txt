@@ -10,3 +10,4 @@ beautifulsoup4
 html5lib
 fonttools
 pillow
+pycountry
