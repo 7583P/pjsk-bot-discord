@@ -4680,7 +4680,7 @@ class Matchmaking(commands.Cog):
         room_info["rerolling"] = False
 
         song_lines = "\n".join(
-            f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notas]"
+            f"{i}. **{title}** (Lv {lvl} {diff}) [{notes} notes]"
             for i, (title, lvl, diff, notes) in enumerate(final_picks, start=1)
         )
 
