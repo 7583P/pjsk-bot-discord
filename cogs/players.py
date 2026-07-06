@@ -4,6 +4,7 @@ import asyncpg
 import datetime as dt
 import calendar
 import discord
+import pycountry
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -51,7 +52,9 @@ async def get_conn():
 
 async def get_current_season():
     sql = """
-    SELECT ID, Name, Active, StartDate, EndDate from seasons where active = true
+    SELECT ID, Name, Active, StartDate, EndDate
+    FROM seasons
+    WHERE active = true
     """
     conn = await get_conn()
     try:
@@ -75,7 +78,7 @@ async def get_all_seasons():
         await conn.close()
 
 
-# Inserta o actualiza un jugador (comando /register)
+# Inserta o actualiza un jugador
 async def upsert_player(user_id: int, name: str, country: str):
     season = await get_current_season()
     if not season:
@@ -116,7 +119,7 @@ async def update_player_name(user_id: int, name: str):
     INSERT INTO players(user_id, name)
     VALUES ($1, $2)
     ON CONFLICT (user_id) DO UPDATE SET
-      name   = EXCLUDED.name
+      name = EXCLUDED.name
     """
     conn = await get_conn()
     try:
@@ -132,6 +135,89 @@ def get_member_name(member: discord.Member) -> str:
     if getattr(member, "global_name", None):
         return member.global_name
     return member.name
+
+
+# English-only aliases.
+# Users must write the country name in English.
+# Internally, we still save ISO2 so flags/page keep working.
+COUNTRY_ALIASES = {
+    "usa": "US",
+    "us": "US",
+    "u.s.": "US",
+    "u.s.a.": "US",
+    "united states": "US",
+    "united states of america": "US",
+
+    "uk": "GB",
+    "u.k.": "GB",
+    "united kingdom": "GB",
+    "england": "GB",
+
+    "south korea": "KR",
+    "north korea": "KP",
+    "russia": "RU",
+    "vietnam": "VN",
+    "taiwan": "TW",
+    "turkey": "TR",
+    "united arab emirates": "AE",
+    "saudi arabia": "SA",
+    "dominican republic": "DO",
+    "south africa": "ZA",
+    "new zealand": "NZ",
+    "czech republic": "CZ",
+    "czechia": "CZ",
+    "ivory coast": "CI",
+    "cote d'ivoire": "CI",
+    "côte d'ivoire": "CI",
+}
+
+
+def normalize_country_text(value: str) -> str:
+    return " ".join((value or "").strip().split()).lower()
+
+
+def country_name_to_iso2(value: str) -> tuple[str | None, str | None]:
+    raw = " ".join((value or "").strip().split())
+    key = normalize_country_text(raw)
+
+    if not key:
+        return None, None
+
+    # Do NOT accept ISO2 directly anymore.
+    # User must write the full country name in English.
+    if len(key) == 2 and key.isalpha():
+        return None, None
+
+    # English aliases
+    if key in COUNTRY_ALIASES:
+        code = COUNTRY_ALIASES[key]
+        country = pycountry.countries.get(alpha_2=code)
+        return code, country.name if country else raw
+
+    # Exact match against official English country names from pycountry.
+    # This is case-insensitive but does not translate Spanish names.
+    for country in pycountry.countries:
+        possible_names = [
+            getattr(country, "name", ""),
+            getattr(country, "official_name", ""),
+            getattr(country, "common_name", ""),
+        ]
+
+        for name in possible_names:
+            if name and normalize_country_text(name) == key:
+                return country.alpha_2, country.name
+
+    # Fuzzy match only for normal English names.
+    # If user used accents not present in the official English name, it will not auto-convert Spanish.
+    try:
+        matches = pycountry.countries.search_fuzzy(raw)
+        if matches:
+            country = matches[0]
+            return country.alpha_2, country.name
+    except LookupError:
+        pass
+
+    return None, None
 
 
 # Sincronización inicial
@@ -177,10 +263,10 @@ class PlayersCog(commands.Cog):
         if not member.bot:
             name = get_member_name(member)
             await upsert_player(member.id, name, "")
+
             if member.guild.system_channel:
                 await member.guild.system_channel.send(
-                    f"Welcome {member.mention}! Execute `/set_your_country <2 LETTER ISO2>` "
-                    f"in #set_your_country to see your country in the page."
+                    f"Welcome {member.mention}! make sure to have a look to <#1441176972964270375> before playing."
                 )
 
     @commands.Cog.listener()
@@ -192,19 +278,27 @@ class PlayersCog(commands.Cog):
 
     @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(
-        name="set_your_country", description="Register your country (código ISO2)"
+        name="set_country",
+        description="Register your country using its English name"
     )
-    @app_commands.describe(country="ISO2 2 letters code (p.ej., PE)")
-    async def set_your_country(self, interaction: discord.Interaction, country: str):
-        code = country.strip().upper()
-        if not re.match(r"^[A-Z]{2}$", code):
+    @app_commands.describe(
+        country="Country name in English, for example: Peru, United States, Japan"
+    )
+    async def set_country(self, interaction: discord.Interaction, country: str):
+        code, country_display_name = country_name_to_iso2(country)
+
+        if not code:
             return await interaction.response.send_message(
-                "You should specify a 2 letter ISO2 country code.", ephemeral=True
+                "❌ Country not found. Please write the country name in English, for example: `Peru`, `United States`, `Japan`.",
+                ephemeral=True
             )
+
         name = get_member_name(interaction.user)  # type: ignore
         await upsert_player(interaction.user.id, name, code)  # type: ignore
+
         await interaction.response.send_message(
-            f"✅ {name}, Country registered **{code}**.", ephemeral=True
+            f"✅ {name}, country registered as **{country_display_name}** (`{code}`).",
+            ephemeral=True
         )
 
     @staticmethod
@@ -306,7 +400,10 @@ class PlayersCog(commands.Cog):
                 return False
 
         # Mantener roles NO-rango y agregar el nuevo rango
-        keep = [r for r in member.roles if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID]
+        keep = [
+            r for r in member.roles
+            if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID
+        ]
         new_roles = list(dict.fromkeys(keep + [target_role]))
 
         try:
@@ -339,7 +436,10 @@ class PlayersCog(commands.Cog):
         if sp_role is None:
             return False
 
-        keep = [r for r in member.roles if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID]
+        keep = [
+            r for r in member.roles
+            if r.id not in rank_role_ids and r.id != SEASON_PLACEMENT_ROLE_ID
+        ]
         new_roles = list(dict.fromkeys(keep + [sp_role]))
 
         try:
@@ -360,7 +460,8 @@ class PlayersCog(commands.Cog):
         # Permitir solo a un usuario específico
         if interaction.user.id != 878310498720940102:
             return await interaction.response.send_message(
-                "❌ No tienes permiso para ejecutar este comando.", ephemeral=True
+                "❌ No tienes permiso para ejecutar este comando.",
+                ephemeral=True
             )
 
         # 1) Ensure current season exists (create if needed)
@@ -368,7 +469,8 @@ class PlayersCog(commands.Cog):
             current_season_id, prev_season_id, created = await self._ensure_current_season()
         except Exception as e:
             return await interaction.response.send_message(
-                f"❌ DB error ensuring season: {e}", ephemeral=True
+                f"❌ DB error ensuring season: {e}",
+                ephemeral=True
             )
 
         # 1.5) Determinar quiénes recibirán Season Placement (jugó + tenía MMR/rango previo)
@@ -429,7 +531,8 @@ class PlayersCog(commands.Cog):
                         migrated = 0
         except Exception as e:
             return await interaction.response.send_message(
-                f"❌ DB error migrating players: {e}", ephemeral=True
+                f"❌ DB error migrating players: {e}",
+                ephemeral=True
             )
 
         # 3) Sync Discord roles for players in current season where synced=false, then mark synced=true
@@ -438,7 +541,8 @@ class PlayersCog(commands.Cog):
             guild = interaction.guild
             if guild is None:
                 return await interaction.response.send_message(
-                    "❌ This command must be used inside a server.", ephemeral=True
+                    "❌ This command must be used inside a server.",
+                    ephemeral=True
                 )
 
             assert self.db_pool is not None
@@ -460,14 +564,20 @@ class PlayersCog(commands.Cog):
                     # Si es elegible → Season Placement role (remueve ranks)
                     if uid in season_placement_uids:
                         ok = await self._apply_season_placement_role(
-                            guild, uid, reason=f"Season {current_season_id} reset: Season Placement"
+                            guild,
+                            uid,
+                            reason=f"Season {current_season_id} reset: Season Placement"
                         )
                     else:
                         # Normal → rol rank de la DB
                         role_name = (r["role"] or "Placement").strip()
                         ok = await self._apply_rank_role(
-                            guild, uid, role_name, reason=f"Season {current_season_id} sync"
+                            guild,
+                            uid,
+                            role_name,
+                            reason=f"Season {current_season_id} sync"
                         )
+
                     if ok:
                         synced += 1
 
@@ -483,7 +593,8 @@ class PlayersCog(commands.Cog):
 
         except Exception as e:
             return await interaction.response.send_message(
-                f"⚠️ Partial success (season ok). Role sync error: {e}", ephemeral=True
+                f"⚠️ Partial success (season ok). Role sync error: {e}",
+                ephemeral=True
             )
 
         # 4) Final message
@@ -499,4 +610,3 @@ class PlayersCog(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(PlayersCog(bot))
-
