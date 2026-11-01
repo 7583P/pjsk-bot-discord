@@ -1,0 +1,14 @@
+[tool.vercel]
+entrypoint = "app:app"
+
+[tool.ruff]
+target-version = "py313"
+exclude = [".local", "node_modules", ".venv", "cogs/mmr.py", "cogs/placement.py", "cogs/ping_test.py"]
+
+[tool.ruff.lint]
+select = ["F", "E9"]
+
+[tool.mypy]
+files = ["lounge/rules.py", "lounge/config.py"]
+check_untyped_defs = true
+ignore_missing_imports = true

@@ -1,86 +1,205 @@
-import os
-import sys
+import asyncio
+import logging
+import signal
 import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
+from aiohttp import web
+from lounge.config import Settings
+from lounge.database import Database
+from lounge.repository import Repository
+from lounge.logging import configure
 
-# Cargar variables de entorno\load_dotenv()
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
-APP_ID = int(os.getenv("APPLICATION_ID", "0"))
-GUILD_ID = os.getenv("GUILD_ID", "")
+log = logging.getLogger(__name__)
 
-# Configurar intents
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.members = True  # Necesario para on_member_join
 
 class MyBot(commands.Bot):
-    def __init__(self):
+    def __init__(self, settings):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
         super().__init__(
             command_prefix="!",
             intents=intents,
-            application_id=APP_ID,
-            help_command=None
+            application_id=settings.application_id,
+            help_command=None,
+            allowed_mentions=discord.AllowedMentions.none(),
         )
+        self.settings = settings
+        self.db = Database(settings)
+        self.repo = Repository(self.db)
+        self.heartbeat_task = None
+        self.health_runner = None
+        self.failure = None
 
     async def setup_hook(self):
-        # Cargar Matchmaking Cog
-        try:
-            await self.load_extension("cogs.matchmaking")
-            print("✅ Cog cargado: cogs.matchmaking")
-        except Exception as e:
-            print(f"❌ Error cargando cogs.matchmaking: {e}")
+        await self.db.open()
+        await self.db.claim()
+        self.heartbeat_task = asyncio.create_task(
+            self.keep_lease(), name="runtime-lease"
+        )
+        for extension in ("cogs.matchmaking", "cogs.autoroles", "cogs.players"):
+            await self.load_extension(extension)
+        if self.settings.guild_id:
+            synced = []
+            for guild_id in sorted(self.settings.guild_ids):
+                guild = discord.Object(id=guild_id)
+                self.tree.copy_global_to(guild=guild)
+                synced.extend(await self.tree.sync(guild=guild))
+        else:
+            synced = await self.tree.sync()
+        log.info("commands_synced count=%s", len(synced))
+        app = web.Application()
+        app.router.add_get("/health/live", self.live)
+        app.router.add_get("/health/ready", self.ready)
+        app.router.add_get("/health/diagnostics", self.diagnostics)
+        self.health_runner = web.AppRunner(app)
+        await self.health_runner.setup()
+        await web.TCPSite(self.health_runner, "127.0.0.1", 8081).start()
 
-        # Cargar AutoRoles Cog
+    async def keep_lease(self):
         try:
-            await self.load_extension("cogs.autoroles")
-            print("✅ Cog cargado: cogs.autoroles")
-        except Exception as e:
-            print(f"❌ Error cargando cogs.autoroles: {e}")
+            while True:
+                await asyncio.sleep(10)
+                await self.db.heartbeat()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.failure = RuntimeError("Lease perdida; reinicio supervisado requerido")
+            log.exception("runtime_lease_lost_shutting_down")
+            # close from another task so it never awaits/cancels itself.
+            asyncio.create_task(self.close())
 
-        # Cargar Players Cog (on_member_join + /register)
-        try:
-            await self.load_extension("cogs.players")
-            print("✅ Cog cargado: cogs.players")
-        except Exception as e:
-            print(f"❌ Error cargando cogs.players: {e}")
+    async def live(self, request):
+        return web.json_response({"process": True})
 
-        # Sincronizar comandos slash
+    async def ready(self, request):
         try:
-            if GUILD_ID:
-                guild = discord.Object(id=int(GUILD_ID))
-                synced = await self.tree.sync(guild=guild)
-                print(f"📋 Slash commands sincronizados en guild {GUILD_ID}: {[c.name for c in synced]}")
-            else:
-                synced = await self.tree.sync()
-                print(f"📋 Slash commands globales: {[c.name for c in synced]}")
-        except Exception as e:
-            print(f"❗ Error al sincronizar comandos: {e}")
+            database = await self.db.health()
+        except Exception:
+            database = False
+        gateway = self.is_ready() and not self.is_closed()
+        return web.json_response(
+            {"gateway": gateway, "database": database},
+            status=200 if gateway and database else 503,
+        )
+
+    async def diagnostics(self, request):
+        async with self.db.pool.acquire(timeout=3) as c:
+            row = await c.fetchrow("""SELECT
+                (SELECT id FROM seasons WHERE status='active') AS season,
+                (SELECT count(*) FROM rooms WHERE status NOT IN('closed','finished')) AS rooms,
+                (SELECT count(*) FROM rooms WHERE status='needs_attention') AS rooms_needing_attention,
+                (SELECT count(*) FROM polls WHERE status='active') AS polls,
+                (SELECT count(*) FROM matches) AS matches,
+                (SELECT count(*) FROM role_jobs) AS pending_roles,
+                (SELECT count(*) FROM thread_jobs) AS pending_memberships""")
+        return web.json_response(
+            {
+                **dict(row),
+                "pool_size": self.db.pool.get_size(),
+                "pool_idle": self.db.pool.get_idle_size(),
+            }
+        )
+
+    async def close(self):
+        if self.heartbeat_task:
+            self.heartbeat_task.cancel()
+            await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+            self.heartbeat_task = None
+        for name in list(self.extensions):
+            await self.unload_extension(name)
+        await super().close()
+        if self.health_runner:
+            await self.health_runner.cleanup()
+            self.health_runner = None
+        if self.db.pool:
+            try:
+                await self.db.release()
+            finally:
+                await self.db.close()
+                self.db.pool = None
 
     async def on_ready(self):
-        print(f"🤖 Conectado como {self.user} (ID: {self.user.id})")
+        log.info(
+            "gateway_ready user_id=%s latency_ms=%.2f",
+            self.user.id,
+            self.latency * 1000,
+        )
 
-# Instanciar bot
-bot = MyBot()
+    async def on_disconnect(self):
+        log.warning("gateway_disconnected")
 
-# Manejo de errores globales para comandos slash
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    try:
+    async def on_resumed(self):
+        log.info("gateway_resumed")
+
+    async def on_command_error(self, ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        cause = getattr(error, "original", error)
+        log.error(
+            "text_command_error command=%s type=%s sqlstate=%s",
+            getattr(ctx.command, "name", "unknown"),
+            type(cause).__name__,
+            getattr(cause, "sqlstate", ""),
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+        await ctx.send(
+            str(cause)
+            if isinstance(
+                cause, (ValueError, commands.CheckFailure, commands.UserInputError)
+            )
+            else "No se pudo completar la operación. Consulta los logs del servicio."
+        )
+
+
+def create_bot(settings):
+    bot = MyBot(settings)
+
+    @bot.tree.error
+    async def slash_error(interaction, error):
+        cause = getattr(error, "original", error)
+        log.error(
+            "slash_command_error command=%s type=%s sqlstate=%s",
+            getattr(interaction.command, "name", "unknown"),
+            type(cause).__name__,
+            getattr(cause, "sqlstate", ""),
+            exc_info=(type(cause), cause, cause.__traceback__),
+        )
+        message = (
+            str(cause)
+            if isinstance(cause, (ValueError, app_commands.CheckFailure))
+            else "No se pudo completar la operación. Consulta los logs del servicio."
+        )
         if interaction.response.is_done():
-            await interaction.followup.send(f"❌ Error: {error}", ephemeral=True)
+            await interaction.followup.send(message, ephemeral=True)
         else:
-            await interaction.response.send_message(f"❌ Error: {error}", ephemeral=True)
-    except Exception as e:
-        print(f"⚠️ Falló el envío del mensaje de error: {e}")
+            await interaction.response.send_message(message, ephemeral=True)
 
-# Arrancar bot
+    return bot
+
+
+async def run():
+    load_dotenv()
+    configure()
+    settings = Settings.load()
+    if not settings.token or not settings.guild_id:
+        raise ValueError("DISCORD_TOKEN y GUILD_ID obligatorios")
+    bot = create_bot(settings)
+    loop = asyncio.get_running_loop()
+    # POSIX systemd/container SIGTERM; asyncio.run handles SIGINT on Windows.
+    try:
+        loop.add_signal_handler(
+            signal.SIGTERM, lambda: asyncio.create_task(bot.close())
+        )
+    except NotImplementedError:
+        pass
+    async with bot:
+        await bot.start(settings.token, reconnect=True)
+    if bot.failure:
+        raise bot.failure
+
+
 if __name__ == "__main__":
-    if not TOKEN:
-        print("❌ DISCORD_TOKEN no definido.")
-        sys.exit(1)
-    bot.run(TOKEN)
-
+    asyncio.run(run())

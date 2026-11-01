@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+.local
+backups
+node_modules
+__pycache__
+*.db
+*.db-*
+*.dump
+*.json
+tests

@@ -1,554 +1,598 @@
-# ------------- matchmaking.py (versión completa con la poll de 9 canciones) -------------
-
-import os
-import re
-import random
 import asyncio
-
-import aiohttp                 # descarga catálogo canciones
-import aiosqlite               # SQLite asíncrono
+from datetime import datetime, timezone
+import json
+import logging
+import random
+import weakref
 import discord
-from discord.ext import commands, tasks   # loops periódicos
 from discord import app_commands
+from discord.ext import commands, tasks
+from lounge.rules import RANKS, song_range
+from lounge.songs import SongCatalog
+
+log = logging.getLogger(__name__)
 
 
-# ─────────── POLL DE 9 CANCIONES (votación 60 s) ───────────
+def country_flag(code):
+    return (
+        "".join(chr(ord(c) + 127397) for c in code.upper())
+        if len(code) == 2 and code.isalpha()
+        else ""
+    )
+
+
 class SongPollView(discord.ui.View):
-    """Select de 9 canciones que abre votación de 1 minuto."""
-    def __init__(self, songs, *, thread, timeout=60):
-        super().__init__(timeout=timeout)
-        self.thread = thread
-        self.message: discord.Message
-        self.vote_map: dict[int,str] = {}
-        self.votes:    dict[str,int] = {}
-
-        options = [
-            discord.SelectOption(
-                label=f"{title} (Lv {level} {diff})",
-                value=f"{title}|{level}|{diff}"
-            )
-            for title, level, diff in songs
-        ]
-
+    def __init__(self, cog, room_id, songs):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.room_id = room_id
         select = discord.ui.Select(
+            custom_id=f"pjsk:poll:{room_id}",
             placeholder="👆 Tu voto (puedes cambiar antes de 1 min)",
-            options=options,
-            min_values=1,
-            max_values=1
+            options=[
+                discord.SelectOption(
+                    label=f"{title} (Lv {level} {diff})"[:100], value=str(i)
+                )
+                for i, (title, level, diff) in enumerate(songs)
+            ],
         )
 
-        async def select_callback(inter: discord.Interaction):
-            uid    = inter.user.id
-            choice = select.values[0]
-            # si ya votó, quita su voto anterior
+        async def callback(inter):
+            await inter.response.defer(ephemeral=True, thinking=True)
+            try:
+                choice = await cog.bot.repo.vote(
+                    room_id, inter.user.id, int(select.values[0])
+                )
+                await inter.followup.send(
+                    f"✅ Tu voto por **{choice[0]}** ha sido registrado.",
+                    ephemeral=True,
+                )
+            except ValueError as exc:
+                await inter.followup.send(str(exc), ephemeral=True)
+
+        select.callback = callback
+        self.add_item(select)
+
+
+class DiagnosticPoll(discord.ui.View):
+    """The original public debug poll; never writes competitive data."""
+
+    def __init__(self, songs, channel):
+        super().__init__(timeout=60)
+        self.songs = songs
+        self.channel = channel
+        self.votes = {}
+        self.vote_map = {}
+        self.message = None
+        select = discord.ui.Select(
+            options=[
+                discord.SelectOption(label=f"{t} (Lv {l} {d})"[:100], value=str(i))
+                for i, (t, l, d) in enumerate(songs)
+            ]
+        )
+
+        async def vote(inter):
+            choice = int(select.values[0])
+            uid = inter.user.id
             if uid in self.vote_map:
-                prev = self.vote_map[uid]
-                self.votes[prev] -= 1
-            # asigna el nuevo
+                self.votes[self.vote_map[uid]] -= 1
             self.vote_map[uid] = choice
             self.votes[choice] = self.votes.get(choice, 0) + 1
             await inter.response.send_message(
-                f"✅ Tu voto por **{choice.split('|')[0]}** ha sido registrado.",
-                ephemeral=True
+                f"✅ Tu voto por **{songs[choice][0]}** ha sido registrado.",
+                ephemeral=True,
             )
 
-        select.callback = select_callback
+        select.callback = vote
         self.add_item(select)
 
     async def on_timeout(self):
-        # deshabilita el menú
-        for child in self.children:
-            child.disabled = True
         try:
-            await self.message.edit(view=self)
-        except:
-            pass
-
-        # si nadie votó
-        if not self.votes:
-            return await self.thread.send(
-                "⚠️ No se registraron votos en el tiempo establecido."
-            )
-
-        # elige al ganador (azar en caso de empate)
-        max_votes = max(self.votes.values())
-        winners   = [opt for opt,c in self.votes.items() if c == max_votes]
-        chosen    = random.choice(winners) if len(winners)>1 else winners[0]
-        title, lvl, diff = chosen.split("|")
-
-        await self.thread.send(
-            f"🏆 **Resultado de la votación** 🏆\n"
-            f"La canción ganadora es **{title}** (Lv {lvl}, {diff}) con **{max_votes} votos**."
-        )
-        self.stop()
-        
-
-
-# ------------- CONFIGURACIÓN GLOBAL DEL COG -------------
-DB_PATH           = "matchmaking.db"
-GUILD_ID          = int(os.getenv("GUILD_ID", "0"))
-JOIN_CHANNEL_NAME = "join"
-
-ENTRY_RE = re.compile(
-    r"^<@!?(?P<id>\d+)>\s*\[(?P<cc>\w{2})\]\s*(?P<stats>\d+,\d+,\d+,\d+,\d+)$"
-)
-
-def country_flag(code: str) -> str:
-    code = code.upper()
-    if len(code) != 2:
-        return ""
-    return chr(ord(code[0]) + 127397) + chr(ord(code[1]) + 127397)
+            if self.message:
+                await self.message.edit(view=None)
+            if not self.votes:
+                await self.channel.send(
+                    "⚠️ No se registraron votos en el tiempo establecido."
+                )
+            else:
+                maximum = max(self.votes.values())
+                winners = [i for i, n in self.votes.items() if n == maximum]
+                title, level, diff = self.songs[random.choice(winners)]
+                await self.channel.send(
+                    f"🏆 **Resultado de la votación** 🏆\nLa canción ganadora es **{title}** (Lv {level}, {diff}) con **{maximum} votos**."
+                )
+        except discord.HTTPException:
+            log.exception("diagnostic_poll_delivery_failed")
+        finally:
+            self.stop()
 
 
 class Matchmaking(commands.Cog):
-    # ----------  CONSTANTES y helpers ----------
-    RAW_EN = (
-        "https://raw.githubusercontent.com/"
-        "Sekai-World/sekai-master-db-en-diff/main"
-    )
-    DIFFS = ("append", "master", "expert")  # prioridad de dificultad
+    _range_for_counts = staticmethod(song_range)
 
-    @staticmethod
-    def _range_for_counts(c):
-        """Devuelve (low, high) según rangos presentes."""
-        if c["Diamond"]:
-            return (31, 33)
-        if c["Gold"]:
-            return (28, 30)
-        if c["Bronze"]:
-            return (25, 27)
-        return (28, 30)  # Placement o mixto
-
-    # ----------  CONSTRUCTOR ----------
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
-        self._songs_lock = asyncio.Lock()
-        # rooms: {rid: {'players': [...], 'thread': Thread}}
-        self.rooms: dict[int, dict] = {}
+        self.catalog = SongCatalog(bot.db)
+        self.room_locks = weakref.WeakValueDictionary()
+        self.member_locks = weakref.WeakValueDictionary()
+        self.confirmed_members = set()
+        self.views = {}
 
-    # ----------  SQL SETUP ----------
     async def cog_load(self):
-        self.db = await aiosqlite.connect(DB_PATH)
-        await self.db.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS players (
-                user_id INTEGER PRIMARY KEY,
-                mmr     INTEGER DEFAULT 0,
-                role    TEXT DEFAULT 'Placement'
-            );
-            """
-        )
-        await self.db.commit()
-
-        # arranca el loop que refresca las canciones
+        await self.catalog.load()
         self.refresh_songs.start()
-        await self.refresh_songs()
+        self.maintenance.start()
 
     async def cog_unload(self):
-        await self.db.close()
+        self.refresh_songs.cancel()
+        self.maintenance.cancel()
+        for view in self.views.values():
+            view.stop()
 
-    # ----------  LOOP que actualiza canciones cada 6 h ----------
     @tasks.loop(hours=6)
     async def refresh_songs(self):
-        async with self._songs_lock:
-            async with aiohttp.ClientSession() as s:
-                async def grab(name):
-                    async with s.get(f"{self.RAW_EN}/{name}.json") as r:
-                        return await r.json(content_type=None)
-
-                musics = await grab("musics")
-                diffs  = await grab("musicDifficulties")
-
-            title = {m["id"]: m["title"] for m in musics}
-            rows = [
-                (d["musicId"], title[d["musicId"]],
-                 d["musicDifficulty"], d["playLevel"])
-                for d in diffs if d["musicDifficulty"] in self.DIFFS
-            ]
-
-            await self.db.execute("DROP TABLE IF EXISTS songs")
-            await self.db.execute(
-                """CREATE TABLE songs(
-                     id INTEGER, title TEXT, diff TEXT, level INTEGER)"""
+        try:
+            await self.catalog.refresh()
+        except Exception:
+            log.exception(
+                "catalog_refresh_failed cached_charts=%s", len(self.catalog.rows)
             )
-            await self.db.executemany("INSERT INTO songs VALUES(?,?,?,?)", rows)
-            await self.db.commit()
-        print("[songs] Catálogo actualizado")
 
     @refresh_songs.before_loop
-    async def _wait_ready(self):
+    async def before_songs(self):
         await self.bot.wait_until_ready()
 
-    # ----------  Helper para 9 canciones ----------
-    async def _get_9_songs(self, low, high):
-        async with self._songs_lock:
-            rows = await self.db.execute_fetchall(
-                f"""SELECT title, level, diff FROM songs
-                    WHERE level BETWEEN ? AND ? 
-                    AND diff IN ({','.join('?'*len(self.DIFFS))})""",
-                (low, high, *self.DIFFS),
+    async def thread(self, room):
+        if not room["thread_id"]:
+            return None
+        thread = self.bot.get_channel(
+            room["thread_id"]
+        ) or await self.bot.fetch_channel(room["thread_id"])
+        if not isinstance(thread, discord.Thread):
+            raise ValueError("El canal persistido no es un thread")
+        if (
+            thread.guild.id != room["guild_id"]
+            or str(thread.parent_id) != room["queue_id"]
+        ):
+            raise ValueError("Thread fuera de la cola configurada")
+        return thread
+
+    async def provision(self, room, channel):
+        lock = self.room_locks.setdefault(room["id"], asyncio.Lock())
+        async with lock:
+            rooms = await self.bot.repo.rooms()
+            current = next((r for r in rooms if r["id"] == room["id"]), None)
+            if not current or current["status"] == "needs_attention":
+                raise ValueError("Sala pendiente de reconciliación administrativa")
+            thread = await self.thread(current)
+            if thread:
+                return thread
+            try:
+                thread = await channel.create_thread(
+                    name=f"sala-{current['display_number']}",
+                    auto_archive_duration=60,
+                    type=discord.ChannelType.public_thread,
+                )
+                await self.bot.repo.attach_thread(room["id"], thread.id)
+                return thread
+            except Exception:
+                # An HTTP timeout may have created a thread remotely. Never blindly create it twice.
+                await self.bot.repo.issue(
+                    room["id"], "thread_creation_failed_or_ambiguous"
+                )
+                raise
+
+    async def launch_song_poll(self, room, thread):
+        if len(room["players"]) != 5 or room["status"] != "open":
+            return
+        async with self.bot.db.pool.acquire() as c:
+            roles = await c.fetch(
+                "SELECT role FROM season_players WHERE season_id=$1 AND user_id=ANY($2::bigint[])",
+                room["season_id"],
+                room["players"],
+            )
+        counts = {rank: sum(p["role"] == rank for p in roles) for rank in RANKS}
+        low, high = song_range(counts)
+        songs = self.catalog.pick(low, high)
+        if not songs:
+            await self.bot.repo.issue(room["id"], "catalog_empty_for_rank_range")
+            await thread.send(
+                "⚠️ No hay canciones en ese rango. Se requiere revisar el catálogo."
+            )
+            return
+        if not await self.bot.repo.create_poll(room["id"], songs):
+            return
+        view = SongPollView(self, room["id"], songs)
+        try:
+            msg = await thread.send(
+                f"🎉 Sala completa · Niveles {high}-{low}\nTienen **1 minuto** para votar la canción:",
+                view=view,
+            )
+            await self.bot.repo.activate_poll(room["id"], msg.id)
+            self.views[room["id"]] = view
+        except Exception:
+            view.stop()
+            await self.bot.repo.issue(room["id"], "poll_send_failed_or_ambiguous")
+            raise
+
+    async def membership(self, room, thread, user_id, action):
+        if action == "add":
+            await thread.add_user(discord.Object(id=user_id))
+            self.confirmed_members.add((thread.id, user_id))
+        else:
+            await thread.remove_user(discord.Object(id=user_id))
+            self.confirmed_members.discard((thread.id, user_id))
+        async with self.bot.db.pool.acquire() as c:
+            await c.execute(
+                "DELETE FROM thread_jobs WHERE room_id=$1 AND user_id=$2 AND action=$3",
+                room["id"],
+                user_id,
+                action,
             )
 
-        by_lvl = {lvl: [] for lvl in range(high, low - 1, -1)}
-        for t, lvl, diff in rows:
-            by_lvl[lvl].append((t, lvl, diff.capitalize()))
-
-        picks = []
-        for lvl in range(high, low - 1, -1):  # 30→29→28
-            random.shuffle(by_lvl[lvl])
-            picks.extend(by_lvl[lvl][:3])
-        return picks[:9]
-
-    # ----------  Poll de canciones ----------
-    async def launch_song_poll(self, room_info):
-        thread  = room_info["thread"]
-        players = room_info["players"]
-
-        # ─── Calcula conteos y rango de niveles ───
-        counts = {"Placement": 0, "Bronze": 0, "Gold": 0, "Diamond": 0}
-        for m in players:
-            for r in counts:
-                if discord.utils.get(m.roles, name=r):
-                    counts[r] += 1
-                    break
-
-        low, high = self._range_for_counts(counts)
-        songs = await self._get_9_songs(low, high)
-
-        if not songs:
-            return await thread.send("⚠️ No hay canciones en ese rango.")
-
-        # ─── Inicia la votación de 60 segundos ───
-        view = SongPollView(songs, thread=thread, timeout=60)
-        msg  = await thread.send(
-            f"🎉 Sala completa · Niveles {high}-{low}\n"
-            "Tienen **1 minuto** para votar la canción:",
-            view=view
-        )
-        view.message = msg
-
-
-
-    # ----------  RESTO DE MÉTODOS ORIGINALES  ----------
-    async def fetch_player(self, user_id: int):
-        cur = await self.db.execute(
-            "SELECT mmr, role FROM players WHERE user_id = ?", (user_id,)
-        )
-        row = await cur.fetchone()
-        if row:
-            return row
-
-        await self.db.execute(
-            "INSERT OR IGNORE INTO players (user_id, mmr, role) VALUES (?, 0, 'Placement')",
-            (user_id,),
-        )
-        await self.db.commit()
-        cur = await self.db.execute(
-            "SELECT mmr, role FROM players WHERE user_id = ?", (user_id,)
-        )
-        row = await cur.fetchone()
-        return row
-
-    async def ensure_join_channel(self, guild: discord.Guild):
-        for ch in guild.text_channels:
-            if ch.name == JOIN_CHANNEL_NAME:
-                return ch
-        return await guild.create_text_channel(JOIN_CHANNEL_NAME)
-
-    async def sort_and_rename_rooms(self, guild: discord.Guild):
-        avgs = []
-        for rid, info in self.rooms.items():
-            members = info["players"]
-            if not members:
-                continue
-            total = 0
-            for m in members:
-                m_mmr, _ = await self.fetch_player(m.id)
-                total += m_mmr
-            avgs.append((rid, total / len(members)))
-        avgs.sort(key=lambda x: x[1], reverse=True)
-        new_rooms = {}
-        for idx, (old_rid, _) in enumerate(avgs, start=1):
-            info = self.rooms[old_rid]
+    async def membership_jobs(self):
+        async with self.bot.db.pool.acquire() as c:
+            jobs = await c.fetch(
+                "SELECT j.user_id,j.action,j.attempts,r.* FROM thread_jobs j JOIN rooms r ON r.id=j.room_id WHERE j.next_attempt<=now() AND r.thread_id IS NOT NULL ORDER BY j.next_attempt LIMIT 25"
+            )
+        for job in jobs:
             try:
-                await info["thread"].edit(name=f"sala-{idx}")
-            except:
-                pass
-            new_rooms[idx] = info
-        self.rooms = new_rooms
+                if not job["thread_id"]:
+                    continue
+                if job["action"] == "add":
+                    async with self.bot.db.pool.acquire() as c:
+                        valid = await c.fetchval(
+                            "SELECT 1 FROM room_members WHERE room_id=$1 AND user_id=$2",
+                            job["id"],
+                            job["user_id"],
+                        )
+                        if not valid:
+                            await c.execute(
+                                "DELETE FROM thread_jobs WHERE room_id=$1 AND user_id=$2 AND action='add'",
+                                job["id"],
+                                job["user_id"],
+                            )
+                            continue
+                thread = await self.thread(job)
+                if thread.archived:
+                    # Archival supersedes membership work; never reopen an expired room.
+                    async with self.bot.db.pool.acquire() as c:
+                        await c.execute(
+                            "DELETE FROM thread_jobs WHERE room_id=$1", job["id"]
+                        )
+                    continue
+                await self.membership(job, thread, job["user_id"], job["action"])
+            except (discord.HTTPException, ValueError) as exc:
+                code = (
+                    f"discord_{exc.status}"
+                    if isinstance(exc, discord.HTTPException)
+                    else "invalid_thread"
+                )
+                delay = (
+                    min(3600, 5 * 2 ** min(job["attempts"], 10)) + random.random() * 5
+                )
+                async with self.bot.db.pool.acquire() as c:
+                    await c.execute(
+                        "UPDATE thread_jobs SET attempts=attempts+1,next_attempt=now()+$3*interval '1 second',last_error=$4 WHERE room_id=$1 AND user_id=$2",
+                        job["id"],
+                        job["user_id"],
+                        delay,
+                        code,
+                    )
+                log.warning(
+                    "thread_membership_retry room_id=%s reason=%s", job["id"], code
+                )
 
-    # ----------  COMANDOS ----------
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def cancelled_poll_jobs(self):
+        async with self.bot.db.pool.acquire() as c:
+            jobs = await c.fetch(
+                "SELECT p.message_id,r.* FROM polls p JOIN rooms r ON r.id=p.room_id WHERE p.status='cancelled' AND NOT p.announced AND p.message_id IS NOT NULL LIMIT 25"
+            )
+        for job in jobs:
+            try:
+                thread = await self.thread(job)
+                if thread and not thread.archived:
+                    message = await thread.fetch_message(job["message_id"])
+                    await message.edit(view=None)
+                view = self.views.pop(job["id"], None)
+                if view:
+                    view.stop()
+                async with self.bot.db.pool.acquire() as c:
+                    await c.execute(
+                        "UPDATE polls SET announced=true WHERE room_id=$1", job["id"]
+                    )
+            except discord.NotFound:
+                async with self.bot.db.pool.acquire() as c:
+                    await c.execute(
+                        "UPDATE polls SET announced=true WHERE room_id=$1", job["id"]
+                    )
+                log.warning("cancelled_poll_message_missing room_id=%s", job["id"])
+            except discord.HTTPException:
+                log.exception("cancelled_poll_cleanup_retry room_id=%s", job["id"])
+
+    @tasks.loop(seconds=5)
+    async def maintenance(self):
+        try:
+            await self.membership_jobs()
+            await self.cancelled_poll_jobs()
+            async with self.bot.db.pool.acquire() as c:
+                archival = [
+                    dict(r)
+                    for r in await c.fetch(
+                        "SELECT * FROM rooms WHERE status='closed' AND issue='archive_pending'"
+                    )
+                ]
+            for room in archival:
+                try:
+                    thread = await self.thread(room)
+                    if thread and not thread.archived:
+                        await thread.edit(archived=True, locked=True)
+                    async with self.bot.db.pool.acquire() as c:
+                        await c.execute(
+                            "UPDATE rooms SET issue=NULL WHERE id=$1", room["id"]
+                        )
+                except discord.NotFound:
+                    async with self.bot.db.pool.acquire() as c:
+                        await c.execute(
+                            "UPDATE rooms SET issue='thread_missing_on_archive' WHERE id=$1",
+                            room["id"],
+                        )
+                except discord.HTTPException:
+                    log.exception("room_archive_retry room_id=%s", room["id"])
+            rooms = await self.bot.repo.rooms()
+            active_threads = {r["thread_id"] for r in rooms}
+            self.confirmed_members = {
+                pair for pair in self.confirmed_members if pair[0] in active_threads
+            }
+            for room in rooms:
+                try:
+                    if room["status"] == "needs_attention":
+                        continue
+                    if not room["thread_id"]:
+                        if (
+                            datetime.now(timezone.utc) - room["created_at"]
+                        ).total_seconds() > 90:
+                            await self.bot.repo.issue(
+                                room["id"], "restart_during_thread_creation"
+                            )
+                        continue
+                    thread = await self.thread(room)
+                    if thread.archived:
+                        async with self.bot.db.competitive() as (c, s):
+                            await c.execute(
+                                "UPDATE rooms SET status='closed',issue='thread_archived',updated_at=now() WHERE id=$1",
+                                room["id"],
+                            )
+                            await c.execute(
+                                "DELETE FROM room_members WHERE room_id=$1", room["id"]
+                            )
+                            await c.execute(
+                                "UPDATE polls SET status='cancelled' WHERE room_id=$1 AND status IN('sending','active')",
+                                room["id"],
+                            )
+                        continue
+                    name = f"sala-{room['display_number']}"
+                    if thread.name != name:
+                        await thread.edit(name=name)
+                    for uid in room["players"]:
+                        if (
+                            thread.get_member(uid) is None
+                            and (thread.id, uid) not in self.confirmed_members
+                        ):
+                            await thread.add_user(discord.Object(id=uid))
+                            self.confirmed_members.add((thread.id, uid))
+                    async with self.bot.db.pool.acquire() as c:
+                        poll = await c.fetchrow(
+                            "SELECT * FROM polls WHERE room_id=$1", room["id"]
+                        )
+                    if poll:
+                        if poll["status"] == "sending" and not poll["message_id"]:
+                            if (
+                                datetime.now(timezone.utc) - room["updated_at"]
+                            ).total_seconds() > 30:
+                                await self.bot.repo.issue(
+                                    room["id"],
+                                    "poll_delivery_unknown_manual_reconciliation",
+                                )
+                            continue
+                        if poll["status"] == "active" and room["id"] not in self.views:
+                            view = SongPollView(
+                                self, room["id"], json.loads(poll["options"])
+                            )
+                            self.bot.add_view(view, message_id=poll["message_id"])
+                            self.views[room["id"]] = view
+                        if poll["status"] in ("active", "closed") and poll[
+                            "expires_at"
+                        ] <= datetime.now(timezone.utc):
+                            await self.finish_poll(room, thread)
+                    else:
+                        await self.launch_song_poll(room, thread)
+                except (discord.NotFound, ValueError):
+                    await self.bot.repo.issue(
+                        room["id"], "thread_or_message_missing_or_invalid"
+                    )
+                    log.exception("room_recovery_failed room_id=%s", room["id"])
+                except discord.HTTPException as exc:
+                    log.warning(
+                        "discord_room_retry room_id=%s status=%s",
+                        room["id"],
+                        exc.status,
+                    )
+        except Exception:
+            log.exception("room_maintenance_failed")
+
+    @maintenance.before_loop
+    async def before_maintenance(self):
+        await self.bot.wait_until_ready()
+
+    async def finish_poll(self, room, thread):
+        poll = await self.bot.repo.close_poll(room["id"], random)
+        if not poll or poll["announced"]:
+            return
+        view = self.views.pop(room["id"], None)
+        if view:
+            for child in view.children:
+                child.disabled = True
+        if poll["message_id"]:
+            message = await thread.fetch_message(poll["message_id"])
+            # Edit the original message rather than send another: restart-safe announcement.
+            if poll["winner"] is None:
+                content = "⚠️ No se registraron votos en el tiempo establecido."
+            else:
+                title, level, diff = json.loads(poll["options"])[poll["winner"]]
+                async with self.bot.db.pool.acquire() as c:
+                    count = await c.fetchval(
+                        "SELECT count(*) FROM poll_votes WHERE room_id=$1 AND choice=$2",
+                        room["id"],
+                        poll["winner"],
+                    )
+                content = f"🏆 **Resultado de la votación** 🏆\nLa canción ganadora es **{title}** (Lv {level}, {diff}) con **{count} votos**."
+            await message.edit(content=content, view=None)
+        if view:
+            view.stop()
+        async with self.bot.db.pool.acquire() as c:
+            await c.execute(
+                "UPDATE polls SET announced=true WHERE room_id=$1", room["id"]
+            )
+
     @app_commands.command(name="c", description="Unirse a una sala")
     async def join_room(self, interaction: discord.Interaction):
-        # ─────────────── Validación: solo canal "join" ───────────────
-        if interaction.channel.name != JOIN_CHANNEL_NAME:
-            return await interaction.response.send_message(
-                f"❌ Este comando solo funciona en el canal #{JOIN_CHANNEL_NAME}.",
-                ephemeral=True
-            )
-
-        # ─────────── Lógica original de emparejamiento ───────────
-        member = interaction.user
-        mmr_val, _ = await self.fetch_player(member.id)
-
-        # buscar sala con espacio
-        best_rid, best_score = None, float("inf")
-        for rid, info in self.rooms.items():
-            if len(info["players"]) >= 5:
-                continue
-
-            vals = []
-            for m in info["players"]:
-                m_mmr, _ = await self.fetch_player(m.id)
-                vals.append(m_mmr)
-
-            if not vals:
-                continue
-
-            avg = sum(vals) / len(vals)
-            diff = abs(avg - mmr_val)
-            if diff < best_score:
-                best_rid, best_score = rid, diff
-
-        # Si no existe sala libre, crear nueva
-        if best_rid is None:
-            new_id = max(self.rooms.keys(), default=0) + 1
-
-            # Creamos el hilo justo en este canal "join"
-            ch = interaction.channel
-
-            thread = await ch.create_thread(
-                name=f"sala-{new_id}",
-                auto_archive_duration=60,
-                type=discord.ChannelType.public_thread,
-            )
-            self.rooms[new_id] = {"players": [], "thread": thread}
-            best_rid = new_id
-
-        # Una vez tenemos la sala (best_rid), unimos al jugador
-        room = self.rooms[best_rid]
-        if member in room["players"]:
-            return await interaction.response.send_message(
-                "❌ Ya estás en esa sala.", ephemeral=True
-            )
-
-        room["players"].append(member)
-        await interaction.response.send_message(
-            f"✅ Te uniste a sala-{best_rid} — MMR {mmr_val}"
+        await interaction.response.defer(thinking=True)
+        lock = self.member_locks.setdefault(
+            (interaction.guild_id, interaction.user.id), asyncio.Lock()
         )
-        await room["thread"].add_user(member)
-        await room["thread"].send(f"{member.display_name} se unió — MMR {mmr_val}")
+        async with lock:
+            await self.join_after_ack(interaction)
 
-        # Reordenar y renombrar salas según promedio de MMR
-        await self.sort_and_rename_rooms(interaction.guild)
+    async def join_after_ack(self, interaction):
+        permissions = getattr(interaction, "app_permissions", None)
+        if permissions is not None and not (
+            permissions.create_public_threads
+            and permissions.send_messages_in_threads
+            and permissions.view_channel
+        ):
+            return await interaction.followup.send(
+                "❌ El bot necesita View Channel, Create Public Threads y Send Messages in Threads en esta cola.",
+                ephemeral=True,
+            )
+        queue = self.bot.settings.queue_key(
+            interaction.guild_id,
+            interaction.channel_id,
+            getattr(interaction.channel, "name", ""),
+        )
+        if not queue:
+            return await interaction.followup.send(
+                "❌ Este comando solo funciona en un canal de cola configurado.",
+                ephemeral=True,
+            )
+        room, mmr = await self.bot.repo.join(
+            interaction.guild_id,
+            queue,
+            interaction.user.id,
+            interaction.user.display_name,
+        )
+        thread = await self.provision(room, interaction.channel)
+        await self.membership(room, thread, interaction.user.id, "add")
+        await interaction.followup.send(
+            f"✅ Te uniste a sala-{room['display_number']} — MMR {mmr}"
+        )
+        await thread.send(f"{interaction.user.display_name} se unió — MMR {mmr}")
 
-        # Si la sala llega a 5 jugadores, lanzar la votación de canciones
-        if len(room["players"]) == 5:
-            asyncio.create_task(self.launch_song_poll(room))
-
-
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="d", description="Salir de la sala")
     async def leave_room(self, interaction: discord.Interaction):
-        member = interaction.user
-        for rid, info in list(self.rooms.items()):
-            if member in info["players"]:
-                info["players"].remove(member)
-                await info["thread"].send(f"{member.display_name} salió.")
-                await info["thread"].remove_user(member)
-                if not info["players"]:
-                    try:
-                        await info["thread"].edit(archived=True, locked=True)
-                    except:
-                        pass
-                    self.rooms.pop(rid)
-                await interaction.response.send_message(
-                    f"🚪 Saliste de sala-{rid}."
-                )
-                await self.sort_and_rename_rooms(interaction.guild)
-                return
-        await interaction.response.send_message(
-            "❌ No estás en ninguna sala.", ephemeral=True
+        await interaction.response.defer(thinking=True)
+        lock = self.member_locks.setdefault(
+            (interaction.guild_id, interaction.user.id), asyncio.Lock()
         )
+        async with lock:
+            await self.leave_after_ack(interaction)
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
+    async def leave_after_ack(self, interaction):
+        room, left = await self.bot.repo.leave(
+            interaction.guild_id, interaction.user.id
+        )
+        await interaction.followup.send(f"🚪 Saliste de sala-{room['display_number']}.")
+        thread = await self.thread(room)
+        if thread:
+            try:
+                await thread.send(f"{interaction.user.display_name} salió.")
+                await self.membership(room, thread, interaction.user.id, "remove")
+                if not left:
+                    await thread.edit(archived=True, locked=True)
+                    async with self.bot.db.pool.acquire() as c:
+                        await c.execute(
+                            "UPDATE rooms SET issue=NULL WHERE id=$1", room["id"]
+                        )
+            except discord.HTTPException:
+                log.exception("leave_discord_pending room_id=%s", room["id"])
+
+    async def show_mmr(self, interaction, user):
+        await interaction.response.defer(thinking=True)
+        p = await self.bot.repo.player(user.id, user.display_name)
+        text = f"{user.display_name} tiene {p['mmr']} MMR y rango {p['role']}."
+        if p["role"] == "Placement":
+            text = f"{user.display_name} está en estado Placement y aún no tiene MMR asignado. (MMR: {p['mmr']})"
+        await interaction.followup.send(text)
+
     @app_commands.command(name="mmr", description="Muestra tu MMR actual")
     async def mmr_self(self, interaction: discord.Interaction):
-        mmr_val, role = await self.fetch_player(interaction.user.id)
-        name = interaction.user.display_name
-        if role == "Placement":
-            await interaction.response.send_message(
-                f"{name} está en estado Placement y aún no tiene MMR asignado."
-            )
-        else:
-            await interaction.response.send_message(
-                f"{name} tiene {mmr_val} MMR y rango {role}."
-            )
+        await self.show_mmr(interaction, interaction.user)
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="mmr_user", description="Muestra el MMR de otro jugador")
     async def mmr_user(self, interaction: discord.Interaction, user: discord.Member):
-        mmr_val, role = await self.fetch_player(user.id)
-        name = user.display_name
-        if role == "Placement":
-            await interaction.response.send_message(
-                f"{name} está en estado Placement y aún no tiene MMR asignado."
-            )
-        else:
-            await interaction.response.send_message(
-                f"{name} tiene {mmr_val} MMR y rango {role}."
-            )
+        await self.show_mmr(interaction, user)
 
-    @app_commands.guilds(discord.Object(id=GUILD_ID))
     @app_commands.command(name="top10", description="Top 10 jugadores por MMR")
     async def top10_slash(self, interaction: discord.Interaction):
-        cur = await self.db.execute(
-            "SELECT user_id, mmr FROM players ORDER BY mmr DESC LIMIT 10"
-        )
-        top = await cur.fetchall()
-        if not top:
-            return await interaction.response.send_message(
-                "Aún no hay jugadores con MMR definido."
+        await interaction.response.defer(thinking=True)
+        players = await self.bot.repo.leaderboard()
+        await interaction.followup.send(
+            "\n".join(
+                f"{i}. {p['name'] or str(p['user_id'])} — {p['mmr']} MMR"
+                for i, p in enumerate(players, 1)
             )
-        lines = []
-        for i, (uid, mmr_val) in enumerate(top, 1):
-            mem = interaction.guild.get_member(uid)
-            nm = mem.display_name if mem else f"ID {uid}"
-            lines.append(f"{i}. {nm} — {mmr_val} MMR")
-        await interaction.response.send_message("\n".join(lines))
+            or "Aún no hay jugadores con MMR definido."
+        )
 
     @commands.command(name="debug_diffs")
-    async def debug_diffs(self, ctx: commands.Context):
-        """Muestra las dificultades únicas cargadas en la tabla songs."""
-        cur = await self.db.execute("SELECT DISTINCT diff FROM songs")
-        rows = await cur.fetchall()
-        diffs = [r[0] for r in rows]
-        await ctx.send(f"Dificultades en la tabla songs: {diffs}")
+    async def debug_diffs(self, ctx):
+        await ctx.send(
+            f"Dificultades en el catálogo: {sorted({r['diff'] for r in self.catalog.rows})}"
+        )
 
     @commands.command(name="debug_poll")
-    async def debug_poll(self, ctx: commands.Context):
-        """Fuerza una poll de prueba con TODO el catálogo."""
-        songs = await self._get_9_songs(1, 99)
-        await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones", ephemeral=True)
+    async def debug_poll(self, ctx):
+        songs = self.catalog.pick(1, 99)
+        await ctx.send(f"🎵 debug_poll sacó {len(songs)} canciones")
         if not songs:
-            return await ctx.send("⚠️ No hay canciones en debug_poll.", ephemeral=True)
+            return await ctx.send("⚠️ No hay canciones en debug_poll.")
+        view = DiagnosticPoll(songs, ctx.channel)
+        view.message = await ctx.send("🎵 Poll de prueba (60s para votar):", view=view)
 
-        # ← Estas cuatro líneas deben ir INDENTADAS con 8 espacios
-        view = SongPollView(songs, thread=ctx.channel, timeout=60)
-        msg  = await ctx.send(
-            "🎵 Poll de prueba (60s para votar):",
-            view=view
-        )
-        view.message = msg
-
-    # -----------------  ¡submit5!  -----------------
     @commands.command(name="submit5")
-    async def submit5(self, ctx: commands.Context, *, block: str):
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-        if len(lines) != 5:
-            return await ctx.send(
-                "⚠️ Debes enviar 5 líneas: @user [CC] p,g,gd,b,m"
-            )
-        room = next(
-            (r for r in self.rooms.values() if r["thread"].id == ctx.channel.id),
-            None,
+    async def submit5(self, ctx, *, block: str):
+        result, created = await self.bot.repo.submit(
+            ctx.channel.id,
+            ctx.message.id,
+            block,
+            ctx.author.id,
+            ctx.author.guild_permissions.manage_guild,
         )
-        if not room:
-            return await ctx.send("❌ Usa este comando dentro de un hilo de sala.")
-
-        players_list = []
-        for ln in lines:
-            m = ENTRY_RE.match(ln)
-            if not m:
-                return await ctx.send(f"❌ Formato incorrecto: `{ln}`")
-            uid = int(m.group("id"))
-            cc = m.group("cc")
-            stats = list(map(int, m.group("stats").split(",")))
-            member = ctx.guild.get_member(uid) or await ctx.guild.fetch_member(uid)
-
-            weights = [5, 3, 2, 1, 0]
-            total = sum(s * w for s, w in zip(stats, weights))
-            old, db_role = await self.fetch_player(uid)
-
-            placement_bonus = None
-            bonus = old
-            if old == 0 and db_role == "Placement":
-                non_perfect = sum(stats[1:])
-                if non_perfect <= 15:
-                    bonus = 2000
-                    placement_bonus = "(+2000 Placement Diamond)"
-                elif non_perfect <= 50:
-                    bonus = 1000
-                    placement_bonus = "(+1000 Placement Gold)"
-                else:
-                    bonus = 0
-                    placement_bonus = "(+0 Placement Bronze)"
-                await self.db.execute(
-                    "UPDATE players SET mmr=? WHERE user_id=?", (bonus, uid)
-                )
-
-            players_list.append(
-                {
-                    "member": member,
-                    "country": cc,
-                    "total": total,
-                    "old": bonus,
-                    "placement_bonus": placement_bonus,
-                }
+        lines = [
+            "🏆 Resultados de ¡submit5! 🏆"
+            if created
+            else "Resultado ya confirmado; MMR sin cambios."
+        ]
+        for p in result:
+            if p["bonus"]:
+                lines.append(p["bonus"])
+            lines.append(
+                f"{country_flag(p['country'])} <@{p['user_id']}> · Puntos Totales: {p['total']} · MMR: {p['old']}{p['delta']:+} = {p['new']}"
             )
-
-        players_list.sort(key=lambda x: x["total"], reverse=True)
-        avg = sum(p["old"] for p in players_list) / 5
-        unit = max(1, int(avg // 10))
-
-        results = []
-        for idx, p in enumerate(players_list, 1):
-            mu = {1: 3, 2: 2, 3: 0.5, 4: -1, 5: -2}[idx]
-            delta = int(mu * unit)
-            new = p["old"] + delta
-            role_name = (
-                "Bronze" if new < 1000 else "Gold" if new < 2000 else "Diamond"
-            )
-            await self.db.execute(
-                "UPDATE players SET mmr=?,role=? WHERE user_id=?",
-                (new, role_name, p["member"].id),
-            )
-            role_obj = discord.utils.get(ctx.guild.roles, name=role_name)
-            if role_obj:
-                await p["member"].remove_roles(
-                    *[r for r in p["member"].roles if r.name in {"Bronze", "Gold", "Diamond"}]
-                )
-                await p["member"].add_roles(role_obj)
-
-            results.append(
-                {
-                    "idx": idx,
-                    "member": p["member"],
-                    "country": p["country"],
-                    "total": p["total"],
-                    "old": p["old"],
-                    "delta": delta,
-                    "new": new,
-                    "bonus": p["placement_bonus"],
-                }
-            )
-        await self.db.commit()
-
-        # construir mensaje
-        lines_out = ["🏆 Resultados de ¡submit5! 🏆\n"]
-        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-        for r in results:
-            if r["bonus"]:
-                lines_out.append(r["bonus"])
-            med = medals.get(r["idx"], "")
-            flag = country_flag(r["country"])
-            sign = "+" if r["delta"] >= 0 else ""
-            lines_out.append(f"{med} {flag} {r['member'].mention}")
-            lines_out.append(f"• Puntos Totales: {r['total']}")
-            lines_out.append(f"• MMR: {r['old']}{sign}{r['delta']} = {r['new']}\n")
-        await ctx.send("\n".join(lines_out))
+        await ctx.send(
+            "\n".join(lines), allowed_mentions=discord.AllowedMentions.none()
+        )
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot):
     await bot.add_cog(Matchmaking(bot))

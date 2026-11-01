@@ -1,25 +1,22 @@
-import sqlite3, os
+import asyncio
+from dotenv import load_dotenv
+from lounge.config import Settings
+from lounge.database import Database
 
-BASE    = os.path.dirname(os.path.abspath(__file__))
-db_path = os.path.join(BASE, "matchmaking.db")
 
-conn = sqlite3.connect(db_path)
-cur  = conn.cursor()
+async def inspect():
+    db = Database(Settings.load())
+    await db.open()
+    try:
+        async with db.pool.acquire() as c:
+            for row in await c.fetch(
+                "SELECT table_name,column_name,data_type FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position"
+            ):
+                print(*row)
+    finally:
+        await db.close()
 
-# Tablas
-cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-print("Tablas en la base:", cur.fetchall())
 
-# players
-cur.execute("PRAGMA table_info(players);")
-print("\nEsquema de 'players':")
-for col in cur.fetchall():
-    print(col)
-
-# placements
-cur.execute("PRAGMA table_info(placements);")
-print("\nEsquema de 'placements':")
-for col in cur.fetchall():
-    print(col)
-
-conn.close()
+if __name__ == "__main__":
+    load_dotenv()
+    asyncio.run(inspect())

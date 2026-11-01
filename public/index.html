@@ -2,6 +2,7 @@
 <html lang="es">
 <head>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PJSK LOUNGE</title>
   <style>
     body {
@@ -67,95 +68,23 @@
 </head>
 <body>
   <div id="app">
-    <h1>PJSK LOUNGE – Temporada {{ seasonLabel }}</h1>
+    <h1>PJSK LOUNGE – <span id="season">Cargando temporada…</span></h1>
+    <p id="season-date" style="text-align:center"></p>
     <div class="controls">
-      <input type="text" v-model="filter" placeholder="Buscar por nombre…">
+      <label for="search">Buscar jugador</label><br>
+      <input id="search" type="search" maxlength="100" placeholder="Buscar por nombre…">
     </div>
+    <p id="status" role="status" aria-live="polite">Cargando clasificación…</p>
     <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Player</th>
-          <th>MMR</th>
-          <th>Rango</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="p in filteredPlayers" :key="p.id">
-          <td :class="rankClass(p.rank)">
-            {{ playerRankMap[p.id] }}
-            <img v-if="p.country" :src="flagUrl(p.country)" :alt="p.country" class="flag" />
-          </td>
-          <td :class="rankClass(p.rank)">{{ p.name }}</td>
-          <td :class="rankClass(p.rank)">{{ p.mmr }}</td>
-          <td :class="rankClass(p.rank)">{{ p.rank }}</td>
-        </tr>
-      </tbody>
+      <thead><tr><th scope="col">#</th><th scope="col">Player</th><th scope="col">MMR</th><th scope="col">Rango</th></tr></thead>
+      <tbody id="players"></tbody>
     </table>
+    <div class="controls">
+      <button id="previous" type="button" disabled>Anterior</button>
+      <span id="page"></span>
+      <button id="next" type="button" disabled>Siguiente</button>
+    </div>
   </div>
-
-  <script src="https://unpkg.com/vue@3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
-  <script>
-    const { createApp } = Vue;
-    createApp({
-      data() {
-        return {
-          players: [],
-          filter: '',
-          playerRankMap: {}
-        };
-      },
-      computed: {
-        filteredPlayers() {
-          const q = this.filter.toLowerCase();
-          return this.players.filter(p =>
-            p.name.toLowerCase().includes(q)
-          );
-        },
-        seasonLabel() {
-          const start = new Date(2025, 4, 16);
-          const now   = new Date();
-          const monthsDiff = (now.getFullYear() - start.getFullYear()) * 12
-                           + (now.getMonth() - start.getMonth());
-          const period = Math.floor(monthsDiff / 3);
-          return period === 0 ? 'Beta' : period;
-        }
-      },
-      methods: {
-        async fetchPlayers() {
-          try {
-            const resp = await axios.get('/api/players');
-            const playersSorted = resp.data.sort((a, b) => b.mmr - a.mmr);
-            this.players = playersSorted;
-
-            // Crear mapa de posiciones reales por ID
-            const rankMap = {};
-            playersSorted.forEach((p, idx) => {
-              rankMap[p.id] = idx + 1;
-            });
-            this.playerRankMap = rankMap;
-          } catch (err) {
-            console.error(err);
-            alert('Error al cargar los datos de jugadores');
-          }
-        },
-        flagUrl(cc) {
-          return `https://flagcdn.com/24x18/${cc.toLowerCase()}.png`;
-        },
-        rankClass(rank) {
-          return `rank-${rank}`;
-        }
-      },
-      mounted() {
-        this.fetchPlayers();
-        setInterval(() => {
-          this.fetchPlayers();
-        }, 10000); // actualiza cada 10 segundos
-      }
-    }).mount('#app');
-  </script>
+  <script src="/app.js" defer></script>
 </body>
 </html>
-
-

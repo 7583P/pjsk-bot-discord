@@ -1,0 +1,126 @@
+{
+  "backend": {
+    "created_at": "2026-11-01T13:22:14.795158+00:00",
+    "source_revision": "8a4f8127b992562f0a818968e10554256cc88317",
+    "environment": "disposable local PostgreSQL; synthetic fixtures; Discord exchange/reactions mocked",
+    "tests": 49,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "successful": true,
+    "production_verified": false,
+    "normalized_packaging_retested_in_final_suite": true
+  },
+  "web": {
+    "tests": 11,
+    "failures": 0,
+    "skipped": 0,
+    "build": "passed",
+    "scope": "Node/jsdom, actual Vue methods and malicious DOM input; no browser or production QA",
+    "css_reference": "bc3c069; unchanged after CRLF/LF normalization"
+  },
+  "dependencies": {
+    "pip_audit": "no known vulnerabilities in production lock",
+    "npm_audit_production": 0,
+    "pip_check": "passed"
+  },
+  "source": {
+    "bot": "8a4f8127b992562f0a818968e10554256cc88317",
+    "web": "bc3c069",
+    "bot_history_commits": 658,
+    "web_history_commits": 431
+  },
+  "preservation": {
+    "snapshot_files": 74,
+    "changed_since_snapshot": [
+      "docs/DEPLOYMENT.md",
+      "docs/WEB_AUDIT.md",
+      "README.md"
+    ],
+    "missing": []
+  },
+  "production_reset_executed": false,
+  "deployed": false,
+  "status": "NOT READY",
+  "legacy_root_tests": {
+    "tests": 31,
+    "failures": 0,
+    "errors": 0,
+    "skipped": [],
+    "success": true
+  },
+  "confirmed_season5_policy": "0 initial MMR; preserve original normal/season placement and first-result seeds",
+  "public_probes": [
+    {
+      "created_at": "2026-11-01T12:57:07.160614+00:00",
+      "origin": "http://78.154.103.25:14646",
+      "transport": "http",
+      "anonymous_read_only": true,
+      "results": [
+        {
+          "path": "/health",
+          "error": "request_or_contract_failed"
+        },
+        {
+          "path": "/api/runtime-info",
+          "error": "request_or_contract_failed"
+        },
+        {
+          "path": "/api/seasons",
+          "error": "request_or_contract_failed"
+        }
+      ],
+      "production_identity_verified": false
+    },
+    {
+      "created_at": "2026-11-01T12:59:15.973907+00:00",
+      "origin": "https://worker-production-1ad2.up.railway.app",
+      "transport": "https",
+      "anonymous_read_only": true,
+      "results": [
+        {
+          "path": "/health",
+          "status": 404,
+          "body_sha256": "d29c96b9dfd7ed545b39590ed997ebeb57132864b7010c3c0bcbbb45f0625939"
+        },
+        {
+          "path": "/api/runtime-info",
+          "status": 404,
+          "body_sha256": "08e9c1afc3628bbd1add97b86946dfacce756c0f5b27e1208507c7e67c92bebe"
+        },
+        {
+          "path": "/api/seasons",
+          "status": 404,
+          "body_sha256": "5393d2978103df89482438c836ece87c2f0bc8552374118efa3316b5bebf9498"
+        }
+      ],
+      "production_identity_verified": false
+    },
+    {
+      "created_at": "2026-11-01T12:57:01.779428+00:00",
+      "origin": "https://pjsk-page.vercel.app",
+      "transport": "https",
+      "anonymous_read_only": true,
+      "results": [
+        {
+          "path": "/health",
+          "status": 404,
+          "body_sha256": "409ae750f8720abc563c50c442cd51913f62730170107919701cd5f0db27c802"
+        },
+        {
+          "path": "/api/runtime-info",
+          "status": 502,
+          "body_sha256": "918f97f4f4cb7f7eb12bea7c4317aa67248cde35969ddef925e5531853bcc06b"
+        },
+        {
+          "path": "/api/seasons",
+          "error": "request_or_contract_failed"
+        }
+      ],
+      "production_identity_verified": false
+    }
+  ],
+  "backup_directory": "backups/followup-20261101T124407Z/",
+  "candidate": "artifacts/vercel-production-prep-final-20261101/",
+  "candidate_manifest_sha256": "83f3304c3fd2829b004591f33595e79da940a1b3f490902e3a84b5d85f700a60"
+}

@@ -5,3 +5,15 @@ __pycache__/
 node_modules/
 matchmaking.db
 "python" 
+*.db-*
+backups/
+.local/
+.venv/
+*.dump
+*.manifest.json
+.env.*
+!.env.example
+artifacts/
+.ruff_cache/
+.mypy_cache/
+/web/

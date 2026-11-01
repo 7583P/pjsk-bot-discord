@@ -1,0 +1,140 @@
+{
+  "environment": "disposable local PostgreSQL; production unchanged",
+  "created_at": "2026-11-01T04:26:33.732347+00:00",
+  "imported": {
+    "players": 58,
+    "songs": 995,
+    "legacy_placements": 1
+  },
+  "import_idempotent": true,
+  "backup_restored_and_compared": true,
+  "backup_sha256": "27e8ecf0d8dd0c08860b86c08b783450db131992e8bd603fc077f8ccda87c3e5",
+  "preserved_legacy_profiles": true,
+  "dry_run": {
+    "previous_season": "beta",
+    "players": 58,
+    "previous_mmr_total": 0,
+    "new_season": "Season 5 (New Era)",
+    "new_mmr": 0,
+    "execute": false
+  },
+  "activation": {
+    "previous_season": "beta",
+    "players": 58,
+    "previous_mmr_total": 0,
+    "new_season": "Season 5 (New Era)",
+    "new_mmr": 0,
+    "execute": true,
+    "backup_sha256": "27e8ecf0d8dd0c08860b86c08b783450db131992e8bd603fc077f8ccda87c3e5"
+  },
+  "zero_mmr_without_placement": 58,
+  "archived_players": 58,
+  "season": {
+    "name": "Season 5 (New Era)",
+    "staging_started_at": "2026-11-01T04:26:33.717514+00:00"
+  },
+  "performance": {
+    "scope": "local loopback; no TLS, no Discord or Supabase WAN; no throughput/24h guarantee",
+    "players": 50,
+    "legacy_member_reads": {
+      "p50_ms": 7.681,
+      "p95_ms": 10.493,
+      "samples": 50
+    },
+    "batched_reads": {
+      "p50_ms": 0.256,
+      "p95_ms": 0.515,
+      "samples": 50
+    },
+    "legacy_queries": 50,
+    "batched_queries": 1,
+    "api": {
+      "p50_ms": 3.582,
+      "p95_ms": 5.41,
+      "samples": 50
+    },
+    "query_plan": [
+      {
+        "Plan": {
+          "Node Type": "Limit",
+          "Parallel Aware": false,
+          "Async Capable": false,
+          "Startup Cost": 11.31,
+          "Total Cost": 11.31,
+          "Plan Rows": 3,
+          "Plan Width": 16,
+          "Actual Startup Time": 0.03,
+          "Actual Total Time": 0.031,
+          "Actual Rows": 10,
+          "Actual Loops": 1,
+          "Plans": [
+            {
+              "Node Type": "Sort",
+              "Parent Relationship": "Outer",
+              "Parallel Aware": false,
+              "Async Capable": false,
+              "Startup Cost": 11.31,
+              "Total Cost": 11.31,
+              "Plan Rows": 3,
+              "Plan Width": 16,
+              "Actual Startup Time": 0.03,
+              "Actual Total Time": 0.03,
+              "Actual Rows": 10,
+              "Actual Loops": 1,
+              "Sort Key": [
+                "mmr DESC",
+                "user_id"
+              ],
+              "Sort Method": "top-N heapsort",
+              "Sort Space Used": 25,
+              "Sort Space Type": "Memory",
+              "Plans": [
+                {
+                  "Node Type": "Bitmap Heap Scan",
+                  "Parent Relationship": "Outer",
+                  "Parallel Aware": false,
+                  "Async Capable": false,
+                  "Relation Name": "season_players",
+                  "Alias": "season_players",
+                  "Startup Cost": 4.17,
+                  "Total Cost": 11.28,
+                  "Plan Rows": 3,
+                  "Plan Width": 16,
+                  "Actual Startup Time": 0.013,
+                  "Actual Total Time": 0.017,
+                  "Actual Rows": 58,
+                  "Actual Loops": 1,
+                  "Recheck Cond": "(season_id = 'beta'::text)",
+                  "Rows Removed by Index Recheck": 0,
+                  "Exact Heap Blocks": 1,
+                  "Lossy Heap Blocks": 0,
+                  "Plans": [
+                    {
+                      "Node Type": "Bitmap Index Scan",
+                      "Parent Relationship": "Outer",
+                      "Parallel Aware": false,
+                      "Async Capable": false,
+                      "Index Name": "season_leaderboard",
+                      "Startup Cost": 0.0,
+                      "Total Cost": 4.17,
+                      "Plan Rows": 3,
+                      "Plan Width": 0,
+                      "Actual Startup Time": 0.005,
+                      "Actual Total Time": 0.005,
+                      "Actual Rows": 58,
+                      "Actual Loops": 1,
+                      "Index Cond": "(season_id = 'beta'::text)"
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        },
+        "Planning Time": 0.078,
+        "Triggers": [],
+        "Execution Time": 0.041
+      }
+    ]
+  }
+}

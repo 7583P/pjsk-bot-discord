@@ -1,98 +1,97 @@
-import os
-import aiosqlite
+import logging
+import random
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
+from lounge.rules import RANKS
 
-# ─────────── CONFIGURACIÓN ───────────
-DB_PATH   = "matchmaking.db"
-GUILD_ID  = int(os.getenv("GUILD_ID", "0"))  # Asegúrate de que la variable GUILD_ID esté definida en tu entorno
+log = logging.getLogger(__name__)
+
 
 class AutoRoles(commands.Cog):
-    def __init__(self, bot: commands.Bot):
+    def __init__(self, bot):
         self.bot = bot
 
-    # ─────────── SETUP / TEARDOWN ───────────
     async def cog_load(self):
-        """
-        Se ejecuta cuando se carga el cog.
-        Conecta a la base de datos y se asegura de que exista la tabla players.
-        """
-        self.db = await aiosqlite.connect(DB_PATH)
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS players (
-                user_id INTEGER PRIMARY KEY,
-                mmr     INTEGER DEFAULT 0,
-                role    TEXT    DEFAULT 'Placement'
-            );
-        """)
-        await self.db.commit()
-        print("[AutoRoles] Tabla 'players' creada o ya existía.")
+        self.reconcile.start()
 
     async def cog_unload(self):
-        """
-        Se ejecuta cuando se descarga el cog.
-        Cierra la conexión a la base de datos.
-        """
-        await self.db.close()
+        self.reconcile.cancel()
 
-    # ─────────── MÉTODO AUXILIAR: fetch_player ───────────
-    async def fetch_player(self, user_id: int):
-        """
-        Recupera (mmr, role) de la tabla players para user_id.
-        Si no existe, lo crea con mmr=0 y role='Placement' y devuelve (0, 'Placement').
-        """
-        async with self.db.execute(
-            "SELECT mmr, role FROM players WHERE user_id = ?", (user_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if row:
-            return row  # Devuelve (mmr, role)
-
-        # Si no existe registro, lo insertamos como Placement
-        await self.db.execute(
-            "INSERT INTO players (user_id, mmr, role) VALUES (?, 0, 'Placement')",
-            (user_id,)
-        )
-        await self.db.commit()
-        return (0, "Placement")
-
-    # ─────────── LISTENER on_member_join ───────────
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member):
-        """
-        Cada vez que un usuario nuevo se une al servidor:
-        1) Llama a fetch_player para asegurarse de que haya una fila en la BD.
-        2) Si mmr == 0, fuerza el role_name a "Placement".
-        3) Busca el rol en Discord por nombre y, si existe, se lo asigna al miembro.
-        """
-        # Solo actuamos si el miembro pertenece al GUILD_ID configurado
-        if member.guild.id != GUILD_ID:
-            return
-
-        print(f"[AutoRoles] on_member_join disparado para {member} ({member.id})")
-
+    @tasks.loop(seconds=10)
+    async def reconcile(self):
         try:
-            mmr, role_name = await self.fetch_player(member.id)
+            async with self.bot.db.pool.acquire() as c:
+                jobs = await c.fetch("""SELECT j.*,sp.role FROM role_jobs j JOIN season_players sp USING(user_id)
+                    JOIN seasons s ON s.id=sp.season_id WHERE s.status='active' AND next_attempt<=now() ORDER BY next_attempt LIMIT 10""")
+            for job in jobs:
+                await self.apply(job)
+        except Exception:
+            log.exception("role_reconciliation_failed")
 
-            # Forzamos Placement si mmr == 0 (aunque fetch_player ya lo asigna)
-            if mmr == 0:
-                role_name = "Placement"
+    async def apply(self, job):
+        try:
+            guild = self.bot.get_guild(job["guild_id"])
+            if guild is None:
+                raise ValueError("guild_missing")
+            member = guild.get_member(job["user_id"]) or await guild.fetch_member(
+                job["user_id"]
+            )
+            target = discord.utils.get(guild.roles, name=job["role"])
+            if target is None:
+                raise ValueError("rank_role_missing:" + job["role"])
+            if (
+                not guild.me.guild_permissions.manage_roles
+                or target >= guild.me.top_role
+                or target.managed
+            ):
+                raise ValueError("rank_role_hierarchy_or_permissions")
+            remove = [r for r in member.roles if r.name in RANKS and r != target]
+            if target not in member.roles:
+                await member.add_roles(
+                    target, reason="PJSK: reconciliar rango PostgreSQL"
+                )
+            if remove:
+                await member.remove_roles(
+                    *remove, reason="PJSK: retirar rangos anteriores"
+                )
+            async with self.bot.db.pool.acquire() as c:
+                await c.execute(
+                    """DELETE FROM role_jobs j WHERE guild_id=$1 AND user_id=$2 AND EXISTS(
+                    SELECT 1 FROM season_players sp JOIN seasons s ON s.id=sp.season_id
+                    WHERE sp.user_id=j.user_id AND s.status='active' AND sp.role=$3)""",
+                    job["guild_id"],
+                    job["user_id"],
+                    job["role"],
+                )
+        except discord.NotFound:
+            await self.failed(job, "member_missing", 3600)
+        except (discord.HTTPException, ValueError) as exc:
+            code = (
+                str(exc)
+                if isinstance(exc, ValueError)
+                else f"discord_http_{exc.status}"
+            )
+            await self.failed(
+                job,
+                code,
+                min(3600, 10 * 2 ** min(job["attempts"], 8)) + random.random() * 5,
+            )
+            log.warning("role_sync_failed user_id=%s reason=%s", job["user_id"], code)
 
-            # Obtener el objeto Role en el servidor
-            guild_role = discord.utils.get(member.guild.roles, name=role_name)
-            if guild_role is None:
-                print(f"[AutoRoles] ❌ No existe el rol '{role_name}' en {member.guild.name}")
-                return
+    async def failed(self, job, code, delay):
+        async with self.bot.db.pool.acquire() as c:
+            await c.execute(
+                "UPDATE role_jobs SET attempts=attempts+1,last_error=$3,next_attempt=now()+$4*interval '1 second' WHERE guild_id=$1 AND user_id=$2",
+                job["guild_id"],
+                job["user_id"],
+                code,
+                delay,
+            )
 
-            # Asignar el rol al miembro
-            await member.add_roles(guild_role, reason="Asignación automática al unirse")
-            print(f"[AutoRoles] ✅ Asigné rol '{role_name}' a {member.name}")
-        except Exception as e:
-            print(f"[AutoRoles] ❌ Excepción en on_member_join: {e}")
+    @reconcile.before_loop
+    async def before_reconcile(self):
+        await self.bot.wait_until_ready()
 
-async def setup(bot: commands.Bot):
-    """
-    Punto de entrada para cargar el cog en el bot.
-    """
+
+async def setup(bot):
     await bot.add_cog(AutoRoles(bot))
