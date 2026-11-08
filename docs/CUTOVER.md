@@ -3,6 +3,12 @@
 Estado base: Season 5 activa · fingerprint MMR `9d3e14332158b8f39d7b9c8e73d3f219` (cambia legítimamente con partidas).
 **Nunca** detener Railway con salas activas: `python -m scripts.cutover_preflight --from-railway` debe dar **GO**.
 
+## ⚠️ Regla Railway (aprendida el 2026-11-08)
+El servicio `worker` está conectado a GitHub `main` (8a4f812, código antiguo), pero producción corre un despliegue **subido por CLI** (id `bccf32a0`, 4-nov). **Cualquier cambio de variable dispara un build desde GitHub `main`** y reemplaza el código de producción por el antiguo (sin lease, con pools propios → `EMAXCONNSESSION`).
+- Para cambiar variables sin cambiar código: `variableCollectionUpsert` con `skipDeploys:true` y luego `deploymentRollback(bccf32a0-cdce-489b-ac64-247b469cb76c)` — ver `scripts/railway_restore_upload_deploy.py`.
+- Parar el bot en el corte (paso 2) = `DISABLED<token>` (dispara build de main, solo API) → esperar lease libre → restaurar token con `skipDeploys` → rollback. No usar `railway variables --set` suelto.
+- Rollback de emergencia del bot: ese mismo script restaura el despliegue del 4-nov.
+
 ## Orden (cada paso tiene su rollback)
 | # | Acción | Rollback |
 |---|---|---|
