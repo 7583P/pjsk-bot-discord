@@ -17,3 +17,5 @@ artifacts/
 .ruff_cache/
 .mypy_cache/
 /web/
+
+scripts/postgres_credentials.json

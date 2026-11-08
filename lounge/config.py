@@ -24,7 +24,8 @@ class Settings:
             raise ValueError(
                 "El token Discord configurado aparece en el historial Git. Rótalo antes de arrancar el bot."
             )
-        url = os.getenv("API_DATABASE_URL" if api else "DATABASE_URL", "")
+        canonical = os.getenv("DATABASE_URL") or os.getenv("DB_HOST") or ""
+        url = (os.getenv("API_DATABASE_URL") or canonical) if api else canonical
         parts = urlsplit(url)
         if (
             parts.scheme not in ("postgres", "postgresql")

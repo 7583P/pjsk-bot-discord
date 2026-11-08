@@ -1,97 +1,140 @@
-import logging
-import random
+import os
+import asyncpg
 import discord
-from discord.ext import commands, tasks
-from lounge.rules import RANKS
+from discord.ext import commands
+from lounge.connections import get_bot_pool
 
-log = logging.getLogger(__name__)
+DATABASE_URL = os.getenv("DB_HOST")  # e.g. "postgresql://user:pass@host:5432/dbname"
+GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
 
 class AutoRoles(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
+        self.db_pool: asyncpg.Pool | None = None
 
+    # ─────────── SETUP / TEARDOWN ───────────
     async def cog_load(self):
-        self.reconcile.start()
+        """Reuse the single pool owned by the bot."""
+        self.db_pool = get_bot_pool()
+        print("[AutoRoles] asyncpg pool ready.")
 
     async def cog_unload(self):
-        self.reconcile.cancel()
+        """Release this cog's reference; the bot closes the pool."""
+        if self.db_pool:
+            self.db_pool = None
+        print("[AutoRoles] shared pool reference released.")
 
-    @tasks.loop(seconds=10)
-    async def reconcile(self):
+    # ─────────── HELPERS (asyncpg) ───────────
+    async def get_current_season(self) -> asyncpg.Record | None:
+        """
+        Returns the active season row or None.
+        """
+        assert self.db_pool is not None, "DB pool not initialized"
+        sql = """
+            SELECT id, name, active, startdate, enddate
+            FROM seasons
+            WHERE active = true
+            ORDER BY startdate DESC
+            LIMIT 1
+        """
+        async with self.db_pool.acquire() as conn:
+            return await conn.fetchrow(sql)
+
+    async def fetch_player(self, user_id: int) -> tuple[int, str]:
+        """
+        Returns (mmr, role) for the current season.
+        - Ensures a players row exists (by user_id).
+        - Ensures a seasonplayers row exists for current season.
+        """
+        assert self.db_pool is not None, "DB pool not initialized"
+
+        season = await self.get_current_season()
+        if not season:
+            # No active season; default to 0 / Placement
+            return (0, "Placement")
+        season_id = season["id"]
+
+        async with self.db_pool.acquire() as conn:
+            async with conn.transaction():
+                # Ensure players row (natural key user_id)
+                await conn.execute(
+                    """
+                    INSERT INTO players (user_id, name, country)
+                    VALUES ($1, '', '')
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    user_id,
+                )
+
+                # Try to read existing season row
+                placement_enabled=await conn.fetchval('SELECT placement_enabled FROM lounge_season_policy WHERE season_id=$1',season_id)
+                initial_role='Iron' if placement_enabled is False else 'Placement'
+                row = await conn.fetchrow(
+                    """
+                    SELECT sp.mmr, sp.role, sp.is_season_placement,
+                        (SELECT count(*) FROM match_history mh WHERE mh.season_id=sp.season_id AND mh.user_id=sp.user_id) AS matches_played
+                    FROM seasonplayers sp
+                    WHERE sp.user_id = $1 AND sp.season_id = $2
+                    """,
+                    user_id,
+                    season_id,
+                )
+
+                if row:
+                    role='Season Placement' if row['is_season_placement'] and row['matches_played']==0 else (row['role'] or 'Placement')
+                    return (row['mmr'] or 0,role)
+
+                # Create season row if missing
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO seasonplayers (user_id, season_id, points, mmr, role)
+                    VALUES ($1, $2, 0, 0, $3)
+                    ON CONFLICT (user_id, season_id) DO NOTHING
+                    RETURNING mmr, role
+                    """,
+                    user_id,
+                    season_id,
+                    initial_role,
+                )
+
+                if row is None:
+                    # Race: someone else created it; fetch again
+                    row = await conn.fetchrow(
+                        """
+                        SELECT sp.mmr, sp.role
+                        FROM seasonplayers sp
+                        WHERE sp.user_id = $1 AND sp.season_id = $2
+                        """,
+                        user_id,
+                        season_id,
+                    )
+
+                return ((row["mmr"] or 0), (row["role"] or "Placement"))
+
+    # ─────────── LISTENER on_member_join ───────────
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member):
+        """Assign role based on MMR when a user joins."""
+        if member.guild.id != GUILD_ID:
+            return
+
         try:
-            async with self.bot.db.pool.acquire() as c:
-                jobs = await c.fetch("""SELECT j.*,sp.role FROM role_jobs j JOIN season_players sp USING(user_id)
-                    JOIN seasons s ON s.id=sp.season_id WHERE s.status='active' AND next_attempt<=now() ORDER BY next_attempt LIMIT 10""")
-            for job in jobs:
-                await self.apply(job)
-        except Exception:
-            log.exception("role_reconciliation_failed")
+            mmr, role_name = await self.fetch_player(member.id)
 
-    async def apply(self, job):
-        try:
-            guild = self.bot.get_guild(job["guild_id"])
-            if guild is None:
-                raise ValueError("guild_missing")
-            member = guild.get_member(job["user_id"]) or await guild.fetch_member(
-                job["user_id"]
-            )
-            target = discord.utils.get(guild.roles, name=job["role"])
-            if target is None:
-                raise ValueError("rank_role_missing:" + job["role"])
-            if (
-                not guild.me.guild_permissions.manage_roles
-                or target >= guild.me.top_role
-                or target.managed
-            ):
-                raise ValueError("rank_role_hierarchy_or_permissions")
-            remove = [r for r in member.roles if r.name in RANKS and r != target]
-            if target not in member.roles:
-                await member.add_roles(
-                    target, reason="PJSK: reconciliar rango PostgreSQL"
+            role = discord.utils.get(member.guild.roles, name=role_name)
+            if not role:
+                print(
+                    f"[AutoRoles] ❌ Role '{role_name}' not found in {member.guild.name}"
                 )
-            if remove:
-                await member.remove_roles(
-                    *remove, reason="PJSK: retirar rangos anteriores"
-                )
-            async with self.bot.db.pool.acquire() as c:
-                await c.execute(
-                    """DELETE FROM role_jobs j WHERE guild_id=$1 AND user_id=$2 AND EXISTS(
-                    SELECT 1 FROM season_players sp JOIN seasons s ON s.id=sp.season_id
-                    WHERE sp.user_id=j.user_id AND s.status='active' AND sp.role=$3)""",
-                    job["guild_id"],
-                    job["user_id"],
-                    job["role"],
-                )
-        except discord.NotFound:
-            await self.failed(job, "member_missing", 3600)
-        except (discord.HTTPException, ValueError) as exc:
-            code = (
-                str(exc)
-                if isinstance(exc, ValueError)
-                else f"discord_http_{exc.status}"
-            )
-            await self.failed(
-                job,
-                code,
-                min(3600, 10 * 2 ** min(job["attempts"], 8)) + random.random() * 5,
-            )
-            log.warning("role_sync_failed user_id=%s reason=%s", job["user_id"], code)
+                return
 
-    async def failed(self, job, code, delay):
-        async with self.bot.db.pool.acquire() as c:
-            await c.execute(
-                "UPDATE role_jobs SET attempts=attempts+1,last_error=$3,next_attempt=now()+$4*interval '1 second' WHERE guild_id=$1 AND user_id=$2",
-                job["guild_id"],
-                job["user_id"],
-                code,
-                delay,
-            )
+            await member.add_roles(role, reason="Asignación automática al unirse")
+            print(f"[AutoRoles] ✅ Assigned '{role_name}' to {member} ({member.id})")
 
-    @reconcile.before_loop
-    async def before_reconcile(self):
-        await self.bot.wait_until_ready()
+        except Exception as e:
+            print(f"[AutoRoles] ❌ Excepción en on_member_join: {e}")
 
 
-async def setup(bot):
+async def setup(bot: commands.Bot):
     await bot.add_cog(AutoRoles(bot))

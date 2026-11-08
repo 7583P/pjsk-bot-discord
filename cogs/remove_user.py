@@ -1,4 +1,17 @@
-"""Retained legacy filename; never delete a player when importing a module."""
+import aiosqlite
+import asyncio
 
-if __name__ == "__main__":
-    raise SystemExit("Utilidad SQLite retirada. Consulta docs/DEPLOYMENT.md.")
+
+async def check_user(user_id: int):
+    async with aiosqlite.connect("matchmaking.db") as db:
+        async with db.execute(
+            "SELECT * FROM players WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            result = await cursor.fetchone()
+            if result:
+                print("🚨 Aún existe:", result)
+            else:
+                print("✅ Usuario eliminado correctamente.")
+
+
+asyncio.run(check_user(878310498720940102))

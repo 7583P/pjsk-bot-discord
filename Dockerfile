@@ -1,12 +1,15 @@
 FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
-COPY requirements.txt requirements.lock ./
-RUN pip install --no-cache-dir -r requirements.lock && useradd --create-home lounge
-COPY main.py app.py ./
-COPY lounge ./lounge
+COPY requirements.lock requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt && useradd --system --uid 10001 lounge
+COPY main.py app.py run.py ./
 COPY cogs ./cogs
-COPY public ./public
+COPY helpers ./helpers
+COPY lounge ./lounge
+COPY assets ./assets
+COPY certs ./certs
+COPY migrations ./migrations
+RUN ln -s /app /opt/pjsk-lounge && chown -R lounge:lounge /app
 USER lounge
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/health/ready',timeout=3)"
-CMD ["python", "main.py"]
+CMD ["python", "run.py"]

@@ -1,0 +1,84 @@
+{
+  "/api/seasons": {
+    "status_code": 200,
+    "content_length": 1251,
+    "content_type": "application/json",
+    "item_count": 7,
+    "sample_item_keys": [
+      "id",
+      "seasonId",
+      "season_id",
+      "name",
+      "seasonName",
+      "season_name"
+    ]
+  },
+  "/api/players?season_id=7": {
+    "status_code": 200,
+    "content_length": 1170152,
+    "content_type": "application/json",
+    "item_count": 1312,
+    "sample_item_keys": [
+      "id",
+      "user_id",
+      "discordId",
+      "discord_id",
+      "name",
+      "mmr"
+    ]
+  },
+  "/api/matches?season_id=7": {
+    "status_code": 200,
+    "content_length": 121981,
+    "content_type": "application/json",
+    "item_count": 43,
+    "sample_item_keys": [
+      "id",
+      "season_id",
+      "seasonId",
+      "season_name",
+      "result_id",
+      "resultId"
+    ]
+  },
+  "/api/hall-of-fame": {
+    "status_code": 200,
+    "content_length": 33050,
+    "content_type": "application/json",
+    "item_count": 6,
+    "sample_item_keys": [
+      "id",
+      "seasonId",
+      "season_id",
+      "name",
+      "seasonName",
+      "season_name"
+    ]
+  },
+  "/api/season-cutoffs": {
+    "status_code": 200,
+    "content_length": 74132,
+    "content_type": "application/json",
+    "item_count": 7,
+    "sample_item_keys": [
+      "id",
+      "seasonId",
+      "season_id",
+      "name",
+      "seasonName",
+      "season_name"
+    ]
+  },
+  "/auth02": {
+    "status_code": 307,
+    "content_length": 0,
+    "content_type": null,
+    "location": "https://discord.com/oauth2/authorize?client_id=1371546746248761455&redirect_uri=https%3A%2F%2Fpjsk-page.vercel.app%2Fauth02%2Fcallback&response_type=code&scope=identify+email&state=eXj8rNQPVk_7qi7ePDNGH-sLY2D-W_N3JRx-JE-CUmU"
+  },
+  "/auth02/me": {
+    "status_code": 401,
+    "content_length": 23,
+    "content_type": "application/json",
+    "response": "{\"detail\":\"no-session\"}"
+  }
+}
