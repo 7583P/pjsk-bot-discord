@@ -1,10 +1,10 @@
 # Probe en Wispbyte (sin Gateway de Discord)
 
-ZIP: `D:\Projects\PJSK Bot\artifacts\wispbyte-package-20261108T183833Z.zip` (11.7 MB, sha256 `96b917ae0aa254ee6daf552a7dfaa909e32e79e24ffeb4dd55ba2c21c44dc5df`).
+ZIP: `D:\Projects\PJSK Bot\artifacts\wispbyte-package-20261108T205037Z.zip` (sha256 `6a6ba897a850b426ae2f2ef2d05c32aeac511d8bc3b4528b75befcbba3ca6a9e`).
 
-1. Servidor `discord_bot` → **Files** → subir el ZIP a la raíz → clic derecho → **Unzip**. Debe quedar `probe.py`, `main.py`, `run_bot.py`, `requirements.txt` en la raíz (no en una subcarpeta).
-2. **Startup** → variables: `DATABASE_URL` = el mismo valor que usa Railway (pooler *session*, puerto 5432). No añadas `DISCORD_TOKEN`.
-3. **Startup command**: `python probe.py` (el panel instalará `requirements.txt`; si no lo hace, consola: `pip install -r requirements.txt`).
-4. **Start**. Espera a que termine (≈20 s) y copia la salida completa de la consola (no contiene secretos).
-5. Para medir CPU/RAM del bot real sin Gateway: Startup command `python -c "import main"` ≈ imports y pool; el consumo se ve en la gráfica del panel.
-6. Cuando termines, deja el servidor **OFFLINE**. No uses `run_bot.py` ni `main.py` hasta el corte.
+1. Files → borrar `.pydeps/` si existe y el contenido anterior del bot → subir el ZIP → Unzip en la raíz (deben quedar `bootstrap.py`, `probe.py`, `main.py`, `run_bot.py`, `MANIFEST.json` en la raíz).
+2. Startup → variable `DATABASE_URL` (ya configurada). Si el panel tiene variables de auto-instalación (p. ej. *Auto Update / Requirements / PY_PACKAGES*), ponlas vacías/desactivadas: `bootstrap.py` instala solo una vez en `.pydeps`.
+3. **Startup command:** `python -u bootstrap.py probe.py`
+4. Start. Verás `[bootstrap …] installing…` (≈1–3 min la primera vez), luego `PROBE COMPLETE`. Si se detiene, la última línea dice en qué paso (`WATCHDOG … stuck at step`) o pip falla con su código.
+5. Copia **toda** la consola (no tiene secretos) y déjala OFFLINE.
+6. Para el bot real (solo en el corte): Startup command `python -u bootstrap.py run_bot.py` (las siguientes arrancadas no reinstalan).

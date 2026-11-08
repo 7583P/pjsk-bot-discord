@@ -5,7 +5,7 @@ ROOT = Path(__file__).resolve().parent.parent
 stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 dest = ROOT / "artifacts" / f"wispbyte-package-{stamp}"
 assert not dest.exists()
-INCLUDE_FILES = ["main.py", "run_bot.py", "probe.py", "requirements-bot.txt", ".env.example"]
+INCLUDE_FILES = ["main.py", "run_bot.py", "probe.py", "bootstrap.py", "requirements-bot.txt", ".env.example"]
 EXTRA_COPIES = {"requirements-bot.txt": "requirements.txt"}  # default panel installers look for requirements.txt
 INCLUDE_DIRS = ["cogs", "lounge", "helpers", "assets", "certs", "migrations"]
 SKIP = {"__pycache__"}
