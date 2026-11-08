@@ -42,6 +42,69 @@ def load_env_file(path):
     return loaded
 
 
+import re
+
+_SECRETS = []  # exact secret strings to scrub from any output (DSN, password)
+
+
+def redact(text):
+    t = str(text)
+    for sec in _SECRETS:
+        if sec:
+            t = t.replace(sec, "<redacted>")
+    t = re.sub(r"//[^/\s@]*@", "//<redacted>@", t)       # any user:password@ userinfo
+    t = re.sub(r"(?i)(password|passwd|pwd)=\S+", lambda m: m.group(1) + "=<redacted>", t)
+    return t[:160]
+
+
+def _safe_excepthook(etype, value, tb):
+    print(f"FATAL {etype.__name__}: {redact(value)} (traceback suppressed to avoid leaking credentials)")
+    sys.exit(1)
+
+
+sys.excepthook = _safe_excepthook
+
+PLACEHOLDERS = ("USUARIO", "SERVIDOR", "CONTRASE", "EJEMPLO", "YOUR_", "TU_", "HOSTNAME", "<", ">", "[", "]", "{", "}")
+
+
+def check_dsn(url):
+    """Syntax problems of DATABASE_URL, described WITHOUT echoing any part of the value."""
+    problems = []
+    if url != url.strip():
+        problems.append("leading/trailing whitespace")
+    if chr(10) in url or chr(13) in url or " " in url:
+        problems.append("contains spaces or line breaks (several lines pasted into one value?)")
+    if url.upper().lstrip().startswith("DATABASE_URL="):
+        problems.append("the value itself starts with 'DATABASE_URL=' (key duplicated)")
+    if url.count("://") != 1:
+        problems.append(f"expected exactly one '://', found {url.count('://')}")
+    found = [ph for ph in PLACEHOLDERS if ph.lower() in url.lower()]
+    if found:
+        problems.append(f"looks like an example string: contains placeholder marker(s) {found}")
+    try:
+        u = urlsplit(url.strip())
+        if u.scheme not in ("postgres", "postgresql"):
+            problems.append(f"scheme must be postgresql:// (got '{u.scheme}')")
+        if not u.hostname:
+            problems.append("no host")
+        elif not u.hostname.endswith(".pooler.supabase.com"):
+            problems.append(f"host '{u.hostname}' is not a Supabase pooler host")
+        if not u.username or "." not in u.username:
+            problems.append("user must look like <role>.<project-ref> for the Supabase pooler")
+        if not u.password:
+            problems.append("no password in the URL")
+        if u.port not in (5432, 6543):
+            problems.append(f"port must be 5432 (session) or 6543 (transaction), got {u.port}")
+        if u.path.strip("/") != "postgres":
+            problems.append("database name should be 'postgres'")
+        if u.password:
+            _SECRETS.append(u.password)
+    except ValueError:
+        problems.append("URL cannot be parsed (stray brackets/characters)")
+    _SECRETS.append(url)
+    return problems
+
+
 def say(msg):
     print(f"[{time.perf_counter()-T0:6.1f}s] {msg}")
 
@@ -226,12 +289,22 @@ def main():
         try:
             fn()
         except Exception as e:
-            say(f"{fn.__name__} failed: {type(e).__name__}: {e}")
+            say(f"{fn.__name__} failed: {type(e).__name__}: {redact(e)}")
     url = os.environ.get("DATABASE_URL")
     if not url:
         say("FAIL: DATABASE_URL is not set (checked process env and .env) -> database checks NOT performed")
         RESULTS["db_ok"] = False
     else:
+        problems = check_dsn(url)
+        step("DATABASE_URL syntax")
+        if problems:
+            for pr in problems:
+                say(f"FAIL DATABASE_URL: {pr}")
+            RESULTS["db_ok"] = False
+            url = None
+        else:
+            say("DATABASE_URL syntax OK (scheme, Supabase pooler host, <role>.<ref> user, password present, port, db name)")
+    if url:
         u = urlsplit(url)
         cafile = dns_tls_step(u.hostname, u.port or 5432)
         try:
@@ -239,7 +312,7 @@ def main():
             RESULTS["db_ok"] = True
         except Exception as e:
             RESULTS["db_ok"] = False
-            say(f"DB step FAILED: {type(e).__name__}: {str(e)[:160]}")
+            say(f"DB step FAILED: {type(e).__name__}: {redact(e)}")
     try:
         discord_step()
     except Exception as e:
