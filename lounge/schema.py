@@ -1,6 +1,9 @@
 """Read-only runtime schema validation; never alters or deduplicates player data."""
 
 
+ACCEPTED_VERSIONS = ("007_publication_state.sql", "008_room_reroll.sql")
+
+
 async def validate_schema(conn):
     applied = await conn.fetchval(
         "SELECT to_regclass('public.lounge_schema_migrations')"
@@ -8,8 +11,15 @@ async def validate_schema(conn):
     if not applied:
         raise RuntimeError("Apply versioned runtime migrations before startup")
     version = await conn.fetchval("SELECT max(version) FROM lounge_schema_migrations")
-    if version != "007_publication_state.sql":
+    # 007 = previous runtime (still deployed on Railway); 008 adds lounge_room_reroll.
+    # The new runtime accepts both. 008 is only *registered* once no 007-only
+    # instance remains (see scripts/register_schema_008.py).
+    if version not in ACCEPTED_VERSIONS:
         raise RuntimeError("Runtime schema is not up to date")
+    if version == "008_room_reroll.sql" and not await conn.fetchval(
+        "SELECT to_regclass('public.lounge_room_reroll')"
+    ):
+        raise RuntimeError("Schema 008 registered but lounge_room_reroll is missing")
     for table in (
         "players",
         "seasons",

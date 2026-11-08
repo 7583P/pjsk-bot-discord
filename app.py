@@ -77,6 +77,15 @@ async def protect_writes(request: Request, call_next):
 # ============================================================
 # PJSK DEPLOY CHECK - TEMPORARY DEBUG
 # ============================================================
+DEBUG_ROUTES = os.getenv("PJSK_DEBUG_ROUTES", "0").lower() in ("1", "true", "yes", "on")
+
+
+def _debug_only():
+    """Diagnostic routes leak server paths/config shape; off unless explicitly enabled."""
+    if not DEBUG_ROUTES:
+        raise HTTPException(404, "Not found")
+
+
 PJSK_DEPLOY_VERSION = "PJSK_TITLES_PREVIOUS_SEASONS_V22_2026_06_27"
 
 # SECURITY DEFAULTS:
@@ -98,6 +107,7 @@ print("======================================================")
 
 @app.get("/auth02/debug-version")
 async def auth02_debug_version():
+    _debug_only()
     return {
         "version": PJSK_DEPLOY_VERSION,
         "file": os.path.abspath(__file__),
@@ -122,6 +132,7 @@ async def auth02_debug_version():
 
 @app.get("/api/debug-version")
 async def api_debug_version():
+    _debug_only()
     return {
         "version": PJSK_DEPLOY_VERSION,
         "file": os.path.abspath(__file__),
@@ -137,6 +148,7 @@ async def api_debug_version():
 
 @app.get("/auth02/debug-request")
 async def auth02_debug_request(request: Request):
+    _debug_only()
     auth_header = request.headers.get("authorization") or ""
     cookie_header = request.headers.get("cookie") or ""
     token_candidates = _candidate_session_tokens_from_request(request)
@@ -165,6 +177,7 @@ async def auth02_debug_request(request: Request):
 
 @app.get("/auth02/debug-routes")
 async def auth02_debug_routes():
+    _debug_only()
     routes = []
     for route in app.routes:
         path = getattr(route, "path", "")
@@ -2172,7 +2185,7 @@ async def readiness():
 async def runtime_info():
     return {'competitive_reference':'8a4f8127b992562f0a818968e10554256cc88317',
             'build_id':os.getenv('PJSK_BUILD_ID','unverified-local'),
-            'schema_expected':'007_publication_state.sql',
+            'schema_expected':['007_publication_state.sql','008_room_reroll.sql'],
             'production_verified':False}
 
 
