@@ -21,6 +21,10 @@ CREATE INDEX IF NOT EXISTS idx_lounge_room_reroll_thread ON lounge_room_reroll(t
 ALTER TABLE lounge_room_reroll ENABLE ROW LEVEL SECURITY;
 REVOKE ALL ON lounge_room_reroll FROM PUBLIC;
 DO $$ BEGIN
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='anon') THEN REVOKE ALL ON lounge_room_reroll FROM anon; END IF;
+  IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='authenticated') THEN REVOKE ALL ON lounge_room_reroll FROM authenticated; END IF;
+END $$;
+DO $$ BEGIN
   IF EXISTS(SELECT 1 FROM pg_roles WHERE rolname='lounge_bot') THEN
     GRANT SELECT,INSERT,UPDATE ON lounge_room_reroll TO lounge_bot;
     GRANT USAGE,SELECT ON SEQUENCE lounge_room_reroll_id_seq TO lounge_bot;

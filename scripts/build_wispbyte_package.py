@@ -6,12 +6,15 @@ stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 dest = ROOT / "artifacts" / f"wispbyte-package-{stamp}"
 assert not dest.exists()
 INCLUDE_FILES = ["main.py", "run_bot.py", "probe.py", "requirements-bot.txt", ".env.example"]
+EXTRA_COPIES = {"requirements-bot.txt": "requirements.txt"}  # default panel installers look for requirements.txt
 INCLUDE_DIRS = ["cogs", "lounge", "helpers", "assets", "certs", "migrations"]
 SKIP = {"__pycache__"}
 SKIP_FILES = {"remove_user.py", "ping_test.py", "mmr.py", "placement.py", "seasons.py", "autoroles.py_"}  # not loaded by main.py cogs list
 dest.mkdir(parents=True)
 for f in INCLUDE_FILES:
     shutil.copy2(ROOT / f, dest / f)
+for src, dst in EXTRA_COPIES.items():
+    shutil.copy2(ROOT / src, dest / dst)
 for d in INCLUDE_DIRS:
     for p in (ROOT / d).rglob("*"):
         if p.is_file() and not (set(p.parts) & SKIP) and p.suffix not in {".pyc", ".lnk"}:
