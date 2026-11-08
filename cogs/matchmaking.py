@@ -1,6 +1,8 @@
 import os, io, re, json, secrets
 import random
 import asyncio
+from types import SimpleNamespace
+import math
 import datetime
 import aiohttp  # descarga catálogo canciones
 import asyncpg  # PostgreSQL asíncrono
@@ -4057,8 +4059,41 @@ class Matchmaking(commands.Cog):
 
         self.refresh_songs.start()
         self.reconcile_runtime.start()
+        self.top100_warmer.start()
+
+    @tasks.loop(minutes=10)
+    async def top100_warmer(self):
+        """Pre-render every /top100 page in the background (throttled) whenever the standings change.
+
+        Rendering costs ~2 s of CPU on a 35 % quota host; the cache is keyed by content, so this does nothing
+        (beyond one cheap query) while standings are unchanged, and /top100 answers from cache afterwards."""
+        try:
+            guild = self.bot.get_guild(GUILD_ID)
+            season = await self.get_current_season()
+            if not guild or not season:
+                return
+            view = Top100View(self, self.db_pool, SimpleNamespace(guild=guild), int(season["id"]), str(season["name"]))
+            try:
+                rows = await view._get_rows(force_refresh=True)
+                pages = max(1, math.ceil(min(len(rows), 100) / view.per_page))
+                for page in range(pages):
+                    await asyncio.to_thread(render_top100_png, rows, view.season_name, page, per_page=view.per_page)
+                    await asyncio.sleep(3)  # leave CPU for commands and the Gateway heartbeat
+            finally:
+                view.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("top100_warmer_failed")
+
+    @top100_warmer.before_loop
+    async def _before_top100_warmer(self):
+        await self.bot.wait_until_ready()
+        await self._runtime_recovered.wait()
+        await asyncio.sleep(60)
 
     async def cog_unload(self):
+        self.top100_warmer.cancel()
         self.refresh_songs.cancel()
         self.reconcile_runtime.cancel()
         self.room_slot_scheduler.cancel()

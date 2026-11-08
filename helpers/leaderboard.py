@@ -2,6 +2,7 @@
 
 import hashlib
 import io
+import os
 import json
 import math
 from collections import OrderedDict
@@ -180,6 +181,28 @@ _PNG_CACHE_MAX = 24
 _DRAWN_FIELDS = ("user_id", "member_name", "player_name", "role", "visible_mmr", "is_unplayed_sp", "title_label", "title_style")
 
 
+def _cache_dir():
+    return Path(os.getenv("PJSK_CACHE_DIR") or ROOT / ".cache") / "top100"
+
+
+def _disk_path(key):
+    return _cache_dir() / f"{key}.png"
+
+
+def _disk_store(path, data, keep=60):
+    """Atomic write + prune oldest files (bounded disk use on a 1 GB host)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+        files = sorted(path.parent.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for old in files[:-keep]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def render_top100_png(rows, season_name, page=0, *, per_page=PER_PAGE):
     """PNG bytes for one page. Keyed by everything that is drawn, so identical standings reuse the image and
     any change in MMR/order/titles produces a new key (never stale)."""
@@ -193,7 +216,14 @@ def render_top100_png(rows, season_name, page=0, *, per_page=PER_PAGE):
     if hit is not None:
         _PNG_CACHE.move_to_end(key)
         return hit
-    data = generate_top100_image(rows, season_name, page, per_page=per_page).getvalue()
+    path = _disk_path(key)
+    try:
+        data = path.read_bytes() if path.exists() else None  # survives restarts; content-keyed, so never stale
+    except OSError:
+        data = None
+    if data is None:
+        data = generate_top100_image(rows, season_name, page, per_page=per_page).getvalue()
+        _disk_store(path, data)
     _PNG_CACHE[key] = data
     while len(_PNG_CACHE) > _PNG_CACHE_MAX:
         _PNG_CACHE.popitem(last=False)

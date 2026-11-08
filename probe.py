@@ -324,7 +324,13 @@ def main():
     ok = RESULTS.get("db_ok") and RESULTS.get("manifest_ok", False)
     say(f"SUMMARY: manifest={'PASS' if RESULTS.get('manifest_ok') else 'FAIL'} database={'PASS' if RESULTS.get('db_ok') else 'FAIL'}")
     say("PROBE COMPLETE" if ok else "PROBE INCOMPLETE (see FAIL lines above)")
-    sys.exit(0 if ok else 1)
+    if os.environ.get("PROBE_EXIT") == "1":
+        sys.exit(0 if ok else 1)
+    # A panel restarts a process that exits, which would re-run the probe forever. Stay idle instead:
+    # the log stays visible and nothing restarts. Press Stop in the panel when you have copied the output.
+    say("Probe finished. Idling so the panel does not restart it; press STOP now. (Set PROBE_EXIT=1 to exit instead.)")
+    while True:
+        time.sleep(3600)
 
 
 main()

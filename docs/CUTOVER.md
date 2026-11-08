@@ -43,3 +43,24 @@ Candidata real: la sala 1 (`STARTED`, 5 jugadores, `songs_posted=False`) detecta
 4. Parar y arrancar Wispbyte; la sala sigue en `lounge_room_state` y el bot la restaura; ningún mensaje duplicado.
 5. Dos `/reroll` casi simultáneos: uno responde "another operation…" o se serializan; `reroll_count` coincide con auditorías.
 6. Enviar el resultado normal con `!submit` solo en una sala real; `/reroll` posterior debe responder "definitive result".
+
+
+---
+## Estado medido (2026-11-08) y proyección honesta
+| Dato | Valor | Fuente |
+|---|---|---|
+| RTT a Supabase desde Wispbyte (Rumanía) | **244 ms** (`SELECT 1` p50; consulta tipo top100 p50 244, p95 488) | probe real en Wispbyte |
+| RTT desde Railway | **≈140–215 ms** (inferido: el chequeo de BD de `/health` añade ≈432 ms con 2–3 viajes) | medición indirecta, sin acceso al contenedor |
+| Render `/top100` por página | Wispbyte **1920 ms** · PC 90–140 ms | probe real |
+| RAM pico | 94 MB de 512 | probe real |
+| Discord REST | 81 ms p50 desde Wispbyte | probe real |
+
+**Conclusión:** cambiar a Wispbyte **no mejora la latencia de BD** (probablemente la empeora ≈1.1–1.7×) y su CPU es ~15–20× más lenta que mi PC. La mejora real viene del código (menos viajes por comando, caché de temporadas, render cacheado) y de mover la **API** a Vercel `gru1` (misma región que Supabase). Proyección por componentes (NO medida): `/mmr` ≈ 0.5–1.0 s; `/top100` ≈ 3–3.5 s en frío y ≈ 1.2 s con caché caliente (precalentada cada 10 min y persistente en disco); `/c`,`/d` ≈ 1–2 s. Se confirmarán con `/health/metrics` en producción (p50/p95 reales).
+Alternativa si Wispbyte no cumple: cualquier host en `sa-east`/`us-east` (RTT <40 ms) con ≥1 vCPU; el paquete es agnóstico (`python -u bootstrap.py run_bot.py`).
+
+## Credenciales del bot definitivo (pendiente de tu autorización)
+`scripts/create_bot_login.py` habilita login en `lounge_bot` (no cambia permisos; ya cubren las 18 tablas que escribe el bot). Hasta autorizarlo el bot usaría `postgres` (no recomendado). Rollback: `--disable`.
+
+## Corte con Railway como fallback (API en Vercel ya verificada)
+1. Preflight GO · 2. `python -m scripts.railway_restore_upload_deploy bccf32a0-cdce-489b-ac64-247b469cb76c --keep-disabled` (Gateway de Railway OFF, API del build subido ON, sin rebuild de `main`) · 3. rotar token en el portal · 4. Wispbyte: `.env` con DSN del bot + `DISCORD_TOKEN`, Startup `python -u bootstrap.py run_bot.py` · 5. verificar `lounge_runtime_lease`, comandos, `/health/metrics`.
+**Rollback:** parar Wispbyte → `python -m scripts.railway_restore_upload_deploy bccf32a0-cdce-489b-ac64-247b469cb76c` (sin flag: restaura el token y relanza el bot en Railway).

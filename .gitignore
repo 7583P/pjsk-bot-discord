@@ -19,3 +19,5 @@ artifacts/
 /web/
 
 scripts/postgres_credentials.json
+
+.cache/
