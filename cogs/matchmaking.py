@@ -16,7 +16,7 @@ from discord.ui import View, button
 from zoneinfo import ZoneInfo
 
 from helpers.image import generate_results_image, generate_stats_image
-from helpers.leaderboard import PER_PAGE, equipped_title, generate_top100_image
+from helpers.leaderboard import PER_PAGE, equipped_title, generate_top100_image, render_top100_png
 from lounge.connections import get_bot_pool
 from lounge.current_results import commit_result
 from lounge.room_store import RoomStore
@@ -548,10 +548,9 @@ class Top100View(View):
         self.prev_page.disabled = self.page == 0
         self.next_page.disabled = self.page == max_page
         if self.page not in self._image_cache:
-            rendered = await asyncio.to_thread(
-                generate_top100_image, rows, self.season_name, self.page, per_page=self.per_page,
+            self._image_cache[self.page] = await asyncio.to_thread(
+                render_top100_png, rows, self.season_name, self.page, per_page=self.per_page,
             )
-            self._image_cache[self.page] = rendered.getvalue()
         filename = f"top100-{self.season_id}-{self.page + 1}.png"
         embed = Embed(title=f"PJSK LOUNGE TOP 100 - {self.season_name}", color=0x00FFFB)
         embed.set_image(url=f"attachment://{filename}")

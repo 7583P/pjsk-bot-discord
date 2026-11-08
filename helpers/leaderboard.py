@@ -1,7 +1,10 @@
 """Portrait PNG pages for the existing, ordered Discord leaderboard."""
 
+import hashlib
 import io
+import json
 import math
+from collections import OrderedDict
 import re
 import unicodedata
 from functools import lru_cache
@@ -16,6 +19,23 @@ ROOT = Path(__file__).resolve().parents[1]
 BACKGROUND = ROOT / "assets" / "top100_stars_vertical.png"
 FONT = ROOT / "assets" / "rodinntlg_eb.otf"
 PER_PAGE = 10
+
+
+@lru_cache(maxsize=1)
+def _base_canvas():
+    """Decode + fit the background once; every render starts from a cheap copy."""
+    with Image.open(BACKGROUND) as background:
+        return ImageOps.fit(background.convert("RGB"), (1024, 1536))
+
+
+@lru_cache(maxsize=2048)
+def _gradient_strip(start, end, width, padding, span):
+    strip = Image.new("RGB", (width, 1))
+    strip.putdata([
+        tuple(round(a + (b - a) * max(0, min(1, (x - padding) / span))) for a, b in zip(start, end))
+        for x in range(width)
+    ])
+    return strip
 
 
 def equipped_title(row):
@@ -83,13 +103,8 @@ def _draw_gradient_text(canvas, xy, value, font, colors, *, anchor=None, neon=Fa
         (padding - bbox[0], padding - bbox[1]), value, font=font, fill=255, anchor=anchor,
     )
     start, end = map(hex_to_rgb, colors)
-    strip = Image.new("RGB", (width, 1))
     span = max(1, width - 2 * padding - 1)
-    strip.putdata([
-        tuple(round(a + (b - a) * max(0, min(1, (x - padding) / span))) for a, b in zip(start, end))
-        for x in range(width)
-    ])
-    gradient = strip.resize((width, height))
+    gradient = _gradient_strip(start, end, width, padding, span).resize((width, height))
     layer = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     if neon:
         for radius, opacity in ((4.5, .55), (1.5, .85)):
@@ -109,8 +124,7 @@ def generate_top100_image(rows, season_name, page=0, *, per_page=PER_PAGE):
     page = max(0, min(int(page), pages - 1))
     offset = page * per_page
     selected = rows[offset:min(offset + per_page, 100)]
-    with Image.open(BACKGROUND) as background:
-        canvas = ImageOps.fit(background.convert("RGB"), (1024, 1536))
+    canvas = _base_canvas().copy()
     draw = ImageDraw.Draw(canvas)
 
     def text(xy, value, size, fill, *, anchor=None):
@@ -159,3 +173,28 @@ def generate_top100_image(rows, season_name, page=0, *, per_page=PER_PAGE):
     canvas.save(output, format="PNG", optimize=False, compress_level=1)
     output.seek(0)
     return output
+
+
+_PNG_CACHE: "OrderedDict[str, bytes]" = OrderedDict()
+_PNG_CACHE_MAX = 24
+_DRAWN_FIELDS = ("user_id", "member_name", "player_name", "role", "visible_mmr", "is_unplayed_sp", "title_label", "title_style")
+
+
+def render_top100_png(rows, season_name, page=0, *, per_page=PER_PAGE):
+    """PNG bytes for one page. Keyed by everything that is drawn, so identical standings reuse the image and
+    any change in MMR/order/titles produces a new key (never stale)."""
+    total = min(len(rows), 100)
+    pages = max(1, math.ceil(total / per_page))
+    page = max(0, min(int(page), pages - 1))
+    offset = page * per_page
+    selected = rows[offset:min(offset + per_page, 100)]
+    key = hashlib.sha1(json.dumps([season_name, page, per_page, total, [[r.get(k) for k in _DRAWN_FIELDS] for r in selected]], default=str, sort_keys=True).encode()).hexdigest()
+    hit = _PNG_CACHE.get(key)
+    if hit is not None:
+        _PNG_CACHE.move_to_end(key)
+        return hit
+    data = generate_top100_image(rows, season_name, page, per_page=per_page).getvalue()
+    _PNG_CACHE[key] = data
+    while len(_PNG_CACHE) > _PNG_CACHE_MAX:
+        _PNG_CACHE.popitem(last=False)
+    return data

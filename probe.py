@@ -17,6 +17,31 @@ STEP = {"name": "start"}
 RESULTS: dict = {}
 
 
+def load_env_file(path):
+    """Minimal .env reader (KEY=VALUE, `export `, quotes, comments). Does not override real env vars; never prints values."""
+    loaded = []
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        elif " #" in val:
+            val = val.split(" #", 1)[0].rstrip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+            loaded.append(key)
+    return loaded
+
+
 def say(msg):
     print(f"[{time.perf_counter()-T0:6.1f}s] {msg}")
 
@@ -58,6 +83,11 @@ def rss_mb():
 
 def env_step():
     step("1. environment / limits")
+    loaded = load_env_file(HERE / ".env")
+    say(".env file: " + ("NOT FOUND in " + str(HERE) if loaded is None else f"found, loaded now: {sorted(loaded) or 'nothing new (already in process env)'}"))
+    for k in ("DATABASE_URL", "DISCORD_TOKEN", "APPLICATION_ID", "GUILD_ID", "DB_SSL", "DB_POOL_MODE", "DB_POOL_MAX"):
+        v = os.environ.get(k)
+        say(f"env {k}: {'PRESENT' if v else 'ABSENT'}" + (f" (length {len(v)})" if v and k in ("DATABASE_URL", "DISCORD_TOKEN") else (f" = {v}" if v and k not in ('DATABASE_URL','DISCORD_TOKEN') else "")))
     say(f"python {platform.python_version()} | {platform.platform()} | machine={platform.machine()}")
     say(f"cpu_count={os.cpu_count()} loadavg={os.getloadavg() if hasattr(os, 'getloadavg') else 'n/a'}")
     mem = read("/sys/fs/cgroup/memory.max") or read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
@@ -72,9 +102,18 @@ def package_step():
     step("2. package integrity / code version")
     mf = HERE / "MANIFEST.json"
     if mf.exists():
-        want = json.loads(mf.read_text())
-        bad = [f for f, h in want.items() if f != "MANIFEST.json" and (not (HERE / f).exists() or hashlib.sha256((HERE / f).read_bytes()).hexdigest() != h)]
-        say(f"MANIFEST files={len(want)} mismatched/missing={len(bad)} {bad[:6]}")
+        want = {k.replace("\\", "/"): v for k, v in json.loads(mf.read_text()).items()}  # tolerate manifests written on Windows
+        missing, differ = [], []
+        for f, h in want.items():
+            if f == "MANIFEST.json":
+                continue
+            fp = HERE.joinpath(*f.split("/"))
+            if not fp.exists():
+                missing.append(f)
+            elif hashlib.sha256(fp.read_bytes()).hexdigest() != h:
+                differ.append(f)
+        RESULTS["manifest_ok"] = not missing and not differ
+        say(f"MANIFEST {'PASS' if RESULTS['manifest_ok'] else 'FAIL'}: files={len(want)} missing={len(missing)} content-differs={len(differ)} {(missing + differ)[:6]}")
     else:
         say("MANIFEST.json missing (package not uploaded as built)")
     say(f"cogs/reroll.py present={ (HERE/'cogs'/'reroll.py').exists() } | lounge/perf.py present={ (HERE/'lounge'/'perf.py').exists() } | run_bot.py present={ (HERE/'run_bot.py').exists() }")
@@ -190,13 +229,16 @@ def main():
             say(f"{fn.__name__} failed: {type(e).__name__}: {e}")
     url = os.environ.get("DATABASE_URL")
     if not url:
-        say("DATABASE_URL not set -> skipping DNS/DB steps")
+        say("FAIL: DATABASE_URL is not set (checked process env and .env) -> database checks NOT performed")
+        RESULTS["db_ok"] = False
     else:
         u = urlsplit(url)
         cafile = dns_tls_step(u.hostname, u.port or 5432)
         try:
             asyncio.run(asyncio.wait_for(db_step(url, cafile), timeout=90))
+            RESULTS["db_ok"] = True
         except Exception as e:
+            RESULTS["db_ok"] = False
             say(f"DB step FAILED: {type(e).__name__}: {str(e)[:160]}")
     try:
         discord_step()
@@ -206,7 +248,10 @@ def main():
         cpu_step()
     except Exception as e:
         say(f"cpu step failed: {type(e).__name__}: {e}")
-    say("PROBE COMPLETE")
+    ok = RESULTS.get("db_ok") and RESULTS.get("manifest_ok", False)
+    say(f"SUMMARY: manifest={'PASS' if RESULTS.get('manifest_ok') else 'FAIL'} database={'PASS' if RESULTS.get('db_ok') else 'FAIL'}")
+    say("PROBE COMPLETE" if ok else "PROBE INCOMPLETE (see FAIL lines above)")
+    sys.exit(0 if ok else 1)
 
 
 main()

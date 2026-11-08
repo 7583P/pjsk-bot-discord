@@ -26,7 +26,7 @@ pat = re.compile(r"[MNO][A-Za-z0-9_-]{23,25}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27
 bad = [str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file() and p.suffix in {".py", ".txt", ".md", ".json", ".sql", ".example", ""} and pat.search(p.read_text(errors="ignore"))]
 assert not bad, f"secret-like content in {bad}"
 assert not list(dest.rglob(".env")) and not list(dest.rglob("*.db")) and not list(dest.rglob("*.dump"))
-manifest = {str(p.relative_to(dest)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(dest.rglob("*")) if p.is_file()}
+manifest = {p.relative_to(dest).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(dest.rglob("*")) if p.is_file()}
 (dest / "MANIFEST.json").write_text(json.dumps(manifest, indent=1))
 z = dest.with_suffix(".zip")
 with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zf:

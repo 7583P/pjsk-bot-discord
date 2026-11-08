@@ -15,6 +15,31 @@ STAMP = DEPS / ".installed"
 PIP_TIMEOUT = int(os.environ.get("BOOTSTRAP_PIP_TIMEOUT", "420"))
 
 
+def load_env_file(path):
+    """Minimal .env reader (KEY=VALUE, `export `, quotes, comments). Does not override real env vars; never prints values."""
+    loaded = []
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, _, val = line.partition("=")
+        key, val = key.strip(), val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        elif " #" in val:
+            val = val.split(" #", 1)[0].rstrip()
+        if key and key not in os.environ:
+            os.environ[key] = val
+            loaded.append(key)
+    return loaded
+
+
 def log(m):
     print(f"[bootstrap {time.strftime('%H:%M:%S')}] {m}", flush=True)
 
@@ -38,6 +63,8 @@ def main():
             raise SystemExit(f"pip failed rc={r.returncode}")
         STAMP.write_text(want)
         log(f"installed in {time.time()-t:.0f}s")
+    loaded = load_env_file(HERE / ".env")
+    log(".env: " + ("not found next to bootstrap.py (variables must come from the panel environment)" if loaded is None else f"loaded {len(loaded)} variable(s): {', '.join(sorted(loaded)) or 'none new'}"))
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(DEPS), str(HERE), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     env["PYTHONUNBUFFERED"] = "1"
