@@ -5,7 +5,7 @@ from discord.ext import commands
 from lounge.connections import get_bot_pool
 
 DATABASE_URL = os.getenv("DB_HOST")  # e.g. "postgresql://user:pass@host:5432/dbname"
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID") or "1371306026917298267")
 
 
 class AutoRoles(commands.Cog):

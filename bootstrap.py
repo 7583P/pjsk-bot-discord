@@ -69,6 +69,12 @@ def main():
     if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
         os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
         log("DB_CA_FILE resolved automatically to certs/supabase_ca_bundle.crt")
+    if not os.environ.get("GUILD_ID"):
+        os.environ["GUILD_ID"] = "1371306026917298267"
+        log("GUILD_ID defaulted to production 1371306026917298267")
+    if not os.environ.get("APPLICATION_ID"):
+        os.environ["APPLICATION_ID"] = "1371546746248761455"
+        log("APPLICATION_ID defaulted to production 1371546746248761455")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(DEPS), str(HERE), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     env["PYTHONUNBUFFERED"] = "1"

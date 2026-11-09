@@ -93,7 +93,7 @@ def is_allowed_leave(ch: discord.abc.GuildChannel) -> bool:
 # ———————————————————————————————————————————————
 
 DB_PATH = "matchmaking.db"  # ignorado, pero por compatibilidad
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+GUILD_ID = int(os.getenv("GUILD_ID") or "1371306026917298267")
 JOIN_CHANNEL_NAME = "join"
 DATABASE_URL = os.getenv("DB_HOST")  # postgresql://user:pass@host:port/dbname
 

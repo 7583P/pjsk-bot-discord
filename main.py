@@ -26,12 +26,14 @@ ca_candidate = HERE / "certs" / "supabase_ca_bundle.crt"
 if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
     os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
 
+DEFAULT_GUILD_ID = 1371306026917298267
+DEFAULT_APPLICATION_ID = 1371546746248761455
+DEFAULT_LOG_CHANNEL_ID = 1451649796971692104
+
 TOKEN = os.getenv("DISCORD_TOKEN")
-APP_ID = int(os.getenv("APPLICATION_ID", "0") or "0")
-GUILD_ID = os.getenv("GUILD_ID", "")
-LOG_CHANNEL_ID = int(
-    os.getenv("LOG_CHANNEL_ID", "1451649796971692104") or "1451649796971692104"
-)
+APP_ID = int(os.getenv("APPLICATION_ID") or DEFAULT_APPLICATION_ID)
+GUILD_ID = os.getenv("GUILD_ID") or str(DEFAULT_GUILD_ID)
+LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID") or DEFAULT_LOG_CHANNEL_ID)
 
 configure()
 logger = logging.getLogger("bot")
@@ -168,22 +170,30 @@ class MyBot(commands.Bot):
         except Exception as e:
             logger.warning("No se pudo enviar log de on_ready: %s", e)
 
-        if GUILD_ID:
+        target_guild = int(GUILD_ID)
+        try:
+            guild = discord.Object(id=target_guild)
+            # Clear stale global commands if no globals exist in tree to prevent shadowing
+            if not self.tree.get_commands():
+                try:
+                    await self.tree.sync()
+                    logger.info("Comandos globales obsoletos limpiados")
+                except Exception as e:
+                    logger.warning("Aviso limpiando comandos globales: %s", e)
+            self.tree.copy_global_to(guild=guild)
+            synced = await self.tree.sync(guild=guild)
+            cmd_names = [c.name for c in synced]
+            logger.info("Slash commands sincronizados en guild %s (%d): %s", target_guild, len(synced), cmd_names)
             try:
-                guild = discord.Object(id=int(GUILD_ID))
-                self.tree.copy_global_to(guild=guild)
-                synced = await self.tree.sync(guild=guild)
-                logger.info("Slash commands sincronizados en guild %s (%d): %s", GUILD_ID, len(synced), [c.name for c in synced])
-                try:
-                    await self._send_log(f"📋 Slash commands sincronizados en guild {GUILD_ID} ({len(synced)}): {', '.join([c.name for c in synced])}")
-                except Exception:
-                    pass
-            except Exception as e:
-                logger.warning("Aviso sincronizando slash commands: %s", e)
-                try:
-                    await self._send_log(f"⚠️ Aviso sincronizando slash commands: `{e}`")
-                except Exception:
-                    pass
+                await self._send_log(f"📋 **Slash commands sincronizados en guild {target_guild} ({len(synced)})**: {', '.join(cmd_names)}")
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("Aviso sincronizando slash commands: %s", e)
+            try:
+                await self._send_log(f"⚠️ Aviso sincronizando slash commands: `{e}`")
+            except Exception:
+                pass
 
 bot = MyBot()
 
@@ -194,16 +204,19 @@ async def sync_commands(ctx: commands.Context):
         return await ctx.reply("❌ No tienes permiso para ejecutar este comando.")
 
     try:
-        if GUILD_ID:
-            guild = discord.Object(id=int(GUILD_ID))
-            synced = await bot.tree.sync(guild=guild)
-            await ctx.send(
-                f"📋 Slash commands sincronizados en guild {GUILD_ID}: "
-                f"{[c.name for c in synced]}"
-            )
-        else:
-            synced = await bot.tree.sync()
-            await ctx.send(f"📋 Slash commands globales: {[c.name for c in synced]}")
+        target_guild = int(GUILD_ID)
+        guild = discord.Object(id=target_guild)
+        try:
+            await bot.tree.sync()
+        except Exception:
+            pass
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        cmd_names = [c.name for c in synced]
+        await ctx.send(
+            f"📋 **Slash commands sincronizados en guild {target_guild} ({len(synced)})**:\n"
+            f"{', '.join(cmd_names)}"
+        )
     except Exception as e:
         logger.exception("Error al sincronizar comandos: %s", e)
         await ctx.send(f"❗ Error al sincronizar comandos: {e}")

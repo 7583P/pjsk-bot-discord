@@ -16,6 +16,12 @@ ca_candidate = HERE / "certs" / "supabase_ca_bundle.crt"
 if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
     os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
     log.info("DB_CA_FILE configured to: %s", os.environ["DB_CA_FILE"])
+if not os.environ.get("GUILD_ID"):
+    os.environ["GUILD_ID"] = "1371306026917298267"
+    log.info("GUILD_ID defaulted to production 1371306026917298267")
+if not os.environ.get("APPLICATION_ID"):
+    os.environ["APPLICATION_ID"] = "1371546746248761455"
+    log.info("APPLICATION_ID defaulted to production 1371546746248761455")
 
 child = None
 stopping = False

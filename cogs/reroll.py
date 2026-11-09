@@ -25,7 +25,7 @@ from lounge.room_store import RoomStore
 
 log = logging.getLogger("reroll")
 
-GUILD_ID = int(os.getenv("GUILD_ID", "0") or "0")
+GUILD_ID = int(os.getenv("GUILD_ID") or "1371306026917298267")
 COMMAND_TIMEOUT_SEC = float(os.getenv("REROLL_TIMEOUT_SEC", "25"))
 SONGS_PER_ROOM = 5
 MARKER = "Reroll #{id}"
