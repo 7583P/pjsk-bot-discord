@@ -65,11 +65,22 @@ class BotHealth:
         return app
 
     async def start(self, port=8081):
-        self.runner = web.AppRunner(self.app(), access_log=None)
-        await self.runner.setup()
-        await web.TCPSite(self.runner, "127.0.0.1", port).start()
+        try:
+            self.runner = web.AppRunner(self.app(), access_log=None)
+            await self.runner.setup()
+            await web.TCPSite(self.runner, "127.0.0.1", port).start()
+        except Exception:
+            if self.runner:
+                try:
+                    await self.runner.cleanup()
+                except Exception:
+                    pass
+                self.runner = None
+            raise
 
     async def close(self):
         if self.runner:
-            await self.runner.cleanup()
-            self.runner = None
+            try:
+                await self.runner.cleanup()
+            finally:
+                self.runner = None

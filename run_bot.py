@@ -33,7 +33,7 @@ delay, MIN, MAX = 15, 15, 300
 while not stopping:
     started = time.monotonic()
     log.info("starting bot process")
-    child = subprocess.Popen([sys.executable, "main.py"])
+    child = subprocess.Popen([sys.executable, "-u", "main.py"])
     code = child.wait()
     ran = time.monotonic() - started
     if stopping:
@@ -41,6 +41,11 @@ while not stopping:
     # A healthy long run resets the backoff; quick crashes back off exponentially.
     delay = MIN if ran > 600 else min(MAX, delay * 2)
     log.warning("bot exited code=%s after %.0fs; restart in %ss", code, ran, delay)
+    try:
+        with open("bot_supervisor.log", "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] bot exited code={code} after {ran:.1f}s; restart in {delay}s\n")
+    except Exception:
+        pass
     for _ in range(int(delay)):
         if stopping:
             break

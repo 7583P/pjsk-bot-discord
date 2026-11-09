@@ -104,8 +104,13 @@ class MyBot(commands.Bot):
             await self._send_log(msg)
             raise RuntimeError("Required cogs failed to load; refusing partial startup")
         perf.install_discord_hooks(self)
-        self.health = BotHealth(self)
-        await self.health.start(int(os.getenv("BOT_HEALTH_PORT", "8081")))
+        try:
+            self.health = BotHealth(self)
+            await self.health.start(int(os.getenv("BOT_HEALTH_PORT", "8081")))
+            logger.info("BotHealth iniciado en 127.0.0.1:%s", os.getenv("BOT_HEALTH_PORT", "8081"))
+        except Exception as e:
+            logger.warning("No se pudo iniciar BotHealth en puerto %s: %s (no crítico, continuando)", os.getenv("BOT_HEALTH_PORT", "8081"), e)
+            self.health = None
 
     async def close(self):
         if self.lease_task:
@@ -141,11 +146,15 @@ class MyBot(commands.Bot):
                 await self.lease.heartbeat()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             self.runtime_failure = RuntimeError(
-                "Database lease lost; supervisor restart required"
+                f"Database lease lost; supervisor restart required ({e})"
             )
             logger.exception("runtime_lease_lost")
+            try:
+                await self._send_log(f"⚠️ Lease de base de datos perdida: `{e}`. Reiniciando...")
+            except Exception:
+                pass
             asyncio.create_task(self.close())
 
     async def on_ready(self):
@@ -154,14 +163,27 @@ class MyBot(commands.Bot):
             self.user,
             self.user.id if self.user else "?",
         )
+        try:
+            await self._send_log(f"🤖 **Bot Conectado y Online** como `{self.user}` (ID: `{self.user.id if self.user else '?'}`)")
+        except Exception as e:
+            logger.warning("No se pudo enviar log de on_ready: %s", e)
+
         if GUILD_ID:
             try:
                 guild = discord.Object(id=int(GUILD_ID))
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
                 logger.info("Slash commands sincronizados en guild %s (%d): %s", GUILD_ID, len(synced), [c.name for c in synced])
+                try:
+                    await self._send_log(f"📋 Slash commands sincronizados en guild {GUILD_ID} ({len(synced)}): {', '.join([c.name for c in synced])}")
+                except Exception:
+                    pass
             except Exception as e:
                 logger.warning("Aviso sincronizando slash commands: %s", e)
+                try:
+                    await self._send_log(f"⚠️ Aviso sincronizando slash commands: `{e}`")
+                except Exception:
+                    pass
 
 bot = MyBot()
 
@@ -225,6 +247,24 @@ async def run_bot_async():
             pass  # Windows console uses asyncio.run's interrupt handling.
         async with bot:
             await bot.start(TOKEN, reconnect=True)
+    except BaseException as e:
+        logger.exception("FATAL ERROR EN BOT START: %s", e)
+        import datetime, traceback
+        tb = traceback.format_exc()
+        try:
+            with open("crash.log", "a", encoding="utf-8") as f:
+                f.write(f"\n--- CRASH {datetime.datetime.now(datetime.timezone.utc).isoformat()} ---\n")
+                f.write(tb)
+        except Exception:
+            pass
+        try:
+            import httpx
+            log_url = f"https://discord.com/api/v10/channels/{LOG_CHANNEL_ID}/messages"
+            content = f"💥 **CRASH FATAL**: `{type(e).__name__}: {e}`\n```\n{tb[-1500:]}\n```"
+            httpx.post(log_url, headers={"Authorization": f"Bot {TOKEN}"}, json={"content": content}, timeout=5.0)
+        except Exception:
+            pass
+        raise
     finally:
         if handles_term:
             loop.remove_signal_handler(signal.SIGTERM)
