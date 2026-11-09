@@ -1,9 +1,56 @@
 from dataclasses import dataclass, field
 import json
+import logging
 import os
 from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 from lounge.credentials import is_exposed
+
+log = logging.getLogger(__name__)
+
+
+def resolve_ca_file(candidate: str | Path | None = None) -> str | None:
+    """Resolve an absolute, verified path to the Supabase CA certificate bundle.
+
+    Searches in order:
+    1. Explicit candidate path if provided.
+    2. DB_CA_FILE environment variable.
+    3. Standard repository / container locations:
+       - <repo_root>/certs/supabase_ca_bundle.crt
+       - <cwd>/certs/supabase_ca_bundle.crt
+       - <lounge_dir>/certs/supabase_ca_bundle.crt
+       - /home/container/certs/supabase_ca_bundle.crt (Wispbyte standard container path)
+       - /var/task/certs/supabase_ca_bundle.crt (Vercel / AWS Lambda)
+    Returns an absolute path string if found and is a file, else None.
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    paths_to_check: list[Path] = []
+
+    raw = candidate or os.getenv("DB_CA_FILE")
+    if raw:
+        p = Path(raw)
+        paths_to_check.extend([
+            p,
+            repo_root / p,
+            Path.cwd() / p,
+        ])
+
+    paths_to_check.extend([
+        repo_root / "certs" / "supabase_ca_bundle.crt",
+        Path.cwd() / "certs" / "supabase_ca_bundle.crt",
+        Path(__file__).resolve().parent / "certs" / "supabase_ca_bundle.crt",
+        Path("/home/container/certs/supabase_ca_bundle.crt"),
+        Path("/var/task/certs/supabase_ca_bundle.crt"),
+    ])
+
+    for path in paths_to_check:
+        try:
+            resolved = path.resolve()
+            if resolved.is_file():
+                return str(resolved)
+        except OSError:
+            continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -64,7 +111,7 @@ class Settings:
             mode,
             pool_max,
             use_ssl,
-            os.getenv("DB_CA_FILE") or None,
+            resolve_ca_file(os.getenv("DB_CA_FILE")),
             int(os.getenv("GUILD_ID") or "0"),
             int(os.getenv("APPLICATION_ID") or "0"),
             os.getenv("DISCORD_TOKEN", ""),

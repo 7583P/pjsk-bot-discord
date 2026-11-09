@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import asyncio
 import logging
 import signal
@@ -8,7 +9,7 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from lounge.connections import create_pool, bind_bot_pool
-from lounge.config import Settings
+from lounge.config import Settings, resolve_ca_file
 from lounge.lease import RuntimeLease
 from lounge.logging import configure
 from lounge.health import BotHealth
@@ -19,6 +20,11 @@ from lounge import perf
 # Environment
 # -------------------------
 load_dotenv()
+
+HERE = Path(__file__).resolve().parent
+ca_candidate = HERE / "certs" / "supabase_ca_bundle.crt"
+if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
+    os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 APP_ID = int(os.getenv("APPLICATION_ID", "0") or "0")

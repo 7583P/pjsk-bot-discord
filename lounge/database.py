@@ -6,6 +6,7 @@ import ssl
 import time
 import uuid
 import asyncpg
+from lounge.config import resolve_ca_file
 
 log = logging.getLogger(__name__)
 
@@ -17,8 +18,9 @@ class Database:
         self.owner = None
 
     async def open(self):
+        ca_file = self.settings.ca_file or resolve_ca_file()
         tls = (
-            ssl.create_default_context(cafile=self.settings.ca_file)
+            ssl.create_default_context(cafile=ca_file)
             if self.settings.ssl
             else False
         )

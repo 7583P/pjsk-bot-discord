@@ -7,7 +7,7 @@ import random
 import ssl
 import os
 import asyncpg
-from lounge.config import Settings
+from lounge.config import Settings, resolve_ca_file
 from lounge.diagnostics import database_fingerprint
 from lounge import perf
 
@@ -32,7 +32,8 @@ async def create_pool(*, api=False, settings=None):
         expected = os.getenv("STAGING_DATABASE_FINGERPRINT")
         if staging and not expected:
             raise ValueError("Staging requires the reviewed staging database fingerprint")
-        tls = ssl.create_default_context(cafile=settings.ca_file) if settings.ssl else False
+        ca_file = settings.ca_file or resolve_ca_file()
+        tls = ssl.create_default_context(cafile=ca_file) if settings.ssl else False
         
         # Limite conservador estricto: max_size=3 para no exceder pool_size=15 de Supabase Free
         pool_max = min(settings.pool_max, 3)

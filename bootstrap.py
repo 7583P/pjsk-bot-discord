@@ -65,6 +65,10 @@ def main():
         log(f"installed in {time.time()-t:.0f}s")
     loaded = load_env_file(HERE / ".env")
     log(".env: " + ("not found next to bootstrap.py (variables must come from the panel environment)" if loaded is None else f"loaded {len(loaded)} variable(s): {', '.join(sorted(loaded)) or 'none new'}"))
+    ca_candidate = HERE / "certs" / "supabase_ca_bundle.crt"
+    if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
+        os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
+        log("DB_CA_FILE resolved automatically to certs/supabase_ca_bundle.crt")
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join([str(DEPS), str(HERE), env.get("PYTHONPATH", "")]).strip(os.pathsep)
     env["PYTHONUNBUFFERED"] = "1"

@@ -6,9 +6,17 @@ that could trip Discord's rate limits on a shared IP; a live DB lease held by
 another instance (e.g. Railway still running) is never fought over.
 """
 import logging, os, signal, subprocess, sys, time
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s run_bot: %(message)s")
 log = logging.getLogger("run_bot")
+
+HERE = Path(__file__).resolve().parent
+ca_candidate = HERE / "certs" / "supabase_ca_bundle.crt"
+if ca_candidate.exists() and not os.environ.get("DB_CA_FILE"):
+    os.environ["DB_CA_FILE"] = str(ca_candidate.resolve())
+    log.info("DB_CA_FILE configured to: %s", os.environ["DB_CA_FILE"])
+
 child = None
 stopping = False
 
