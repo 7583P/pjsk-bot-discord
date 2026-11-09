@@ -16,8 +16,13 @@ web = ROOT / "web"
 for f in ("index.html", "lounge-client.js"):
     shutil.copy2(web / f, pub / f)
 shutil.copytree(web / "assets", pub / "assets")
-(dest / "requirements.txt").write_text("fastapi==0.162.0\nasyncpg==0.32.0\nhttpx==0.28.1\npython-dotenv==1.2.4\npydantic==2.14.2\n")
-(dest / "pyproject.toml").write_text('[project]\nname = "pjsk-lounge-api"\nversion = "0.1.0"\nrequires-python = ">=3.12"\n')
+DEPS = ["fastapi==0.162.0", "asyncpg==0.32.0", "httpx==0.28.1", "python-dotenv==1.2.4", "pydantic==2.14.2"]
+# Vercel installs from pyproject.toml when it exists (and then IGNORES requirements.txt): dependencies must live here.
+NL = chr(10)
+dep_lines = "".join(f'  "{d}",{NL}' for d in DEPS)
+(dest / "pyproject.toml").write_text(
+    f'[project]{NL}name = "pjsk-lounge-api"{NL}version = "0.1.0"{NL}requires-python = ">=3.12"{NL}dependencies = [{NL}{dep_lines}]{NL}')
+(dest / "requirements.txt").write_text(NL.join(DEPS) + NL)  # kept identical for tools that read it
 (dest / "vercel.json").write_text(json.dumps({
     "framework": "fastapi",
     "functions": {"app.py": {"maxDuration": 30}},
