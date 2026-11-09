@@ -193,32 +193,34 @@ def install_discord_hooks(bot) -> None:
     """Records gateway delay, ack latency and total time for slash commands."""
     import discord
 
-    if getattr(discord.InteractionResponse, "_perf_patched", False):
+    if getattr(bot, "_perf_hooks_installed", False):
         return
+    bot._perf_hooks_installed = True
 
-    def _wrap(method_name):
-        original = getattr(discord.InteractionResponse, method_name)
+    if not getattr(discord.InteractionResponse, "_perf_patched", False):
+        def _wrap(method_name):
+            original = getattr(discord.InteractionResponse, method_name)
 
-        async def wrapper(self, *a, **k):
-            inter = getattr(self, "_parent", None)
-            try:
-                if inter is not None and "t_ack" not in inter.extras:
-                    inter.extras["t_ack"] = time.perf_counter()
-            except Exception:
-                pass
-            return await original(self, *a, **k)
+            async def wrapper(self, *a, **k):
+                inter = getattr(self, "_parent", None)
+                try:
+                    if inter is not None and "t_ack" not in inter.extras:
+                        inter.extras["t_ack"] = time.perf_counter()
+                except Exception:
+                    pass
+                return await original(self, *a, **k)
 
-        wrapper.__name__ = method_name
-        setattr(discord.InteractionResponse, method_name, wrapper)
+            wrapper.__name__ = method_name
+            setattr(discord.InteractionResponse, method_name, wrapper)
 
-    for name in ("defer", "send_message", "edit_message"):
-        _wrap(name)
-    discord.InteractionResponse._perf_patched = True
+        for name in ("defer", "send_message", "edit_message"):
+            _wrap(name)
+        discord.InteractionResponse._perf_patched = True
 
     tree = bot.tree
     prior_check = tree.interaction_check
 
-    async def interaction_check(interaction):
+    async def interaction_check(interaction: discord.Interaction) -> bool:
         try:
             interaction.extras["t0"] = time.perf_counter()
             if interaction.created_at is not None:
@@ -235,7 +237,9 @@ def install_discord_hooks(bot) -> None:
 
     def _finish(interaction, command, ok: bool):
         try:
-            t0 = interaction.extras.get("t0")
+            if interaction is None:
+                return
+            t0 = getattr(interaction, "extras", {}).get("t0")
             if t0 is None:
                 return
             name = getattr(command, "qualified_name", None) or getattr(command, "name", "unknown")
@@ -254,4 +258,20 @@ def install_discord_hooks(bot) -> None:
         except Exception:
             log.debug("perf finish failed", exc_info=True)
 
-    bot.add_listener(lambda i, c: _finish(i, c, True), "on_app_command_completion")
+    # Listeners in discord.py must be coroutines (async def)
+    async def on_app_command_completion(interaction: discord.Interaction, command) -> None:
+        _finish(interaction, command, True)
+
+    bot.add_listener(on_app_command_completion, "on_app_command_completion")
+
+    prior_tree_error = tree.on_error
+
+    async def on_tree_error(interaction: discord.Interaction, error: discord.app_commands.AppCommandError) -> None:
+        try:
+            cmd = getattr(interaction, "command", None)
+            _finish(interaction, cmd, False)
+        except Exception:
+            pass
+        return await prior_tree_error(interaction, error)
+
+    tree.on_error = on_tree_error
