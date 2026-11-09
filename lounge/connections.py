@@ -35,8 +35,8 @@ async def create_pool(*, api=False, settings=None):
         ca_file = settings.ca_file or resolve_ca_file()
         tls = ssl.create_default_context(cafile=ca_file) if settings.ssl else False
         
-        # Limite conservador estricto: max_size=3 para no exceder pool_size=15 de Supabase Free
-        pool_max = min(settings.pool_max, 3)
+        # Pool conservador: max_size=4 para evitar hambruna de conexiones en la lease
+        pool_max = min(settings.pool_max, 4)
         
         for attempt in range(5):
             try:

@@ -76,6 +76,20 @@ class MyBot(commands.Bot):
         self.lease = RuntimeLease(self.db_pool)
         await self.lease.claim()
         self.lease_owner = self.lease.owner
+
+        def _on_fenced():
+            mm = self.get_cog("Matchmaking")
+            if mm and hasattr(mm, "_runtime_recovered"):
+                mm._runtime_recovered.clear()
+                logger.warning("Fencing activado: escrituras competitivas en pausa")
+
+        def _on_recovered():
+            mm = self.get_cog("Matchmaking")
+            if mm and hasattr(mm, "_runtime_recovered"):
+                mm._runtime_recovered.set()
+                logger.info("Fencing desactivado: escrituras competitivas reanudadas")
+
+        self.lease.set_fencing_callbacks(on_fenced=_on_fenced, on_recovered=_on_recovered)
         self.lease_task = asyncio.create_task(self._heartbeat(), name="runtime-lease")
         bind_bot_pool(self.db_pool)
         cogs = [
@@ -143,18 +157,16 @@ class MyBot(commands.Bot):
 
     async def _heartbeat(self):
         try:
-            while True:
-                await asyncio.sleep(10)
-                await self.lease.heartbeat()
+            await self.lease.run_loop()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             self.runtime_failure = RuntimeError(
-                f"Database lease lost; supervisor restart required ({e})"
+                f"Fallo definitivo de exclusividad de lease: {e}"
             )
-            logger.exception("runtime_lease_lost")
+            logger.exception("runtime_lease_fatal: %s", e)
             try:
-                await self._send_log(f"⚠️ Lease de base de datos perdida: `{e}`. Reiniciando...")
+                await self._send_log(f"🛑 **Lease de base de datos finalizada**: `{e}`. Cerrando proceso para evitar conflictos.")
             except Exception:
                 pass
             asyncio.create_task(self.close())
@@ -169,6 +181,11 @@ class MyBot(commands.Bot):
             await self._send_log(f"🤖 **Bot Conectado y Online** como `{self.user}` (ID: `{self.user.id if self.user else '?'}`)")
         except Exception as e:
             logger.warning("No se pudo enviar log de on_ready: %s", e)
+
+        if getattr(self, "_commands_synced", False):
+            logger.info("Slash commands ya sincronizados previamente; omitiendo resincronización en reconexión")
+            return
+        self._commands_synced = True
 
         target_guild = int(GUILD_ID)
         try:

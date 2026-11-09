@@ -21,3 +21,5 @@ artifacts/
 scripts/postgres_credentials.json
 
 .cache/
+supabase/
+
